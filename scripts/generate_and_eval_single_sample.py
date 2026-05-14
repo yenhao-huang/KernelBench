@@ -4,6 +4,7 @@ import os, sys
 import torch
 import json
 import modal
+from litellm import token_counter
 
 from kernelbench.eval import eval_kernel_against_ref
 from kernelbench.prompt_constructor_toml import get_prompt_for_backend, get_custom_prompt
@@ -25,6 +26,64 @@ uv run python scripts/generate_and_eval_single_sample.py dataset_src=huggingface
 REPO_TOP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 torch.set_printoptions(precision=4, threshold=10)
+
+
+def _estimate_tokens(text: str, model_name: str | None = None) -> int:
+    try:
+        return int(token_counter(model=model_name, text=text))
+    except Exception:
+        # Fallback only used when LiteLLM has no tokenizer metadata for a model.
+        # This is an estimate, not provider billing truth.
+        return max(1, len(text) // 4)
+
+
+def _print_token_summary(
+    *,
+    model_name: str | None,
+    prompt: str,
+    raw_generation: str | None = None,
+    custom_kernel: str | None = None,
+) -> dict:
+    summary = {
+        "model_name": model_name,
+        "prompt_tokens_est": _estimate_tokens(prompt, model_name),
+    }
+    if raw_generation is not None:
+        summary["raw_generation_tokens_est"] = _estimate_tokens(
+            raw_generation, model_name
+        )
+    if custom_kernel is not None:
+        summary["extracted_kernel_tokens_est"] = _estimate_tokens(
+            custom_kernel, model_name
+        )
+    print(f"[Token estimate] {summary}")
+    return summary
+
+
+def _print_runtime_comparison(kernel_exec_result) -> dict:
+    runtime = getattr(kernel_exec_result, "runtime", -1.0)
+    ref_runtime = getattr(kernel_exec_result, "ref_runtime", -1.0)
+    summary = {
+        "runtime": runtime,
+        "ref_runtime": ref_runtime,
+        "speedup_vs_pytorch": None,
+        "slowdown_vs_pytorch": None,
+    }
+    if runtime and runtime > 0 and ref_runtime and ref_runtime > 0:
+        speedup = ref_runtime / runtime
+        summary["speedup_vs_pytorch"] = speedup
+        summary["slowdown_vs_pytorch"] = runtime / ref_runtime
+        print(
+            "[Runtime comparison] "
+            f"kernel={runtime:.4g} ms pytorch_ref={ref_runtime:.4g} ms "
+            f"speedup={speedup:.4g}x slowdown={runtime / ref_runtime:.4g}x"
+        )
+    else:
+        print(
+            "[Runtime comparison] unavailable "
+            f"kernel={runtime} pytorch_ref={ref_runtime}"
+        )
+    return summary
 
 
 class EvalConfig(Config):
@@ -52,7 +111,9 @@ class EvalConfig(Config):
 
         # Inference config
         self.server_type = REQUIRED
-        self.model_name = REQUIRED
+        self.model_name = None
+        self.server_address = None
+        self.server_port = None
         self.max_tokens = None
         self.temperature = None
         
@@ -149,6 +210,8 @@ def main(config: EvalConfig):
     inference_server = create_inference_server_from_presets(
         server_type=config.server_type,
         model_name=config.model_name,
+        server_address=config.server_address,
+        server_port=config.server_port,
         temperature=config.temperature,
         max_tokens=config.max_tokens,
         verbose=config.verbose,
@@ -227,14 +290,47 @@ def main(config: EvalConfig):
         with open(os.path.join(config.logdir, f"prompt_level_{config.level}_problem_{config.problem_id}.txt"), "w") as f:
             f.write(custom_prompt)
 
+    token_summary = _print_token_summary(
+        model_name=config.model_name,
+        prompt=custom_prompt,
+    )
+
     # Query server with constructed prompt
-    custom_kernel = inference_server(custom_prompt)
-    custom_kernel = extract_first_code(custom_kernel, ["python", "cpp"])
+    raw_generation = inference_server(custom_prompt)
+    token_summary = _print_token_summary(
+        model_name=config.model_name,
+        prompt=custom_prompt,
+        raw_generation=raw_generation,
+    )
+    if config.log or config.log_generated_kernel:
+        raw_generation_path = os.path.join(
+            config.logdir,
+            f"raw_generation_level_{config.level}_problem_{config.problem_id}.txt",
+        )
+        with open(raw_generation_path, "w") as f:
+            f.write(raw_generation)
+        print(f"Raw generation saved to: {raw_generation_path}")
+    custom_kernel = extract_first_code(raw_generation, ["python", "cpp"])
 
     # check LLM is able to generate custom kernel code
     assert (
         custom_kernel is not None
     ), f"Custom {config.backend} kernel code generation failed"
+    token_summary = _print_token_summary(
+        model_name=config.model_name,
+        prompt=custom_prompt,
+        raw_generation=raw_generation,
+        custom_kernel=custom_kernel,
+    )
+
+    if config.log or config.log_generated_kernel:
+        generated_kernel_path = os.path.join(
+            config.logdir,
+            f"generated_kernel_level_{config.level}_problem_{config.problem_id}.py",
+        )
+        with open(generated_kernel_path, "w") as f:
+            f.write(custom_kernel)
+        print(f"Generated kernel saved to: {generated_kernel_path}")
 
     # Optional: static code checker for kernel code using regex matching
     # NOTE: by no means is this checker complete, but it could help catch some potential hacks
@@ -248,11 +344,6 @@ def main(config: EvalConfig):
         assert static_check_status, f"Static check failed for level {config.level} problem {config.problem_id}. Errors: {errors}. Warnings: {warnings}"
         if warnings:
             print(f"Static check warnings for level {config.level} problem {config.problem_id}: {warnings}")
-
-    # this should be optional
-    if config.log:
-        with open(os.path.join(config.logdir, f"generated_kernel_level_{config.level}_problem_{config.problem_id}.py"), "w") as f:
-            f.write(custom_kernel)
 
     # 3. Evaluate Kernel
     # NOTE: no need to wrap around process here as only a single sample
@@ -272,11 +363,17 @@ def main(config: EvalConfig):
     print(
         f"Evaluation result for level {config.level} problem {config.problem_id}:\n{kernel_exec_result}"
     )
+    runtime_summary = _print_runtime_comparison(kernel_exec_result)
 
     if config.log:
         with open(os.path.join(config.logdir, f"eval_result_level_{config.level}_problem_{config.problem_id}.txt"), "a",) as f:
             f.write(f"Problem Name: {problem_name}\n")
             f.write(str(kernel_exec_result))
+            f.write("\nToken Summary:\n")
+            f.write(json.dumps(token_summary, indent=2))
+            f.write("\nRuntime Comparison:\n")
+            f.write(json.dumps(runtime_summary, indent=2))
+            f.write("\n")
 
 
 if __name__ == "__main__":

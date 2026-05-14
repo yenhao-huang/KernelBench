@@ -121,6 +121,15 @@ uv run python scripts/generate_and_eval_single_sample.py dataset_src=huggingface
 # add .verbose_logging for more visibility
 ```
 
+To evaluate an LLM through OpenRouter, set `OPENROUTER_API_KEY` in your
+environment or `.env`, then use `server_type=openrouter`. See
+[`docs/openrouter_support.md`](docs/openrouter_support.md) for batch commands
+and model naming notes.
+
+```bash
+uv run python scripts/generate_and_eval_single_sample.py dataset_src=huggingface level=1 problem_id=1 eval_mode=local server_type=openrouter model_name=openrouter/qwen/qwen3-coder max_tokens=8192 temperature=0.0
+```
+
 **What you might need to modify**
 * **`gpu_arch`** - Depending on your GPU, you might need to adjust the `gpu_arch` argument to reflect your hardware.
 * **`precision`** - You can specify the precision of tensor by `precision=fp32`. Currently all of our reported results are `fp32` but we added support for `fp16` & `bf16`.

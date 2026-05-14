@@ -720,12 +720,24 @@ def check_if_eval_exists_local(
 
 
 def add_to_eval_results_file(
-    problem_id: int, sample_id: int, eval_result: KernelExecResult, eval_file_path: str
+    problem_id: int, sample_id: int, eval_result: KernelExecResult | None, eval_file_path: str
 ):
     """
     Add evaluation result to eval results file
     TODO: migrate database support
     """
+    if eval_result is None:
+        eval_result = KernelExecResult(
+            compiled=False,
+            correctness=False,
+            metadata={
+                "error": "KernelBench evaluator returned None",
+                "error_name": "NoneEvalResult",
+            },
+            runtime=-1.0,
+            runtime_stats={},
+        )
+
     # Load existing results if file exists
     if os.path.exists(eval_file_path):
         with open(eval_file_path, "r") as f:
@@ -811,7 +823,26 @@ def main(config: EvalConfig):
 
     all_problem_ids = dataset.get_problem_ids()
 
-    if config.subset == (None, None):
+    if config.problem_ids is not None and config.problem_ids != "None":
+        if isinstance(config.problem_ids, str):
+            problem_ids_to_run = [
+                int(pid.strip())
+                for pid in config.problem_ids.split(",")
+                if pid.strip()
+            ]
+        elif isinstance(config.problem_ids, int):
+            problem_ids_to_run = [int(config.problem_ids)]
+        else:
+            problem_ids_to_run = [int(pid) for pid in config.problem_ids]
+        available_problem_ids = set(int(pid) for pid in all_problem_ids)
+        missing_problem_ids = [
+            pid for pid in problem_ids_to_run if pid not in available_problem_ids
+        ]
+        if missing_problem_ids:
+            raise ValueError(
+                f"Problem IDs not found in level {config.level}: {missing_problem_ids}"
+            )
+    elif config.subset == (None, None):
         problem_ids_to_run = all_problem_ids
     else:
         start, end = config.subset

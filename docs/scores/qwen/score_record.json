@@ -1,0 +1,420 @@
+{
+  "model": "Qwen3.6 35B A3B",
+  "run_prefix": "qwen36_retime",
+  "source_kernels": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/",
+  "dataset_total": 206,
+  "accuracy": {
+    "correct": 36,
+    "total": 206,
+    "accuracy": 0.17475728155339806,
+    "compiled": 106,
+    "compile_rate": 0.5145631067961165
+  },
+  "by_level": [
+    {
+      "level": 1,
+      "total": 54,
+      "evaluated": 54,
+      "compiled": 28,
+      "correct": 12,
+      "accuracy": 0.2222222222222222,
+      "compile_rate": 0.5185185185185185,
+      "speed_n": 12,
+      "faster": 2
+    },
+    {
+      "level": 2,
+      "total": 95,
+      "evaluated": 95,
+      "compiled": 62,
+      "correct": 23,
+      "accuracy": 0.24210526315789474,
+      "compile_rate": 0.6526315789473685,
+      "speed_n": 23,
+      "faster": 14
+    },
+    {
+      "level": 3,
+      "total": 48,
+      "evaluated": 48,
+      "compiled": 16,
+      "correct": 1,
+      "accuracy": 0.020833333333333332,
+      "compile_rate": 0.3333333333333333,
+      "speed_n": 1,
+      "faster": 0
+    },
+    {
+      "level": 4,
+      "total": 9,
+      "evaluated": 9,
+      "compiled": 0,
+      "correct": 0,
+      "accuracy": 0.0,
+      "compile_rate": 0.0,
+      "speed_n": 0,
+      "faster": 0
+    }
+  ],
+  "status_counts": {
+    "compile_failed": 84,
+    "correct": 36,
+    "output_mismatch": 51,
+    "runtime_error": 28,
+    "shape_mismatch": 7
+  },
+  "per_level_histograms": {
+    "1": {
+      "output_mismatch": 10,
+      "correct": 12,
+      "compile_failed": 21,
+      "runtime_error": 10,
+      "shape_mismatch": 1
+    },
+    "2": {
+      "output_mismatch": 31,
+      "correct": 23,
+      "compile_failed": 30,
+      "shape_mismatch": 5,
+      "runtime_error": 6
+    },
+    "3": {
+      "shape_mismatch": 1,
+      "output_mismatch": 10,
+      "runtime_error": 6,
+      "correct": 1,
+      "compile_failed": 30
+    },
+    "4": {
+      "compile_failed": 3,
+      "runtime_error": 6
+    }
+  },
+  "speed": {
+    "correct_kernels_with_speed_data": 36,
+    "geomean_speedup": 0.4373317045170292,
+    "median_speedup": 0.945903860543186,
+    "faster_than_reference": 16,
+    "fastp_gt_1": 0.07766990291262135,
+    "fastp_gt_1_5": 0.03398058252427184,
+    "fastp_gt_2": 0.009708737864077669,
+    "top_speedups": [
+      {
+        "level": 1,
+        "problem_id": 88,
+        "speedup": 8.900169204737733,
+        "runtime": 0.591,
+        "ref_runtime": 5.26
+      },
+      {
+        "level": 2,
+        "problem_id": 57,
+        "speedup": 2.7195945945945947,
+        "runtime": 2.96,
+        "ref_runtime": 8.05
+      },
+      {
+        "level": 2,
+        "problem_id": 7,
+        "speedup": 1.9089900110987792,
+        "runtime": 9.01,
+        "ref_runtime": 17.2
+      },
+      {
+        "level": 2,
+        "problem_id": 46,
+        "speedup": 1.766704416761042,
+        "runtime": 8.83,
+        "ref_runtime": 15.6
+      },
+      {
+        "level": 2,
+        "problem_id": 48,
+        "speedup": 1.764705882352941,
+        "runtime": 3.74,
+        "ref_runtime": 6.6
+      },
+      {
+        "level": 2,
+        "problem_id": 93,
+        "speedup": 1.7471736896197327,
+        "runtime": 9.73,
+        "ref_runtime": 17.0
+      },
+      {
+        "level": 2,
+        "problem_id": 16,
+        "speedup": 1.6893203883495143,
+        "runtime": 20.6,
+        "ref_runtime": 34.8
+      },
+      {
+        "level": 2,
+        "problem_id": 31,
+        "speedup": 1.462655601659751,
+        "runtime": 9.64,
+        "ref_runtime": 14.1
+      },
+      {
+        "level": 2,
+        "problem_id": 58,
+        "speedup": 1.3465346534653466,
+        "runtime": 20.2,
+        "ref_runtime": 27.2
+      },
+      {
+        "level": 1,
+        "problem_id": 43,
+        "speedup": 1.195266272189349,
+        "runtime": 5.07,
+        "ref_runtime": 6.06
+      },
+      {
+        "level": 2,
+        "problem_id": 35,
+        "speedup": 1.1885245901639345,
+        "runtime": 12.2,
+        "ref_runtime": 14.5
+      },
+      {
+        "level": 2,
+        "problem_id": 89,
+        "speedup": 1.0812182741116751,
+        "runtime": 19.7,
+        "ref_runtime": 21.3
+      },
+      {
+        "level": 2,
+        "problem_id": 88,
+        "speedup": 1.0620915032679739,
+        "runtime": 3.06,
+        "ref_runtime": 3.25
+      },
+      {
+        "level": 2,
+        "problem_id": 95,
+        "speedup": 1.0440677966101695,
+        "runtime": 2.95,
+        "ref_runtime": 3.08
+      },
+      {
+        "level": 2,
+        "problem_id": 52,
+        "speedup": 1.00990099009901,
+        "runtime": 10.1,
+        "ref_runtime": 10.2
+      },
+      {
+        "level": 2,
+        "problem_id": 24,
+        "speedup": 1.0062893081761006,
+        "runtime": 1.59,
+        "ref_runtime": 1.6
+      },
+      {
+        "level": 1,
+        "problem_id": 53,
+        "speedup": 1.0,
+        "runtime": 10.0,
+        "ref_runtime": 10.0
+      },
+      {
+        "level": 1,
+        "problem_id": 12,
+        "speedup": 0.949685534591195,
+        "runtime": 0.159,
+        "ref_runtime": 0.151
+      },
+      {
+        "level": 2,
+        "problem_id": 98,
+        "speedup": 0.942122186495177,
+        "runtime": 3.11,
+        "ref_runtime": 2.93
+      },
+      {
+        "level": 2,
+        "problem_id": 36,
+        "speedup": 0.9207708779443254,
+        "runtime": 4.67,
+        "ref_runtime": 4.3
+      }
+    ],
+    "slowest_speedups": [
+      {
+        "level": 2,
+        "problem_id": 17,
+        "speedup": 0.008552631578947369,
+        "runtime": 1520.0,
+        "ref_runtime": 13.0
+      },
+      {
+        "level": 2,
+        "problem_id": 29,
+        "speedup": 0.009900990099009901,
+        "runtime": 303.0,
+        "ref_runtime": 3.0
+      },
+      {
+        "level": 1,
+        "problem_id": 18,
+        "speedup": 0.011019417475728155,
+        "runtime": 206.0,
+        "ref_runtime": 2.27
+      },
+      {
+        "level": 1,
+        "problem_id": 4,
+        "speedup": 0.013452380952380952,
+        "runtime": 672.0,
+        "ref_runtime": 9.04
+      },
+      {
+        "level": 2,
+        "problem_id": 81,
+        "speedup": 0.015,
+        "runtime": 206.0,
+        "ref_runtime": 3.09
+      },
+      {
+        "level": 1,
+        "problem_id": 16,
+        "speedup": 0.07551724137931035,
+        "runtime": 29.0,
+        "ref_runtime": 2.19
+      },
+      {
+        "level": 1,
+        "problem_id": 2,
+        "speedup": 0.10307017543859649,
+        "runtime": 22.8,
+        "ref_runtime": 2.35
+      },
+      {
+        "level": 1,
+        "problem_id": 13,
+        "speedup": 0.10913242009132422,
+        "runtime": 21.9,
+        "ref_runtime": 2.39
+      },
+      {
+        "level": 1,
+        "problem_id": 8,
+        "speedup": 0.13039443155452435,
+        "runtime": 43.1,
+        "ref_runtime": 5.62
+      },
+      {
+        "level": 1,
+        "problem_id": 14,
+        "speedup": 0.14838709677419354,
+        "runtime": 15.5,
+        "ref_runtime": 2.3
+      },
+      {
+        "level": 2,
+        "problem_id": 23,
+        "speedup": 0.15771812080536912,
+        "runtime": 14.9,
+        "ref_runtime": 2.35
+      },
+      {
+        "level": 2,
+        "problem_id": 44,
+        "speedup": 0.550709939148073,
+        "runtime": 9.86,
+        "ref_runtime": 5.43
+      },
+      {
+        "level": 3,
+        "problem_id": 4,
+        "speedup": 0.6807407407407408,
+        "runtime": 1.35,
+        "ref_runtime": 0.919
+      },
+      {
+        "level": 2,
+        "problem_id": 42,
+        "speedup": 0.707641196013289,
+        "runtime": 30.1,
+        "ref_runtime": 21.3
+      },
+      {
+        "level": 1,
+        "problem_id": 47,
+        "speedup": 0.8632478632478633,
+        "runtime": 11.7,
+        "ref_runtime": 10.1
+      },
+      {
+        "level": 2,
+        "problem_id": 10,
+        "speedup": 0.8785714285714287,
+        "runtime": 28.0,
+        "ref_runtime": 24.6
+      },
+      {
+        "level": 2,
+        "problem_id": 36,
+        "speedup": 0.9207708779443254,
+        "runtime": 4.67,
+        "ref_runtime": 4.3
+      },
+      {
+        "level": 2,
+        "problem_id": 98,
+        "speedup": 0.942122186495177,
+        "runtime": 3.11,
+        "ref_runtime": 2.93
+      },
+      {
+        "level": 1,
+        "problem_id": 12,
+        "speedup": 0.949685534591195,
+        "runtime": 0.159,
+        "ref_runtime": 0.151
+      },
+      {
+        "level": 1,
+        "problem_id": 53,
+        "speedup": 1.0,
+        "runtime": 10.0,
+        "ref_runtime": 10.0
+      }
+    ],
+    "by_level_detail": {
+      "1": {
+        "speed_n": 12,
+        "geomean_speedup": 0.22940894441218776,
+        "median_speedup": 0.13939076416435894,
+        "faster_than_reference": 2
+      },
+      "2": {
+        "speed_n": 23,
+        "geomean_speedup": 0.6006857610996992,
+        "median_speedup": 1.0440677966101695,
+        "faster_than_reference": 14
+      },
+      "3": {
+        "speed_n": 1,
+        "geomean_speedup": 0.6807407407407408,
+        "median_speedup": 0.6807407407407408,
+        "faster_than_reference": 0
+      },
+      "4": {
+        "speed_n": 0,
+        "geomean_speedup": 0,
+        "median_speedup": 0,
+        "faster_than_reference": 0
+      }
+    }
+  },
+  "logs": [
+    "/tmp/kb_logs/qwen36_retime_rerun.log",
+    "/tmp/kb_logs/qwen36_retime_resume.log"
+  ],
+  "notes": [
+    "Existing generated kernels were retimed only; no code generation was run.",
+    "Speedup is reference_runtime / generated_kernel_runtime, parsed from retime eval logs because eval_results.json does not persist ref_runtime."
+  ]
+}

@@ -108,15 +108,21 @@ def query_server(
     Done through liteLLM:
     - Local Server (SGLang, vLLM, Tokasaurus)
     """
-    # Local Server (SGLang, vLLM, Tokasaurus) - special handling
-    if server_type == "local":
+    # Local Server (SGLang, vLLM, llama.cpp, Tokasaurus) - special handling.
+    # Some instruct/chat GGUF models return EOS immediately on /v1/completions
+    # unless the prompt is passed through the server chat template.
+    if server_type in {"local", "local_chat"}:
         url = f"http://{server_address}:{server_port}"
         client = OpenAI(
-            api_key=SGLANG_KEY, base_url=f"{url}/v1", timeout=None, max_retries=0
+            api_key=SGLANG_KEY or os.environ.get("OPENAI_API_KEY") or "EMPTY",
+            base_url=f"{url}/v1",
+            timeout=None,
+            max_retries=0,
         )
-        if isinstance(prompt, str):
+        local_model_name = model_name or "default"
+        if server_type == "local" and isinstance(prompt, str):
             response = client.completions.create(
-                model="default",
+                model=local_model_name,
                 prompt=prompt,
                 temperature=temperature,
                 n=num_completions,
@@ -125,9 +131,13 @@ def query_server(
             )
             outputs = [choice.text for choice in response.choices]
         else:
+            if isinstance(prompt, str):
+                messages = [{"role": "user", "content": prompt}]
+            else:
+                messages = prompt
             response = client.chat.completions.create(
-                model="default",
-                messages=prompt,
+                model=local_model_name,
+                messages=messages,
                 temperature=temperature,
                 n=num_completions,
                 max_tokens=max_tokens,
@@ -184,7 +194,12 @@ def query_server(
             completion_kwargs["top_p"] = top_p
             
             # top_k is not supported by OpenAI models
-            if "openai/" not in model_name.lower() and "gpt" not in model_name.lower():
+            model_name_lower = model_name.lower()
+            if (
+                "openai/" not in model_name_lower
+                and "gpt" not in model_name_lower
+                and not model_name_lower.startswith("openrouter/")
+            ):
                 completion_kwargs["top_k"] = top_k
         
         response = completion(**completion_kwargs)
@@ -229,6 +244,12 @@ SERVER_PRESETS = {
         "server_address": "matx2.stanford.edu",
         "max_tokens": 8192,
     },
+    "local_chat": {
+        "temperature": 0.8,
+        "server_port": 10210,
+        "server_address": "localhost",
+        "max_tokens": 8192,
+    },
     "anthropic": {  # for Claude 3.7 Sonnet
         "model_name": "anthropic/claude-3-7-sonnet-20250219",
         "temperature": 0.8,
@@ -239,6 +260,13 @@ SERVER_PRESETS = {
         # "model_name": "o1-preview-2024-09-12", # be careful with this one
         "temperature": 0.0,
         "max_tokens": 4096,
+    },
+    "openrouter": {
+        # LiteLLM routes OpenRouter models using the openrouter/<provider>/<model> prefix.
+        # Set OPENROUTER_API_KEY in .env or the shell before running generation.
+        "model_name": "openrouter/qwen/qwen3-coder",
+        "temperature": 0.0,
+        "max_tokens": 8192,
     },
     "fireworks": {
         "model_name": "fireworks_ai/llama-v3p1-70b-instruct",
@@ -396,6 +424,18 @@ def extract_first_code(output_string: str, code_language_types: list[str]) -> st
     
     trimmed = output_string.strip()
 
+    # Prefer explicitly tagged code fences. Some local models emit stray closing
+    # fences before the real block, which makes a generic backtick regex grab
+    # non-code text instead of the generated Python/C++ source.
+    for code_type in code_language_types:
+        code_match = re.search(
+            rf"^```\s*{re.escape(code_type)}\s*\n(.*?)^```\s*$",
+            trimmed,
+            re.DOTALL | re.MULTILINE,
+        )
+        if code_match:
+            return code_match.group(1).strip()
+
     # Extracting the first occurrence of content between backticks
     code_match = re.search(r"```(.*?)```", trimmed, re.DOTALL)
 
@@ -411,6 +451,13 @@ def extract_first_code(output_string: str, code_language_types: list[str]) -> st
                 code = code[len(code_type) :].strip()
 
         return code
+
+    # Some local completion models return raw Python without markdown fences.
+    # Treat it as code when it looks like a generated KernelBench module so the
+    # later static/compile checks can report the real failure.
+    code_like_markers = ["import torch", "class ModelNew", "load_inline", "__global__"]
+    if any(marker in trimmed for marker in code_like_markers):
+        return trimmed
 
     return None
 
