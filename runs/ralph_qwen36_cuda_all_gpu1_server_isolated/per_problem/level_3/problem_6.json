@@ -1,0 +1,45 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 68.181,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "150.424026",
+        "150.415466",
+        "150.429428",
+        "150.400665",
+        "150.409180"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "1825.169312",
+        "1847.657104",
+        "1790.404419",
+        "1953.554443",
+        "1724.467773"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_3/problem_6.py",
+  "level": 3,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 6,
+  "problem_name": "6_GoogleNetInceptionModule.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_3/problem_6.txt",
+  "static_warnings": [
+    "Uses torch.nn.functional op: F.max_pool",
+    "Uses torch.nn compute layer (only containers, Parameter, init allowed)"
+  ],
+  "status": "evaluated"
+}

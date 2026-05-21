@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 88.709,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "0.666577",
+        "0.668071",
+        "0.663031",
+        "0.662006",
+        "0.664323"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "3.048809",
+        "2.966770",
+        "3.122962",
+        "3.100703",
+        "3.033474"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_3/problem_32.py",
+  "level": 3,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 32,
+  "problem_name": "32_ConvolutionalVisionTransformer.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_3/problem_32.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

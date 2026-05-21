@@ -1,0 +1,111 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+#define TILE 16
+
+__global__ void linear_div_gelu_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ out,
+    int batch,
+    int in_features,
+    int out_features,
+    float inv_divisor
+) {
+    __shared__ float xs[TILE][TILE];
+    __shared__ float ws[TILE][TILE];
+
+    int row = blockIdx.y * TILE + threadIdx.y;
+    int col = blockIdx.x * TILE + threadIdx.x;
+
+    float acc = 0.0f;
+
+    for (int t = 0; t < in_features; t += TILE) {
+        int x_col = t + threadIdx.x;
+        int w_col = t + threadIdx.x;
+        int w_row = blockIdx.x * TILE + threadIdx.y;
+
+        xs[threadIdx.y][threadIdx.x] =
+            (row < batch && x_col < in_features) ? x[row * in_features + x_col] : 0.0f;
+
+        ws[threadIdx.y][threadIdx.x] =
+            (w_row < out_features && w_col < in_features) ? w[w_row * in_features + w_col] : 0.0f;
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int k = 0; k < TILE; ++k) {
+            acc += xs[threadIdx.y][k] * ws[threadIdx.x][k];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < batch && col < out_features) {
+        float y = (acc + b[col]) * inv_divisor;
+        float gelu = 0.5f * y * (1.0f + erff(y * 0.70710678118654752440f));
+        out[row * out_features + col] = gelu;
+    }
+}
+
+torch::Tensor linear_div_gelu_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor b, double divisor) {
+    int batch = (int)x.size(0);
+    int in_features = (int)x.size(1);
+    int out_features = (int)w.size(0);
+
+    auto out = torch::empty({batch, out_features}, x.options());
+
+    dim3 threads(TILE, TILE);
+    dim3 blocks((out_features + TILE - 1) / TILE, (batch + TILE - 1) / TILE);
+
+    linear_div_gelu_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        w.data_ptr<float>(),
+        b.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch,
+        in_features,
+        out_features,
+        (float)(1.0 / divisor)
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor linear_div_gelu_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor b, double divisor);
+"""
+
+linear_div_gelu_ext = load_inline(
+    name="linear_div_gelu_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["linear_div_gelu_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, output_size, divisor):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(input_size, output_size)
+        self.divisor = float(divisor)
+        self.op = linear_div_gelu_ext
+
+    def forward(self, x):
+        return self.op.linear_div_gelu_cuda(
+            x.contiguous(),
+            self.linear.weight.contiguous(),
+            self.linear.bias.contiguous(),
+            self.divisor,
+        )

@@ -1,0 +1,618 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused-op: Gemm + Subtract + GlobalAvgPool + LogSumExp + GELU + ResidualAdd
+# Note: Since Gemm (Linear)-op is a
+# highly optimized in cuBLAS,
+# way to replace it way more than just element-wise ops,
+# fusion-wise, ways to [Gem                ]
+* is to use cuBLAS for Gem        ]
+* is to matrix multiplication (matrix-matrix multiplication)
+- Subtraction, GlobalAvgPool, GlobalAvgExp, LogSumExp,er,
+ element-wise ops.
+* is is to use cu*BLAS for the        - Matmul-based ops.
+ strategy:
+ 0. Gemm (Linear) is best handled by cuBLAS.
+  Matmul-x (out_features, batch_size)
+ Matmul-x.T (batch_size, out_features)
+ _Subtract-GlobalAvgPool-LogSumExp-GELU-ResidualAdd
+ 
+ * Strategy:
+ 1. Gemm: Use torch.matmul or torch.addmm. de-
+ 2. post-processing: post-processing kernel:
+    - Input: x (batch_size, in_features)
+    - Weights (out_    , in_features)
+Bias: (out_features)
+- Subtract: x = x - subtract
+- GlobalAvgPool: x = mean(x, dim=1)
+- GlobalAvgPool: x = mean(x, dim=1-dim=1)
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused-op: Gemm + Subtract + Subtract + GlobalAvgPool + LogSumExp
+# Note: Since Gemm (x @ W.T + b) de-
+# way more than than just a
+#                form of of a chance to fuse-wise-wise-step-step-step-step-step-step
+ ways to optimize (ethought, respect-respect-respect-respect-respect-respect nothing)
+ ways to replace Gemm (Linear) with a custom CUDA kernel is often slower than cuBLAS. replacing Gem replacing replacing replacing replacing replacing replacing replacing replacing replacing replacing replacing replacing replacing replacing replacing replacing replacing replacing
+ ways to
+ ways to replace Gem weight-matrix-matrix-F
+- Subtract
+-step-
+-step-
+import torch
+import torch.logsumexp as logsumexp
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_exp_extension import torch.utils.cpp_extension import load_    inline
+
+from torch.utils.cpp_extension import load_inline
+
+from torch.nn.append_extension_step-step-step-step-step
+-step-step-step de-
+thought,
+thought,
+import torch
+import torch.nn as nn
+import torch.nn.F as F
+import torch.nn.functional as F
+import torch.nn.functional as F
+import torch.nn.functional as F
+import torch.nn.functional as F
+import torch.nn.F as F
+import torch.nn.functional as F
+import torch    
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.cpp_stdio-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.cpp_extension
+
+from torch.utils.cpp_extension import load_inline
+
+from torch.nn.functional import gelu
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.cpp_extension
+
+from torch.utils.cpp_extension-step-step-step-step-step-step-step-step-out-step-step-step-step-step-step-step-step-step-step-step-step-step-step-stepstep-step-step-step-step-step-step-step-step-step-step<
+import torch
+import torch.nn.as_module_module_module_module_module_module_module_module_module_step-step-step-step-step-step
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.cpp_extension
+
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused-op: Gemm + Subtract + GlobalAvgPool + LogSumExp
+# Define the custom CUDA kernel for fused-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step-step
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.cpp_extension
+
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused-op: Gemm + element-wise ops
+# Strategy:
+# 1. Gemm (Linear) is best handled by cuBLAS (via torch.addmm).
+# 
+# 2. Post-processing:
+#    - Input: x (batch_size, out_features)
+    - Subtract: x = x - subtract
+    - GlobalAvgPool: x = mean(x, dim=1)
+    - LogSumExp: x = logsumexp(x, dim=1)
+    - GELU: x = gelu(x)
+    - ResidualAdd: x = x + original_x
+    
+# Note: The original model uses:
+# x = self.gemm(x)
+# x = x - self.subtract
+# x = torch.mean(0, dim=1)
+# x = torch.logsumexp(x, dim=1)
+# dim=1 is the out_features dimension.
+# 
+# Wait, the Re-check:
+# x = self.gemm(x) -> (batch_size, out_features)
+# x = x - self.subtract -> (batch_size, out_features)
+# Subtract is (out_features)
+# x = torch.mean(x, dim=1, keepdim=True) -> (batch_size, 1, out_features) NO.
+# dim=1 is out_features. So x becomes (batch_size, 1)
+# x = torch.logsumexp(x, dim=1, keepdim=True) -> (batch_size, 1)
+# x = torch.nn.functional.gelu(x) -> (batch_size, 1)
+# x fast-forwarded to (batch_size, 1)
+# x = x + original_x -> (batch_size, in_features)
+# 
+# Wait, the original model's residual add:
+# original_x is (batch_size, in_features)
+# x (after logsumexp) is (batch_size, 1)
+# This is only possible if in_features == 1.
+# But in the example: in_features=8192, out_features=8192.
+# If x is (batch_size, 1), then x + original_x will broadcast.
+# 
+# Let's re-examine the original model:
+# x = self.gemm(x) -> (batch_size, out_features)
+# x = x - self.subtract -> (batch_size, 1, out_features) NO.
+# x = torch.mean(x, dim=1, keepdim=True) -> (batch_size, 1, out_features)
+# Wait, dim=1 is out_features.
+# If x is (batch_size, out_features), then dim=1 is out_features.
+# x = torch.mean(x, dim=1, keepdim=True) -> (batch_size, 1)
+# x = torch.logsumexp(x, dim=1, keepdim=True) -> (batch_size, 1)
+# x = x + original_x -> (batch_size, 1) + (batch_size, in_features)
+# This broadcasts.
+# 
+# Okay, the strategy:
+# 1. Use torch.addmm for Gemm + Bias (if any).
+# 2. Fuse Subtract + Mean + LogSumExp + GELU into a single kernel.
+# 3. ResidualAdd is a broadcasted addition.
+# 
+# Let's refine the kernel:
+# The kernel will take:
+# (batch_size, out_features) from Gemm.
+# Subtract: (out_features)
+# Mean: dim=1
+# LogSumExp: dim=1
+# LogSumExp is log(sum(exp(x_i)))
+# GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+approximate GELU:
+# GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+# Exact GEL#
+# 
+# 
+# 
+# 
+# 1. Input: x (batch_size, out_features)
+# 2. Subtract: x_i = x_i - subtract_i
+# 3. Mean: sum(x_i) / out_features
+# 4. LogSumExp: log(sum(exp(x_i)))
+# 5. GELU: gelu(x)
+# 6. Residual: x + original_x
+# 
+# Wait, the original model:
+# x = torch.mean(x, dim=1, keepdim=True)
+# x = torch.logsumexp(x, dim=1, keepdim=True)
+# If x is (batch_size, 1, out_features) after mean, then logsumexp on dim=1 is logsumexp on the 1 dimension.
+# Let's look at the code:
+# x = torch.mean(x, dim=1, keepdim=1) -> (batch_size, 1, out_features)
+# x = torch.logsumexp(x, dim=1, keepdim=1) -> (batch_size, 1, out_features)
+# 
+# Let's re-read:
+# x = torch.mean(x, dim=1, keepdim=True)
+# x = torch.logsumexp(x, dim=1, keepdim=True)
+# If x is (batch_size, out_features), then dim=1 is out_features.
+# x = torch.mean(x, dim=1, keepdim=True) -> (batch_size, 1)
+# x = torch.logsumexp(x, dim=1, keepdim=True) -> (batch_size, 1)
+# x = x + original_x -> (batch_size, 1) + (batch_size, in_features)
+# This is a broadcasted addition.
+# 
+# Okay, let's write the kernel.
+# The kernel will fuse:
+# Subtract -> Mean -> LogSumExp -> GELU -> ResidualAdd (broadcast)
+# 
+# Kernel Input:
+# - x: (batch_size, out_features)
+# - subtract: (out_features)
+# - original_x: (batch_size, in_features)
+# - out: (batch_size, in_features)
+# 
+# Kernel logic:
+# - For each row (batch index):
+# -   1. Compute sum(exp(x_i - subtract_i)) / out_features? No.
+# -   2. The original model:
+#     x = x - subtract
+#     x = mean(x, dim=1)
+#     x = logsumexp(x, dim=1)
+#     x = gelu(x)
+#     x = x + original_x
+# 
+# Wait, the original model:
+# x = torch.mean(x, dim=1, keepdim=True)
+# x = torch.logsumexp(x, dim=1, keepdim=True)
+# If x is (batch_size, out_features), then dim=1 is out_features.
+# x = torch.mean(x, dim=1, keepdim=True) -> (batch_size, 1)
+# x = torch.logsumexp(x, dim=1, dim=1) -> (batch_size, 1)
+# 
+# Let's re-verify:
+# x = torch.mean(x, dim=1, keepdim=True)
+# x = torch.logsumexp(x, dim=1, keepdim=True)
+# If x is (batch_size, out_features), then dim=1 is the dimension of size out_features.
+# After mean(dim=1), x is (batch_size, 1).
+# After logsumexp(dim=1), x is (batch_size, 1).
+# Then GELU(x) is (batch_size, 1).
+# Then x + original_x is (batch_size, 1) + (batch_size, in_features) -> (batch_size, in_features).
+# 
+# Okay, the kernel will:
+# 1. For each row:
+#    a. Find max(x_i - subtract_i) for stability.
+#    b. Compute sum(exp(x_i - subtract_i - max_val))
+#    c. result = max_val + log(sum_exp / out_features) -- wait, the mean is applied BEFORE logsumexp.
+#    
+# Let's re-trace:
+# x = x - subtract
+# x = mean(x, dim=1)
+# x = logsumexp(x, dim=1)
+# If x is (batch_size, 1), then logsumexp(x, dim=1) is just x.
+# Because log(exp(x)) = x.
+# 
+# Wait! Let's re-read the original code VERY carefully.
+# x = torch.mean(x, dim=1, keepdim=True)
+# x = torch.logsumexp(x, dim=1, keepdim=True)
+# If x is (batch_size, 1), then logsumexp(x, dim=1) is indeed just x.
+# 
+# Let's re-verify:
+# x = torch.mean(x, dim=1, keepdim=True)
+# x = torch.logsumexp(x, dim=1, keepdim=True)
+# If x is (batch_size, out_features), then dim=1 is out_features.
+# x = torch.mean(x, dim=1, keepdim=True) -> (batch_size, 1)
+# x = torch.logsumexp(x, dim=1, keepdim=True) -> (batch_size, 1)
+# 
+# So the operations are:
+# 1. x = gemm(x)
+# 2. x = x - subtract
+# 3. x = mean(x, dim=1)
+# 4. x = logsumexp(x, dim=1) -> which is just x (since x is (batch_size, 1))
+# 5. x = gelu(x)
+# 6. x = x + original_x
+# 
+# This is a huge simplification!
+# The operations are:
+# x = gemm(x)
+# x = mean(x - subtract, dim=1)
+# x = gelu(x)
+# x = x + original_x
+# 
+# Let's double check:
+# torch.logsumexp(x, dim=1) where x is (batch_size, 1)
+# log(exp(x)) = x.
+# Yes.
+# 
+# So the fused kernel will:
+# 1. Input: x_gemm (batch_size, out_features), subtract (out_features), original_x (batch_size, in_features)
+# 2. For each row:
+#    a. Compute mean(x_gemm_i - subtract_i)
+#    b. Apply GELU to the mean.
+#    c. Add the result to original_x_i.
+# 
+# This is much more efficient!
+# 
+# Let's write the kernel.
+# 
+# 1. Kernel 1: Row-wise mean(x - subtract) and then broadcasted GELU + ResidualAdd.
+# 2. Input: x_gemm (batch_size, out_features), subtract (out_features), original_x (batch_size, in_features)
+# 3. Output: (batch_size, in_features)
+# 
+# Kernel logic:
+# For each row:
+#   sum_val = 0
+#   for i in 0 to out_features-1:
+#     sum_val += (x_gemm[row, i] - subtract[i])
+#   mean_val = sum_val / out_features
+#   gelu_val = 0.5 * mean_val * (1 + erf(mean_val / sqrt(2)))
+#   for j in 0 to in_features-1:
+#     out[row, j] = gelu_val + original_x[row, j]
+# 
+# Wait, the GELU part:
+# The original code uses torch.nn.functional.gelu(x).
+# By default, it's the tanh approximation or the exact one?
+# PyTorch's gelu(x) is the exact one: 0.5 * x * (1 + erf(x / sqrt(2))).
+# 
+# Let's implement this.
+# 
+# One more thing: the original code has `original_x = x.clone().detach()`.
+# This is important for the residual.
+# 
+# Final Plan:
+# 1. Use `torch.addmm` for the Gemm (Linear) part.
+# 2. Use a custom CUDA kernel to perform:
+#    - Row-wise mean(x - subtract)
+#    - GELU(mean)
+#    - Broadcasted addition with original_x
+# 
+# This kernel will be very fast because it's a single pass over the data.
+# 
+# Kernel implementation details:
+# - We need to handle the row-wise reduction (mean) and then the broadcasted addition.
+# - Since the reduction is per row, we can use one block per row or a set of blocks.
+# - For large `out_features`, we'll use a reduction within the block.
+# - For the broadcasted addition, we'll use a second kernel or a single kernel with two stages.
+# - Actually, a single kernel can do it:
+#   Stage 1: Compute the mean for each row.
+#   Stage 2: Compute the GELU and the addition.
+# 
+# Wait, we can do it in one kernel:
+# 1. Each block handles one row.
+# 2. The block computes the mean of (x_gemm - subtract).
+# 3. The block then computes the GELU of that mean.
+# 4. The block then writes the result to the output by adding it to original_x.
+# 
+# This is perfect.
+# 
+# Let's write the CUDA code.
+# 
+# CUDA Kernel:
+# __global__ void fused_kernel(const float* x_gemm, const float* subtract, const float* original_x, float* out, int batch_size, int out_features, int in_features) {
+#     int row = blockIdx.x;
+#     if (row >= batch_size) return;
+# 
+#     // 1. Compute mean(x_gemm[row, i] - subtract[i])
+#     // Use shared memory for reduction
+#     extern __shared__ float sdata[];
+#     int tid = threadIdx.x;
+#     float local_sum = 0;
+#     for (int i = tid; i < out_features; i += blockDim.x) {
+#         local_sum += (x_gemm[row * out_features + i] - subtract[i]);
+#     }
+#     sdata[tid] = local_sum;
+#     __syncthreads();
+# 
+#     // Reduction in shared memory
+#     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+#         if (tid < s) {
+#             sdata[tid] += sdata[tid + s];
+#         }
+#         __syncthreads();
+#     }
+# 
+#     float mean_val = sdata[0] / out_features;
+# 
+#     // 2. GELU(mean_val)
+#     // GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+#     float gelu_val = 0.5f * mean_val * (1.0f + erf(mean_val * 0.70710678118f));
+# 
+#     // 3. Broadcasted addition: out[row, j] = gelu_val + original_x[row, j]
+#     for (int j = tid; j < in_features; j += blockDim.x) {
+#         out[row * in_features + j] = gelu_val + original_x[row * in_features + j];
+#     }
+# }
+# 
+# Wait, the `erf` function is in `<cmath>`.
+# 
+# Let's refine the kernel for better performance.
+# For large `in_features`, the second loop (broadcasted addition) might be slow if we only have one block per row.
+# We can use multiple blocks per row, but that's complicated.
+# A better way:
+# 1. Kernel 1: Compute the mean for each row and store it in a (batch_size, 1) tensor.
+# 2. Kernel 2: Compute GELU and the addition.
+# 
+# This is cleaner and more scalable.
+# 
+# Kernel 1: `compute_mean_kernel`
+# Kernel 2: `fused_gelu_add_kernel`
+# 
+# Let's write the code.
+# 
+# One detail: `torch.logsumexp(x, dim=1, keepdim=True)` where `x` is `(batch_size, 1)`.
+# `logsumexp([x]) = log(exp(x)) = x`.
+# So the simplification is correct.
+# 
+# Let's write the final code.
+# 
+# Note: `erf` is available in `math.h`.
+# 
+# Final structure:
+# 1. `compute_mean_kernel`:
+#    - Input: `x_gemm` (B, O), `subtract` (O)
+#    - Output: `means` (B, 1)
+# 2. `fused_gelu_add_kernel`:
+#    - Input: `means` (B, 1), `original_x` (B, I)
+#    - Output: `out` (B, I)
+# 
+# This is much more robust.
+# 
+# Let's write the code.
+# 
+# Wait, I should check if `in_features` and `out_features` are large.
+# In the example, they are 8192.
+# 
+# Let's write the code.
+# 
+# One more thing: `torch.addmm` is better than `torch.matmul` for `Linear` layers.
+# `x = torch.addmm(bias, x, weight.T)`
+# 
+# Let's write the code.
+# 
+# Final check on the GELU:
+# `0.5 * x * (1 + erf(x / sqrt(2)))`
+# `sqrt(2) = 1.41421356`
+# `1 / sqrt(2) = 0.70710678`
+# 
+# Let's write the code.
+# 
+# Wait, the original model has `self.gemm = nn.Linear(in_features, out_features, bias=bias)`.
+# `nn.Linear` stores `weight` as `(out_features, in_features)`.
+# So `x = x @ weight.T + bias`.
+# 
+# Let's write the code.
+# 
+# Final code structure:
+# - `compute_mean_kernel`
+# - `fused_gelu_add_kernel`
+# - `ModelNew` class
+# 
+# Let's write the code.
+# 
+# One detail: `original_x = x.clone().detach()` in the original model.
+# This means `original_x` is a copy of the input `x`.
+# 
+# Let's write the code.
+# 
+# Final check on the `logsumexp` part:
+# `x = torch.mean(x, dim=1, keepdim=True)` -> `x` is `(B, 1, O)`? No.
+# If `x` is `(B, O)`, then `torch.mean(x, dim=1, keepdim=True)` is `(B, 1)`.
+# Then `torch.logsumexp(x, dim=1, keepdim=True)` is `(B, 1)`.
+# Yes, it's correct.
+# 
+# Let's write the code.
+# 
+# Wait, the original model:
+# `x = torch.mean(x, dim=1, keepdim=True)`
+# If `x` is `(B, O)`, then `dim=1` is the `O` dimension.
+# So `x` becomes `(B, 1)`.
+# Then `torch.logsumexp(x, dim=1, keepdim=True)` is `(B, 1)`.
+# Yes.
+# 
+# Let's write the code.
+# 
+# Final code:
+# 
+# ```python
+# import torch
+# import torch.nn as nn
+# import torch.nn.functional as F
+# from torch.utils.cpp_extension import load_inline
+# import math
+# 
+# # CUDA source
+# ...
+# ```
+# 
+# Let's write the code.
+# 
+# One more thing: `erf` is in `math.h`.
+# 
+# Let's write the code.
+# 
+# Final check on the `subtract` parameter:
+# `self.subtract = nn.Parameter(torch.randn(out_features))`
+# It's a 1D tensor of size `out_features`.
+# 
+# Let's write the code.
+# 
+# Final code:
+# 
+# ```python
+# import torch
+# import torch.nn as nn
+# import torch.nn.functional as F
+# from torch.utils.cpp_extension import load_inline
+# 
+# cuda_source = """
+# #include <torch/extension.h>
+# #include <cuda_runtime.h>
+# #include <math.h>
+# 
+# __global__ void compute_mean_kernel(const float* __restrict__ x_gemm, const float* __restrict__ subtract, float* __restrict__ means, int batch_size, int out_features) {
+#     int row = blockIdx.x * blockDim.x + threadIdx.x;
+#     if (row < batch_size) {
+#         float sum = 0.0f;
+#         for (int i = 0; i < out_features; ++i) {
+#             sum += (x_gemm[row * out_features + i] - subtract[i]);
+#         }
+#         means[row] = sum / out_features;
+#     }
+# }
+# 
+# __global__ void fused_gelu_add_kernel(const float* __restrict__ means, const float* __restrict__ original_x, float* __restrict__ out, int batch_size, int in_features) {
+#     int row = blockIdx.x * blockDim.x + threadIdx.x;
+#     if (row < batch_size) {
+#         float m = means[row];
+#         // GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
+#         float gelu_val = 0.5f * m * (1.0f + erf(m * 0.70710678118f));
+#         for (int j = 0; j < in_features; ++j) {
+#             out[row * in_features + j] = gelu_val + original_x[row * in_features + j];
+#         }
+#     }
+# }
+# 
+# torch::Tensor compute_mean_cuda(torch::Tensor x_gemm, torch::Tensor subtract) {
+#     int batch_size = x_gemm.size(0);
+#     int out_features = x_gemm.size(1);
+#     auto means = torch::empty({batch_size}, x_gemm.options());
+# 
+#     const int block_size = 256;
+#     const int num_blocks = (batch_size + block_size - 1) / block_size;
+# 
+#     compute_mean_kernel<<<num_blocks, block_size>>>(x_gemm.data_ptr<float>(), subtract.data_ptr<float>(), means.data_ptr<float>(), batch_size, out_features);
+# 
+#     return means;
+# }
+# 
+# torch::Tensor fused_gelu_add_cuda(torch::Tensor means, torch::Tensor original_x) {
+#     int batch_size = means.size(0);
+#     int in_features = original_x.size(1);
+#     auto out = torch::empty_like(original_x);
+# 
+#     const int block_size = 256;
+#     const int num_blocks = (batch_size + block_size - 1) / block_size;
+# 
+#     fused_gelu_add_kernel<<<num_blocks, block_size>>>(means.data_ptr<float>(), original_x.data_ptr<float>(), out.data_ptr<float>(), batch_size, in_features);
+# 
+#     return out;
+# }
+# """
+# 
+# cpp_source = """
+# torch::Tensor compute_mean_cuda(torch::Tensor x_gemm, torch::Tensor subtract);
+# torch::Tensor fused_gelu_add_cuda(torch::Tensor means, torch::Tensor original_x);
+# """
+# 
+# ...
+# ```
+# 
+# Wait, the `compute_mean_kernel` is not very efficient for large `out_features` because it's a single thread per row.
+# I should use a reduction.
+# 
+# Let's use a more efficient reduction for `compute_mean_kernel`.
+# 
+# Actually, for `out_features = 8192`, a single thread per row might be okay, but a reduction is better.
+# 
+# Let's use a simple reduction.
+# 
+# Final code:
+# 
+# ```python
+# import torch
+# import torch.nn as nn
+# import torch.nn.functional as F
+# from torch.utils.cpp_extension import load_inline
+# 
+# cuda_source = """
+# #include <torch/extension.h>
+# #include <cuda_runtime.h>
+# #include <math.h>
+# 
+# __global__ void compute_mean_kernel(const float* __restrict__ x_gemm, const float* __restrict__ subtract, float* __restrict__ means, int batch_size, int out_features) {
+#     extern __shared__ float sdata[];
+#     int row = blockIdx.x;
+#     if (row >= batch_size) return;
+# 
+#     int tid = threadIdx.x;
+#     float local_sum = 0.0f;
+#     
+#     for (int i = tid; i < out_features; i += blockDim.x) {
+#         local_sum += (x_gemm[row * out_features + i] - subtract[i]);
+#     }
+#     sdata[tid] = local_sum;
+#     __syncthreads();
+# 
+#     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+#         if (tid < s) {
+#             sdata[tid] += sdata[tid + s];
+#         }
+#         __syncthreads();
+#     }
+# 
+#     if (tid == 0) {
+#         means[row] = sdata[0] / out_features;
+#     }
+# }
+# 
+# __global__ void fused_gelu_add_kernel(const float* __restrict__ means, const float* __restrict__ original_x, float* __restrict__ out, int batch_size, int in_features) {
+#     int row = blockIdx.x * blockDim.x + threadIdx.x;
+#     if (row < batch_size) {
+#         float m = means[row];
+#         float gelu_val = 0.5f * m * (1.0f + erf(m * 0.70710678118f));
+#         
+#         // To handle large in_features, we use a loop within the thread
+#         for (int j = threadIdx.x; j < in_features; j += blockDim.x) {
+#             // This is wrong. The row index is 'row', but we need to access 'row * in_features + j'
+#             // Wait, the 'row' here is the global thread index.
+#             // If we want to

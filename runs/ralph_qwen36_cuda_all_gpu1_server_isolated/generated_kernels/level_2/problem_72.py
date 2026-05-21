@@ -1,0 +1,392 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernels for ConvTranspose3d + BatchNorm3d + AvgPool3d fusion
+# We will fuse ConvTranspose3d, BatchNorm (running mean/var handling is complex, 
+# so we assume inference mode where BN is just scale/shift), and two AvgPools.
+# However, to keep it robust and strictly follow the "replace operators" pattern while 
+# acknowledging that full fusion of TransposeConv is non-trivial in a single naive kernel,
+# we will implement a highly optimized ConvTranspose3d + BatchNorm + Pooling sequence 
+# or separate optimized kernels if necessary. 
+# Given the constraints and typical optimization strategies, let's create a fused kernel 
+# for ConvTranspose3d followed by BatchNorm (inference) and AvgPool.
+
+# Note: Implementing a full 3D Transpose Convolution in a single custom CUDA kernel from scratch 
+# is extremely verbose. A more practical "custom operator" approach for this specific architecture 
+# often involves optimizing the most expensive part or fusing simpler ops.
+# However, the prompt asks for freedom. Let's implement a fused kernel that performs:
+# 1. ConvTranspose3d (im2col + gemm style or direct indexing)
+# 2. BatchNorm (scale/shift)
+# 3. AvgPool3d (kernel 2x2x2)
+
+# To ensure the code compiles and is functional without external libraries like CUTLASS, 
+# we will write a direct indexing kernel for ConvTranspose3d which is memory-bound but simple to implement correctly in inline CUDA.
+# We will fuse BatchNorm and AvgPool into the same kernel or subsequent kernels.
+# Let's do a single fused kernel for ConvTranspose3d + BatchNorm + AvgPool1 + AvgPool2.
+
+fused_ops_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper to calculate output index for ConvTranspose3d
+// Input: (N, C_in, D_in, H_in, W_in)
+// Weight: (C_out, C_in, K_d, K_h, K_w)
+// Output: (N, C_out, D_out, H_out, W_out)
+// stride=2, padding=1, kernel_size=3
+
+__global__ void fused_conv_bn_pool_kernel(
+    const float* input,       // [N, C_in, D_in, H_in, W_in]
+    const float* weight,      // [C_out, C_in, K_d, K_h, K_w]
+    const float* bias,        // [C_out]
+    const float* bn_mean,     // [C_out]
+    const float* bn_var,      // [C_out]
+    const float* bn_weight,   // [C_out]
+    const float* bn_bias,     // [C_out]
+    float* output,            // [N, C_out, D_out, H_out, W_out]
+    
+    int N, int C_in, int D_in, int H_in, int W_in,
+    int C_out, int K_d, int K_h, int K_w,
+    int stride, int padding,
+    int D_out, int H_out, int W_out
+) {
+    // Each thread handles one element of the final output tensor
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C_out * D_out * H_out * W_out;
+    
+    if (idx >= total_elements) return;
+
+    // Decode index to coordinates
+    int w_out = idx % W_out;
+    int h_out = (idx / W_out) % H_out;
+    int d_out = (idx / (W_out * H_out)) % D_out;
+    int c_out = (idx / (W_out * H_out * D_out)) % C_out;
+    int n = idx / (W_out * H_out * D_out * C_out);
+
+    // ConvTranspose3d computation
+    // Output position (n, c_out, d_out, h_out, w_out) is influenced by input positions.
+    // For stride=2, padding=1, kernel=3:
+    // The relationship between output coordinates and input coordinates for the top-left of the kernel window:
+    // i_d = d_out - padding - (K_d - 1)/2 ? No, let's use standard formula.
+    // In PyTorch ConvTranspose3d with stride=s, padding=p, kernel=k:
+    // Output size = (Input - 1) * s - 2*p + k
+    // Here: D_out = (D_in - 1)*2 - 2*1 + 3 = 2*D_in - 2. 
+    // Let's verify dimensions. If D_in=32, D_out = 64-2=62? 
+    // Wait, the example uses stride=2, padding=1, kernel=3.
+    // PyTorch ConvTranspose3d output size formula: (n_in - 1) * stride - 2 * padding + dilation * (kernel_size - 1) + output_padding + 1
+    // Assuming output_padding=0, dilation=1:
+    // D_out = (D_in - 1)*2 - 2*1 + 3 = 2*D_in - 2.
+    
+    // To compute the value at (n, c_out, d_out, h_out, w_out):
+    // We iterate over the kernel dimensions and map back to input coordinates.
+    // Input coordinate corresponding to output (d_out, h_out, w_out) with kernel offset (kd, kh, kw):
+    // i_d = d_out - padding + kd * stride ? 
+    // Actually, for TransposeConv:
+    // The gradient of loss w.r.t input is like a conv. The forward pass is like a transposed convolution.
+    // A common way to implement it in a kernel is to scatter-add from output to input or gather from input to output.
+    // Gathering from input is better for coalesced reads if we structure the loops right, but here we are writing one output element.
+    
+    float sum = 0.0f;
+    
+    // Iterate over kernel dimensions and input channels
+    for (int c_in = 0; c_in < C_in; ++c_in) {
+        for (int kd = 0; kd < K_d; ++kd) {
+            for (int kh = 0; kh < K_h; ++kh) {
+                for (int kw = 0; kw < K_w; ++kw) {
+                    // Calculate input coordinates
+                    int i_d = d_out - padding + kd * stride;
+                    int i_h = h_out - padding + kh * stride;
+                    int i_w = w_out - padding + kw * stride;
+
+                    // Check bounds
+                    if (i_d >= 0 && i_d < D_in && 
+                        i_h >= 0 && i_h < H_in && 
+                        i_w >= 0 && i_w < W_in) {
+                        
+                        int input_idx = ((n * C_in + c_in) * D_in + i_d) * H_in + i_h) * W_in + i_w;
+                        int weight_idx = ((c_out * C_in + c_in) * K_d + kd) * K_h + kh) * K_w + kw;
+                        
+                        sum += input[input_idx] * weight[weight_idx];
+                    }
+                }
+            }
+        }
+    }
+
+    // Add bias
+    sum += bias[c_out];
+
+    // Batch Normalization (Inference mode: y = gamma * (x - mu) / sqrt(sigma^2 + eps) + beta)
+    float var_eps = bn_var[c_out] + 1e-5f;
+    float inv_std = rsqrtf(var_eps);
+    sum = bn_weight[c_out] * (sum - bn_mean[c_out]) * inv_std + bn_bias[c_out];
+
+    // AvgPool3d Layer 1 (Kernel 2x2x2, Stride 2)
+    // Output of ConvTranspose+BN is D_out x H_out x W_out.
+    // After Pool1: D_pool1 = ceil(D_out / 2), etc.
+    int d_p1 = d_out / 2;
+    int h_p1 = h_out / 2;
+    int w_p1 = w_out / 2;
+    
+    // We need to sum over the 2x2x2 window in the previous spatial dimensions.
+    // The previous spatial dimensions were D_prev, H_prev, W_prev (which are D_out, H_out, W_out from conv).
+    // Let's call them D_c, H_c, W_c.
+    int D_c = D_out; 
+    int H_c = H_out;
+    int W_c = W_out;
+
+    float pool1_sum = 0.0f;
+    for (int kd_p1 = 0; kd_p1 < 2; ++kd_p1) {
+        for (int kh_p1 = 0; kh_p1 < 2; ++kh_p1) {
+            for (int kw_p1 = 0; kw_p1 < 2; ++kw_p1) {
+                int i_d_c = d_p1 * 2 + kd_p1;
+                int i_h_c = h_p1 * 2 + kh_p1;
+                int i_w_c = w_p1 * 2 + kw_p1;
+
+                if (i_d_c < D_c && i_h_c < H_c && i_w_c < W_c) {
+                    // We need to fetch the value from the Conv+BN output.
+                    // But we are currently computing one element of the FINAL output.
+                    // This implies we need to read from a temporary buffer or recompute.
+                    // Recomputing is expensive. Reading from global memory is better.
+                    // However, this kernel writes to 'output'. It cannot read from 'output' for intermediate steps easily without double buffering or separate kernels.
+                    
+                    // Strategy Change: 
+                    // Since we are writing the final output, and AvgPool depends on the Conv+BN output,
+                    // we must either:
+                    // 1. Write Conv+BN to a temp buffer, then Pool.
+                    // 2. Re-calculate Conv+BN for each pool neighbor (very slow).
+                    // 3. Implement two separate kernels and chain them in Python.
+                    
+                    // Given the complexity of fusing everything into one kernel without shared memory tiling strategies 
+                    // that are complex to write inline, let's stick to a simpler but effective optimization:
+                    // Optimize ConvTranspose3d + BatchNorm as one kernel, and AvgPool as another?
+                    // Or just optimize the whole thing by doing two kernels.
+                    
+                    // Let's restart the strategy for "Real Code" that compiles.
+                    // We will create TWO custom operators.
+                    // 1. conv_transpose_bn: Fused ConvTranspose3d + BatchNorm
+                    // 2. avg_pool_fused: Two sequential AvgPools (or one kernel doing both)
+                    
+                    // Actually, let's just do ONE kernel for ConvTranspose3d + BatchNorm, 
+                    // and use PyTorch's native AvgPool which is already highly optimized in cuDNN/cuBLAS backend.
+                    // The prompt says "replace ... to get speedups". Replacing the heavy ConvTranspose with a custom one 
+                    // that fuses BN is a significant win. Native AvgPool is fast enough.
+                    
+                    // So, we will output the result of Conv+BN into 'output' for now? No, 'output' is the final return.
+                    // Let's define the kernel to produce the intermediate tensor, and then apply pooling in Python?
+                    // The prompt asks for "ModelNew". We can use custom ops inside ModelNew.
+                    
+                    // Let's implement:
+                    // 1. Custom ConvTranspose3d + BatchNorm (Inference)
+                    // 2. Use native AvgPool3d (it's fast).
+                    
+                    // But wait, the prompt example replaces `a+b`. It doesn't force replacing EVERYTHING.
+                    // "You may make the decision to replace some operators ... and leave others unchanged."
+                    
+                    // So, I will implement a custom CUDA kernel for ConvTranspose3d + BatchNorm fusion.
+                    // This is a significant optimization because it saves memory writes/reads between these two ops.
+                }
+            }
+        }
+    }
+    
+    // Since the above logic got tangled with pooling, let's simplify.
+    // We will write a kernel for ConvTranspose3d + BatchNorm.
+    // The pooling will be done by native PyTorch ops in the forward pass of ModelNew.
+    
+    // To make this work, we need to return the intermediate result from the custom op?
+    // No, the custom op should return the final result if it's fused.
+    // If we don't fuse pooling, the custom op returns Conv+BN output.
+    
+    // Let's rewrite the kernel to ONLY do ConvTranspose3d + BatchNorm.
+    // And store the result in a temporary tensor allocated inside the Python wrapper? 
+    // No, the CUDA function signature must match what we call.
+    
+    // Let's define the custom op `conv_transpose_bn` that takes input, weight, bias, bn_params and returns Conv+BN output.
+    // Then ModelNew calls this, then applies AvgPool1, AvgPool2.
+    
+    // This is a valid optimization strategy.
+}
+
+// We need to separate the logic. Let's define the kernel properly for ConvTranspose3d + BN.
+__global__ void conv_transpose_bn_kernel(
+    const float* input,       // [N, C_in, D_in, H_in, W_in]
+    const float* weight,      // [C_out, C_in, K_d, K_h, K_w]
+    const float* bias,        // [C_out]
+    const float* bn_mean,     // [C_out]
+    const float* bn_var,      // [C_out]
+    const float* bn_weight,   // [C_out]
+    const float* bn_bias,     // [C_out]
+    float* output,            // [N, C_out, D_out, H_out, W_out]
+    
+    int N, int C_in, int D_in, int H_in, int W_in,
+    int C_out, int K_d, int K_h, int K_w,
+    int stride, int padding,
+    int D_out, int H_out, int W_out
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C_out * D_out * H_out * W_out;
+    
+    if (idx >= total_elements) return;
+
+    int w_out = idx % W_out;
+    int h_out = (idx / W_out) % H_out;
+    int d_out = (idx / (W_out * H_out)) % D_out;
+    int c_out = (idx / (W_out * H_out * D_out)) % C_out;
+    int n = idx / (W_out * H_out * D_out * C_out);
+
+    float sum = 0.0f;
+    
+    for (int c_in = 0; c_in < C_in; ++c_in) {
+        for (int kd = 0; kd < K_d; ++kd) {
+            for (int kh = 0; kh < K_h; ++kh) {
+                for (int kw = 0; kw < K_w; ++kw) {
+                    int i_d = d_out - padding + kd * stride;
+                    int i_h = h_out - padding + kh * stride;
+                    int i_w = w_out - padding + kw * stride;
+
+                    if (i_d >= 0 && i_d < D_in && 
+                        i_h >= 0 && i_h < H_in && 
+                        i_w >= 0 && i_w < W_in) {
+                        
+                        int input_idx = ((n * C_in + c_in) * D_in + i_d) * H_in + i_h) * W_in + i_w;
+                        int weight_idx = ((c_out * C_in + c_in) * K_d + kd) * K_h + kh) * K_w + kw;
+                        
+                        sum += input[input_idx] * weight[weight_idx];
+                    }
+                }
+            }
+        }
+    }
+
+    sum += bias[c_out];
+
+    float var_eps = bn_var[c_out] + 1e-5f;
+    float inv_std = rsqrtf(var_eps);
+    output[idx] = bn_weight[c_out] * (sum - bn_mean[c_out]) * inv_std + bn_bias[c_out];
+}
+
+torch::Tensor conv_transpose_bn_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor bn_mean,
+    torch::Tensor bn_var,
+    torch::Tensor bn_weight,
+    torch::Tensor bn_bias
+) {
+    auto N = input.size(0);
+    auto C_in = input.size(1);
+    auto D_in = input.size(2);
+    auto H_in = input.size(3);
+    auto W_in = input.size(4);
+
+    auto C_out = weight.size(0);
+    auto K_d = weight.size(2);
+    auto K_h = weight.size(3);
+    auto K_w = weight.size(4);
+
+    int stride = 2;
+    int padding = 1;
+
+    // Calculate output dimensions for ConvTranspose3d
+    // D_out = (D_in - 1) * stride - 2 * padding + K_d
+    int D_out = (D_in - 1) * stride - 2 * padding + K_d;
+    int H_out = (H_in - 1) * stride - 2 * padding + K_h;
+    int W_out = (W_in - 1) * stride - 2 * padding + K_w;
+
+    auto output = torch::zeros({N, C_out, D_out, H_out, W_out}, input.options());
+
+    const int block_size = 256;
+    int total_elements = N * C_out * D_out * H_out * W_out;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    conv_transpose_bn_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        bn_mean.data_ptr<float>(),
+        bn_var.data_ptr<float>(),
+        bn_weight.data_ptr<float>(),
+        bn_bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        N, C_in, D_in, H_in, W_in,
+        C_out, K_d, K_h, K_w,
+        stride, padding,
+        D_out, H_out, W_out
+    );
+
+    return output;
+}
+"""
+
+conv_transpose_bn_cpp_source = (
+    "torch::Tensor conv_transpose_bn_cuda("
+    "torch::Tensor input,"
+    "torch::Tensor weight,"
+    "torch::Tensor bias,"
+    "torch::Tensor bn_mean,"
+    "torch::Tensor bn_var,"
+    "torch::Tensor bn_weight,"
+    "torch::Tensor bn_bias"
+    ");"
+)
+
+# Compile the inline CUDA code
+conv_transpose_bn = load_inline(
+    name="conv_transpose_bn",
+    cpp_sources=conv_transpose_bn_cpp_source,
+    cuda_sources=fused_ops_source,
+    functions=["conv_transpose_bn_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias_shape):
+        super(ModelNew, self).__init__()
+        
+        # Store parameters for the custom operator
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        
+        # Initialize weights and buffers using standard PyTorch modules to get correct shapes/initialization
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.batch_norm = nn.BatchNorm3d(out_channels)
+        
+        # AvgPool layers remain unchanged as they are already efficient
+        self.avg_pool1 = nn.AvgPool3d(kernel_size=2)
+        self.avg_pool2 = nn.AvgPool3d(kernel_size=2)
+
+    def forward(self, x):
+        # Get parameters from the standard modules
+        weight = self.conv_transpose.weight
+        bias = self.conv_transpose.bias
+        bn_mean = self.batch_norm.running_mean
+        bn_var = self.batch_norm.running_var
+        bn_weight = self.batch_norm.weight
+        bn_bias = self.batch_norm.bias
+        
+        # Use custom fused CUDA operator for ConvTranspose3d + BatchNorm
+        x = conv_transpose_bn.conv_transpose_bn_cuda(
+            x, weight, bias, bn_mean, bn_var, bn_weight, bn_bias
+        )
+        
+        # Apply native AvgPool layers
+        x = self.avg_pool1(x)
+        x = self.avg_pool2(x)
+        
+        return x
+
+
+def get_inputs():
+    return [torch.rand(64, 3, 32, 32, 32)]
+
+def get_init_inputs():
+    return [3, 16, 3, 2, 1, (16, 1, 1, 1)]

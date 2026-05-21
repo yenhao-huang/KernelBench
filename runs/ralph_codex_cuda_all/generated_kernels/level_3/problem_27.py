@@ -1,0 +1,112 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+gap_linear_cpp_source = """
+torch::Tensor gap_linear_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias);
+"""
+
+gap_linear_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void gap_linear_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ out,
+    int N, int C, int H, int W, int K
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * K;
+    if (idx >= total) return;
+
+    int n = idx / K;
+    int k = idx - n * K;
+    int HW = H * W;
+
+    float acc = b[k];
+
+    for (int c = 0; c < C; ++c) {
+        const float* xp = x + ((n * C + c) * H * W);
+        float sum = 0.0f;
+
+        int i = 0;
+        for (; i + 3 < HW; i += 4) {
+            sum += xp[i] + xp[i + 1] + xp[i + 2] + xp[i + 3];
+        }
+        for (; i < HW; ++i) {
+            sum += xp[i];
+        }
+
+        acc += (sum / (float)HW) * w[k * C + c];
+    }
+
+    out[idx] = acc;
+}
+
+torch::Tensor gap_linear_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias) {
+    int N = x.size(0);
+    int C = x.size(1);
+    int H = x.size(2);
+    int W = x.size(3);
+    int K = weight.size(0);
+
+    auto out = torch::empty({N, K}, x.options());
+
+    const int threads = 128;
+    const int blocks = (N * K + threads - 1) / threads;
+
+    gap_linear_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C, H, W, K
+    );
+
+    return out;
+}
+"""
+
+gap_linear_ext = load_inline(
+    name="regnet_gap_linear_ext",
+    cpp_sources=gap_linear_cpp_source,
+    cuda_sources=gap_linear_cuda_source,
+    functions=["gap_linear_cuda"],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_channels, stages, block_widths, output_classes):
+        super(ModelNew, self).__init__()
+
+        self.stages = stages
+        self.block_widths = block_widths
+
+        layers = []
+        current_channels = input_channels
+
+        for i in range(stages):
+            layers.append(self._make_stage(current_channels, block_widths[i]))
+            current_channels = block_widths[i]
+
+        self.feature_extractor = nn.Sequential(*layers)
+        self.fc = nn.Linear(block_widths[-1], output_classes)
+        self.gap_linear_ext = gap_linear_ext
+
+    def _make_stage(self, in_channels, out_channels):
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+        )
+
+    def forward(self, x):
+        x = self.feature_extractor(x)
+        return self.gap_linear_ext.gap_linear_cuda(x, self.fc.weight, self.fc.bias)

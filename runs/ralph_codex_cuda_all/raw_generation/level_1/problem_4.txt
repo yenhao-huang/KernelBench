@@ -1,0 +1,151 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+matvec_cpp_source = """
+torch::Tensor matvec_cuda(torch::Tensor A, torch::Tensor B);
+"""
+
+matvec_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+#define ROWS_PER_BLOCK 8
+#define THREADS 256
+
+__global__ void matvec_kernel(const float* __restrict__ A,
+                              const float* __restrict__ B,
+                              float* __restrict__ C,
+                              int M,
+                              int K) {
+    const int row_base = blockIdx.x * ROWS_PER_BLOCK;
+    const int tid = threadIdx.x;
+    const int K4 = K >> 2;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    float acc4 = 0.0f;
+    float acc5 = 0.0f;
+    float acc6 = 0.0f;
+    float acc7 = 0.0f;
+
+    const float4* __restrict__ B4 = reinterpret_cast<const float4*>(B);
+
+    const float* row0 = A + (row_base + 0) * K;
+    const float* row1 = A + (row_base + 1) * K;
+    const float* row2 = A + (row_base + 2) * K;
+    const float* row3 = A + (row_base + 3) * K;
+    const float* row4 = A + (row_base + 4) * K;
+    const float* row5 = A + (row_base + 5) * K;
+    const float* row6 = A + (row_base + 6) * K;
+    const float* row7 = A + (row_base + 7) * K;
+
+    const float4* __restrict__ A0 = reinterpret_cast<const float4*>(row0);
+    const float4* __restrict__ A1 = reinterpret_cast<const float4*>(row1);
+    const float4* __restrict__ A2 = reinterpret_cast<const float4*>(row2);
+    const float4* __restrict__ A3 = reinterpret_cast<const float4*>(row3);
+    const float4* __restrict__ A4 = reinterpret_cast<const float4*>(row4);
+    const float4* __restrict__ A5 = reinterpret_cast<const float4*>(row5);
+    const float4* __restrict__ A6 = reinterpret_cast<const float4*>(row6);
+    const float4* __restrict__ A7 = reinterpret_cast<const float4*>(row7);
+
+    for (int i = tid; i < K4; i += THREADS) {
+        float4 b = B4[i];
+
+        float4 a0 = A0[i];
+        float4 a1 = A1[i];
+        float4 a2 = A2[i];
+        float4 a3 = A3[i];
+        float4 a4 = A4[i];
+        float4 a5 = A5[i];
+        float4 a6 = A6[i];
+        float4 a7 = A7[i];
+
+        acc0 += a0.x * b.x + a0.y * b.y + a0.z * b.z + a0.w * b.w;
+        acc1 += a1.x * b.x + a1.y * b.y + a1.z * b.z + a1.w * b.w;
+        acc2 += a2.x * b.x + a2.y * b.y + a2.z * b.z + a2.w * b.w;
+        acc3 += a3.x * b.x + a3.y * b.y + a3.z * b.z + a3.w * b.w;
+        acc4 += a4.x * b.x + a4.y * b.y + a4.z * b.z + a4.w * b.w;
+        acc5 += a5.x * b.x + a5.y * b.y + a5.z * b.z + a5.w * b.w;
+        acc6 += a6.x * b.x + a6.y * b.y + a6.z * b.z + a6.w * b.w;
+        acc7 += a7.x * b.x + a7.y * b.y + a7.z * b.z + a7.w * b.w;
+    }
+
+    __shared__ float smem[ROWS_PER_BLOCK][THREADS];
+
+    smem[0][tid] = acc0;
+    smem[1][tid] = acc1;
+    smem[2][tid] = acc2;
+    smem[3][tid] = acc3;
+    smem[4][tid] = acc4;
+    smem[5][tid] = acc5;
+    smem[6][tid] = acc6;
+    smem[7][tid] = acc7;
+    __syncthreads();
+
+    for (int stride = THREADS >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[0][tid] += smem[0][tid + stride];
+            smem[1][tid] += smem[1][tid + stride];
+            smem[2][tid] += smem[2][tid + stride];
+            smem[3][tid] += smem[3][tid + stride];
+            smem[4][tid] += smem[4][tid + stride];
+            smem[5][tid] += smem[5][tid + stride];
+            smem[6][tid] += smem[6][tid + stride];
+            smem[7][tid] += smem[7][tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        C[row_base + 0] = smem[0][0];
+        C[row_base + 1] = smem[1][0];
+        C[row_base + 2] = smem[2][0];
+        C[row_base + 3] = smem[3][0];
+        C[row_base + 4] = smem[4][0];
+        C[row_base + 5] = smem[5][0];
+        C[row_base + 6] = smem[6][0];
+        C[row_base + 7] = smem[7][0];
+    }
+}
+
+torch::Tensor matvec_cuda(torch::Tensor A, torch::Tensor B) {
+    const int M = A.size(0);
+    const int K = A.size(1);
+
+    auto C = torch::empty({M, 1}, A.options());
+
+    const dim3 block(THREADS);
+    const dim3 grid((M + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+
+    matvec_kernel<<<grid, block>>>(A.data_ptr<float>(),
+                                   B.data_ptr<float>(),
+                                   C.data_ptr<float>(),
+                                   M,
+                                   K);
+    return C;
+}
+"""
+
+matvec_ext = load_inline(
+    name="matvec_ext_kernelbench",
+    cpp_sources=matvec_cpp_source,
+    cuda_sources=matvec_cuda_source,
+    functions=["matvec_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.matvec_ext = matvec_ext
+
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        return self.matvec_ext.matvec_cuda(A, B)
+```

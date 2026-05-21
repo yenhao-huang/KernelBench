@@ -1,0 +1,26 @@
+{
+  "backend": "cuda",
+  "codex_command": "codex",
+  "codex_model": null,
+  "codex_timeout_sec": 900,
+  "dataset_src": "local",
+  "expected_total": 270,
+  "gpu_arch": "Ada",
+  "levels": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "limit": null,
+  "max_tokens": 8192,
+  "measure_performance": false,
+  "model_name": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "num_correct_trials": 5,
+  "precision": "fp32",
+  "prompt_option": "one_shot",
+  "server_address": "127.0.0.1",
+  "server_port": 3133,
+  "server_type": "local_chat",
+  "temperature": 0.0
+}

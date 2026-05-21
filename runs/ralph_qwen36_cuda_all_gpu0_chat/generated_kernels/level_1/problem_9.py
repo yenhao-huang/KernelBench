@@ -1,0 +1,96 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernel for matrix multiplication optimized for tall-skinny matrices.
+# We use a block-based approach where each thread block computes a tile of the output matrix C.
+# Given M=32768, N=32, K=32 (or similar dimensions), we want to maximize memory coalescing and register usage.
+# A common strategy for GEMM is to use shared memory for tiles of A and B.
+# However, for very tall-skinny matrices (M >> N), a simpler approach often works well:
+# Each thread computes one element of C, or a small block of elements.
+# Let's implement a standard tiled GEMM but tuned for these dimensions.
+# Since N is small (32), we can have each thread compute multiple rows if M is large, 
+# or use a 1D grid where each thread computes one row of C (if K is small enough to fit in registers).
+# Here K=N=32. So each thread can compute one element C[i,j] by looping over K.
+# This avoids shared memory overhead and is very efficient for this specific shape.
+
+gemm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void gemm_tall_skinny_kernel(
+    const float* __restrict__ A, 
+    const float* __restrict__ B, 
+    float* __restrict__ C, 
+    int M, 
+    int N, 
+    int K) 
+{
+    // Each thread computes one element of the output matrix C.
+    // C is M x N.
+    // Thread index maps to (row, col) in C.
+    
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int col = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (row < M && col < N) {
+        float sum = 0.0f;
+        // Unroll the loop over K for better performance if K is small
+        // Here K=32, which is small enough to keep in registers.
+        #pragma unroll
+        for (int k = 0; k < K; ++k) {
+            sum += A[row * K + k] * B[k * N + col];
+        }
+        C[row * N + col] = sum;
+    }
+}
+
+torch::Tensor gemm_tall_skinny_cuda(torch::Tensor A, torch::Tensor B) {
+    auto M = A.size(0);
+    auto K_A = A.size(1);
+    auto N = B.size(1);
+    auto K_B = B.size(0);
+
+    // Ensure dimensions match for multiplication: (M, K) * (K, N) -> (M, N)
+    TORCH_CHECK(K_A == K_B, "Inner dimensions of A and B must match");
+    
+    auto C = torch::empty({M, N}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+
+    const int block_size_x = 16;
+    const int block_size_y = 16;
+    
+    dim3 block(block_size_x, block_size_y);
+    dim3 grid((M + block_size_x - 1) / block_size_x, (N + block_size_y - 1) / block_size_y);
+
+    gemm_tall_skinny_kernel<<<grid, block>>>(A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), M, N, K_A);
+
+    return C;
+}
+"""
+
+gemm_cpp_source = (
+    "torch::Tensor gemm_tall_skinny_cuda(torch::Tensor A, torch::Tensor B);"
+)
+
+# Compile the inline CUDA code for matrix multiplication
+gemm_module = load_inline(
+    name="gemm_tall_skinny",
+    cpp_sources=gemm_cpp_source,
+    cuda_sources=gemm_source,
+    functions=["gemm_tall_skinny_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using custom CUDA operator for matrix multiplication.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.gemm = gemm_module
+
+    def forward(self, A, B):
+        return self.gemm.gemm_tall_skinny_cuda(A, B)

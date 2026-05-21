@@ -1,0 +1,106 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+#define BM 16
+#define BN 16
+#define BK 32
+
+__global__ void matmul_large_k_kernel(const float* __restrict__ A,
+                                      const float* __restrict__ B,
+                                      float* __restrict__ C,
+                                      int M, int N, int K) {
+    __shared__ float As[BM][BK + 1];
+    __shared__ float Bs[BK][BN + 1];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int row = blockIdx.y * BM + ty;
+    const int col = blockIdx.x * BN + tx;
+
+    float acc = 0.0f;
+
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        const int linear = ty * BN + tx;
+
+        #pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            int idx = linear + i * 256;
+            int a_r = idx / BK;
+            int a_k = idx - a_r * BK;
+            int g_r = blockIdx.y * BM + a_r;
+            int g_k = k0 + a_k;
+            As[a_r][a_k] = (g_r < M && g_k < K) ? A[g_r * K + g_k] : 0.0f;
+        }
+
+        #pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            int idx = linear + i * 256;
+            int b_k = idx / BN;
+            int b_c = idx - b_k * BN;
+            int g_k = k0 + b_k;
+            int g_c = blockIdx.x * BN + b_c;
+            Bs[b_k][b_c] = (g_k < K && g_c < N) ? B[g_k * N + g_c] : 0.0f;
+        }
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int kk = 0; kk < BK; ++kk) {
+            acc = fmaf(As[ty][kk], Bs[kk][tx], acc);
+        }
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = acc;
+    }
+}
+
+torch::Tensor matmul_large_k_cuda(torch::Tensor A, torch::Tensor B) {
+    const int M = A.size(0);
+    const int K = A.size(1);
+    const int N = B.size(1);
+
+    auto C = torch::empty({M, N}, A.options());
+
+    dim3 block(BN, BM);
+    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+
+    matmul_large_k_kernel<<<grid, block>>>(
+        A.data_ptr<float>(),
+        B.data_ptr<float>(),
+        C.data_ptr<float>(),
+        M, N, K
+    );
+
+    return C;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor matmul_large_k_cuda(torch::Tensor A, torch::Tensor B);
+"""
+
+matmul_large_k = load_inline(
+    name="matmul_large_k_inline_kernelbench",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["matmul_large_k_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.matmul_large_k = matmul_large_k
+
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        return self.matmul_large_k.matmul_large_k_cuda(A, B)

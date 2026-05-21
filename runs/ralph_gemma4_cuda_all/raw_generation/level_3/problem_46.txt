@@ -1,0 +1,132 @@
+im.
+1thought
+<channel|>```python
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch as th
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernel to fuse the NetVLAD aggregation steps.
+# Specifically, it handles the weighted sum of features (assignment * x) 
+# and the subtraction of the cluster mean (a) in a single pass to reduce memory bandwidth.
+# This kernel performs: vlad[k, d] = sum_{n} (assignment[n, k] * x[n, d]) - (sum_{n} assignment[n, k]) * clusters2[k, d]
+# Note: The original code calculates 'a' as (sum_n assignment[n, k]) * clusters2[k, d].
+# We can rewrite the expression as: vlad[k, d] = sum_{n} (assignment[n, k] * (x[n, d] - clusters2[k, d]))
+# This is much more numerically stable and efficient.
+
+vlad_fusion_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void vlad_fusion_kernel(
+    const float* __restrict__ x,          // [B, N, D]
+    const float* __restrict__ assignment, // [B, N, K]
+    const float* __restrict__ clusters2,  // [1, D, K] -> accessed as [K, D] or [D, K]
+    float* __restrict__ vlad,             // [B, D, K]
+    int B, int N, int D, int K) {
+    
+    int b = blockIdx.z;
+    int k = blockIdx.y;
+    int d = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (b < B && k < K && d < D) {
+        float sum = 0.0f;
+        float c2_val = clusters2[d * K + k]; // clusters2 is [1, D, K]
+        
+        for (int n = 0; n < N; ++n) {
+            float assign_val = assignment[(b * N * K) + (n * K) + k];
+            float x_val = x[(b * N * D) + (n * D) + d];
+            sum += assign_val * (x_val - c2_val);
+        }
+        vlad[(b * D * K) + (d * K) + k] = sum;
+    }
+}
+
+torch::Tensor vlad_fusion_cuda(torch::Tensor x, torch::Tensor assignment, torch::Tensor clusters2) {
+    int B = x.size(0);
+    int N = x.size(1);
+    int D = x.size(2);
+    int K = assignment.size(2);
+
+    auto vlad = torch::zeros({B, D, K}, x.options());
+
+    dim3 threads(256);
+    dim3 blocks((D + threads.x - 1) / threads.x, K, B);
+
+    vlad_fusion_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        assignment.data_ptr<float>(),
+        clusters2.data_ptr<float>(),
+        vlad.data_ptr<float>(),
+        B, N, D, K
+    );
+
+    return vlad;
+}
+"""
+
+vlad_fusion_cpp_source = "torch::Tensor vlad_fusion_cuda(torch::Tensor x, torch::Tensor assignment, torch::Tensor clusters2);"
+
+vlad_fusion_lib = load_inline(
+    name="vlad_fusion_lib",
+    cpp_sources=vlad_fusion_cpp_source,
+    cuda_sources=vlad_fusion_source,
+    functions=["vlad_fusion_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, cluster_size, feature_size, ghost_clusters):
+        super(ModelNew, self).__init__()
+
+        self.feature_size = feature_size
+        self.cluster_size = cluster_size
+        self.ghost_clusters = ghost_clusters
+
+        init_sc = (1 / math.sqrt(feature_size))
+        clusters_total = cluster_size + ghost_clusters
+
+        self.clusters = nn.Parameter(init_sc * th.randn(feature_size, clusters_total))
+        self.batch_norm = nn.BatchNorm1d(clusters_total)
+        self.clusters2 = nn.Parameter(init_sc * th.randn(1, feature_size, cluster_size))
+        self.out_dim = self.cluster_size * feature_size
+        self.vlad_fusion_lib = vlad_fusion_lib
+
+    def forward(self, x, mask=None):
+        B, N, D = x.shape
+        
+        # 1. Compute assignments
+        # x: [B, N, D] -> [B*N, D]
+        x_flat = x.view(-1, self.feature_size)
+        
+        # assignment: [B*N, K+G]
+        assignment = th.matmul(x_flat, self.clusters)
+        assignment = self.batch_norm(assignment)
+        assignment = F.softmax(assignment, dim=1)
+        
+        # 2. Slice and reshape assignment
+        # Remove ghost clusters and reshape to [B, N, K]
+        assignment = assignment[:, :self.cluster_size]
+        assignment = assignment.view(B, N, self.cluster_size)
+
+        # 3. Fused VLAD aggregation
+        # We use the identity: sum(a * (x - c2)) = sum(a * x) - sum(a) * c2
+        # This avoids the explicit calculation of 'a' and the large matmul/transpose overhead.
+        # The kernel expects clusters2 in [D, K] format for efficient access, 
+        # but our parameter is [1, D, K]. We pass it as is and index accordingly.
+        vlad = self.vlad_fusion_lib.vlad_fusion_cuda(x, assignment, self.clusters2)
+
+        # 4. L2 intra norm (on the D dimension of [B, D, K])
+        # F.normalize on dim=1 (D)
+        vlad = F.normalize(vlad, p=2, dim=1)
+
+        # 5. Flattening + L2 norm
+        # vlad: [B, D, K] -> [B, D*K]
+        vlad = vlad.reshape(B, -1)
+        vlad = F.normalize(vlad, p=2, dim=1)
+        
+        return vlad
+
+```

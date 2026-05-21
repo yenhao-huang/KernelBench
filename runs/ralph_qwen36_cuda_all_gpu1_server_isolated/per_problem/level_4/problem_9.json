@@ -1,0 +1,23 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 52.954,
+  "error": "Isolated KernelBench evaluator failed.",
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_4/problem_9.py",
+  "isolated_eval": {
+    "error": "'BigBirdForCausalLM' object has no attribute 'lm_head'",
+    "error_type": "builtins.AttributeError",
+    "ok": false,
+    "subprocess_output_tail": "[transformers] If you want to use `BigBirdForCausalLM` as a standalone, add `is_decoder=True.`\n\nLoading weights:   0%|          | 0/206 [00:00<?, ?it/s]\nLoading weights: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 206/206 [00:00<00:00, 67365.24it/s]\n[transformers] \u001b[1mBigBirdForCausalLM LOAD REPORT\u001b[0m from: google/bigbird-roberta-base\nKey                         | Status     |  | \n----------------------------+------------+--+-\ncls.seq_relationship.bias   | UNEXPECTED |  | \ncls.seq_relationship.weight | UNEXPECTED |  | \n\nNotes:\n- UNEXPECTED:\tcan be ignored when loading from different task/architecture; not ok if you expect identical arch.\nWarning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.\n[transformers] If you want to use `BigBirdForCausalLM` as a standalone, add `is_decoder=True.`\n\nLoading weights:   0%|          | 0/206 [00:00<?, ?it/s]\nLoading weights: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 206/206 [00:00<00:00, 32981.89it/s]\n[transformers] \u001b[1mBigBirdForCausalLM LOAD REPORT\u001b[0m from: google/bigbird-roberta-base\nKey                         | Status     |  | \n----------------------------+------------+--+-\ncls.seq_relationship.bias   | UNEXPECTED |  | \ncls.seq_relationship.weight | UNEXPECTED |  | \n\nNotes:\n- UNEXPECTED:\tcan be ignored when loading from different task/architecture; not ok if you expect identical arch.\n",
+    "subprocess_returncode": 0,
+    "traceback": "Traceback (most recent call last):\n  File \"<string>\", line 18, in <module>\n  File \"/workspace/external/KernelBench/src/kernelbench/eval.py\", line 562, in eval_kernel_against_ref\n    custom_model = ModelNew(*init_inputs)\n  File \"<string>\", line 175, in __init__\n  File \"/workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1965, in __getattr__\n    raise AttributeError(\nAttributeError: 'BigBirdForCausalLM' object has no attribute 'lm_head'\n"
+  },
+  "level": 4,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 9,
+  "problem_name": "9_google-bigbird-roberta-base_bs32_seq256.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_4/problem_9.txt",
+  "static_warnings": [],
+  "status": "evaluation_error"
+}

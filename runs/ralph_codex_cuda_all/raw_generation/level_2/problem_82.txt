@@ -1,0 +1,144 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_conv_tanh_scale_bias_pool_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    const float* __restrict__ conv_bias,
+    const float* __restrict__ add_bias,
+    float* __restrict__ out,
+    int N, int C_in, int H, int W,
+    int C_out, int K,
+    int Hc, int Wc,
+    int Hp, int Wp,
+    int pool,
+    float scale
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C_out * Hp * Wp;
+    if (idx >= total) return;
+
+    int ow = idx % Wp;
+    int t = idx / Wp;
+    int oh = t % Hp;
+    t /= Hp;
+    int oc = t % C_out;
+    int n = t / C_out;
+
+    float best = -3.4028234663852886e38f;
+
+    int base_ih = oh * pool;
+    int base_iw = ow * pool;
+
+    for (int ph = 0; ph < pool; ++ph) {
+        int ih0 = base_ih + ph;
+        for (int pw = 0; pw < pool; ++pw) {
+            int iw0 = base_iw + pw;
+
+            float acc = conv_bias[oc];
+
+            #pragma unroll
+            for (int ic = 0; ic < 8; ++ic) {
+                const float* xptr = x + ((n * C_in + ic) * H + ih0) * W + iw0;
+                const float* wptr = weight + ((oc * C_in + ic) * K) * K;
+
+                acc += xptr[0 * W + 0] * wptr[0];
+                acc += xptr[0 * W + 1] * wptr[1];
+                acc += xptr[0 * W + 2] * wptr[2];
+                acc += xptr[1 * W + 0] * wptr[3];
+                acc += xptr[1 * W + 1] * wptr[4];
+                acc += xptr[1 * W + 2] * wptr[5];
+                acc += xptr[2 * W + 0] * wptr[6];
+                acc += xptr[2 * W + 1] * wptr[7];
+                acc += xptr[2 * W + 2] * wptr[8];
+            }
+
+            float v = tanhf(acc) * scale + add_bias[oc];
+            best = fmaxf(best, v);
+        }
+    }
+
+    out[idx] = best;
+}
+
+torch::Tensor fused_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor conv_bias,
+    torch::Tensor add_bias,
+    double scale_d,
+    int pool
+) {
+    int N = x.size(0);
+    int C_in = x.size(1);
+    int H = x.size(2);
+    int W = x.size(3);
+    int C_out = weight.size(0);
+    int K = weight.size(2);
+    int Hc = H - K + 1;
+    int Wc = W - K + 1;
+    int Hp = Hc / pool;
+    int Wp = Wc / pool;
+
+    auto out = torch::empty({N, C_out, Hp, Wp}, x.options());
+
+    int total = N * C_out * Hp * Wp;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+
+    fused_conv_tanh_scale_bias_pool_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        conv_bias.data_ptr<float>(),
+        add_bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C_in, H, W,
+        C_out, K,
+        Hc, Wc,
+        Hp, Wp,
+        pool,
+        (float)scale_d
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = "torch::Tensor fused_forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor conv_bias, torch::Tensor add_bias, double scale_d, int pool);"
+
+fused_conv_pool = load_inline(
+    name="fused_conv_tanh_scale_bias_pool_kb",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["fused_forward_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, scaling_factor, bias_shape, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.scaling_factor = scaling_factor
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.pool_kernel_size = pool_kernel_size
+        self.fused = fused_conv_pool
+
+    def forward(self, x):
+        return self.fused.fused_forward_cuda(
+            x.contiguous(),
+            self.conv.weight.contiguous(),
+            self.conv.bias.contiguous(),
+            self.bias.contiguous(),
+            float(self.scaling_factor),
+            int(self.pool_kernel_size),
+        )
+```

@@ -1,0 +1,244 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA implementation for Transposed 1D Convolution (ConvTranspose1d)
+# This kernel performs the operation: out = input * weight^T + bias
+# It handles dilation, stride, and padding logic explicitly.
+
+conv_transpose_1d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper to calculate output length
+__device__ inline int get_out_length(int in_len, int kernel_size, int stride, int padding, int dilation) {
+    return (in_len - 1) * stride - 2 * padding + dilation * (kernel_size - 1) + 1;
+}
+
+__global__ void conv_transpose_1d_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* __restrict__ output,
+    int batch_size,
+    int in_channels,
+    int out_channels,
+    int in_length,
+    int kernel_size,
+    int stride,
+    int padding,
+    int dilation,
+    bool has_bias
+) {
+    // Output dimensions
+    int out_length = get_out_length(in_length, kernel_size, stride, padding, dilation);
+
+    // Each thread handles one element of the output tensor
+    // Global index in the flattened output tensor (excluding batch dim for simplicity in loop structure below)
+    // We will use a 3D grid mapping: blockIdx.z -> batch, blockIdx.y -> out_channel, blockIdx.x -> out_pos
+    
+    int z = blockIdx.z; // Batch index
+    int y = blockIdx.y; // Output channel index
+    int x = blockIdx.x; // Output position index
+
+    if (z >= batch_size || y >= out_channels || x >= out_length) {
+        return;
+    }
+
+    // Calculate base pointers for this thread's data
+    const float* input_ptr = input + z * in_channels * in_length;
+    const float* weight_ptr = weight + y * in_channels * kernel_size;
+    
+    float sum = 0.0f;
+
+    // Iterate over input channels and kernel positions
+    // The relationship between output position 'x' and input position 'i' is:
+    // x = i * stride - padding + dilation * k + padding (conceptually)
+    // More precisely, for a specific output index x, we need to find which input indices contribute.
+    // The standard convolution formula maps input index i to output index o via:
+    // o = i * stride + ... 
+    // For transposed conv, we iterate over the kernel and input channels.
+    
+    // We can derive the valid range of input positions that contribute to output position x.
+    // An input at index 'i' contributes to output index 'o' if:
+    // o = i * stride + dilation * k - padding  (where k is kernel index 0..kernel_size-1)
+    // Rearranging for i given o and k:
+    // i = (o + padding - dilation * k) / stride
+    // This requires (o + padding - dilation * k) to be divisible by stride.
+    
+    // Alternatively, iterate over input channels 'c' and kernel indices 'k'.
+    // For a fixed output position x, which input positions i are involved?
+    // The contribution comes from input[i] where:
+    // x = i * stride + dilation * k - padding  =>  i = (x + padding - dilation * k) / stride
+    
+    for (int c = 0; c < in_channels; ++c) {
+        for (int k = 0; k < kernel_size; ++k) {
+            // Calculate the corresponding input index 'i'
+            int numerator = x + padding - dilation * k;
+            
+            // Check if this maps to a valid integer input index
+            if (numerator >= 0 && numerator % stride == 0) {
+                int i = numerator / stride;
+                
+                // Check bounds for input index
+                if (i >= 0 && i < in_length) {
+                    sum += input_ptr[c * in_length + i] * weight_ptr[c * kernel_size + k];
+                }
+            }
+        }
+    }
+
+    // Add bias if present
+    if (has_bias) {
+        sum += bias[y];
+    }
+
+    // Write to output
+    output[z * out_channels * out_length + y * out_length + x] = sum;
+}
+
+torch::Tensor conv_transpose_1d_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int stride,
+    int padding,
+    int dilation
+) {
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(weight.is_cuda(), "Weight must be a CUDA tensor");
+    
+    const auto batch_size = input.size(0);
+    const auto in_channels = input.size(1);
+    const auto in_length = input.size(2);
+    const auto out_channels = weight.size(0);
+    const auto kernel_size = weight.size(1);
+
+    // Calculate output length
+    int out_length = (in_length - 1) * stride - 2 * padding + dilation * (kernel_size - 1) + 1;
+
+    TORCH_CHECK(out_length > 0, "Output length must be positive");
+
+    auto output = torch::zeros({batch_size, out_channels, out_length}, input.options());
+
+    if (out_length == 0 || batch_size == 0 || in_length == 0) {
+        return output;
+    }
+
+    const bool has_bias = bias.numel() > 0;
+
+    // Configure kernel launch parameters
+    dim3 block(256);
+    dim3 grid(out_length, out_channels, batch_size);
+
+    conv_transpose_1d_kernel<<<grid, block>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        has_bias ? bias.data_ptr<float>() : nullptr,
+        output.data_ptr<float>(),
+        batch_size,
+        in_channels,
+        out_channels,
+        in_length,
+        kernel_size,
+        stride,
+        padding,
+        dilation,
+        has_bias
+    );
+
+    // Check for launch errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA error in conv_transpose_1d: ") + cudaGetErrorString(err));
+    }
+
+    return output;
+}
+"""
+
+conv_transpose_1d_cpp_source = (
+    "torch::Tensor conv_transpose_1d_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, int stride, int padding, int dilation);"
+)
+
+# Compile the inline CUDA code
+conv_transpose_1d_module = load_inline(
+    name="conv_transpose_1d_custom",
+    cpp_sources=conv_transpose_1d_cpp_source,
+    cuda_sources=conv_transpose_1d_source,
+    functions=["conv_transpose_1d_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized Transposed 1D Convolution using custom CUDA operator.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, bias: bool = False):
+        super(ModelNew, self).__init__()
+        
+        # Initialize parameters using standard PyTorch to ensure correct initialization
+        # We will manually manage the weights and bias in forward pass or register them as buffers/params
+        # To keep it simple and compatible with nn.Module state dict, we can use nn.Parameter
+        # However, since we are replacing the operator entirely, we need to store the parameters.
+        
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        
+        # Initialize weight tensor: (out_channels, in_channels, kernel_size)
+        # Standard ConvTranspose1d weight shape is (in_channels, out_channels, kernel_size) for nn.ConvTranspose1d?
+        # Let's check PyTorch docs. 
+        # nn.ConvTranspose1d(weight shape): (in_channels, out_channels, kernel_size)
+        # Wait, standard Conv2d/1d weight is (out, in, k). Transposed usually keeps same shape or swaps?
+        # In PyTorch nn.ConvTranspose1d:
+        # weight shape is (in_channels, out_channels, kernel_size)
+        
+        self.weight = nn.Parameter(torch.empty(in_channels, out_channels, kernel_size))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_channels))
+        else:
+            self.register_parameter('bias', None)
+            
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Kaiming uniform initialization similar to PyTorch default
+        nn.init.kaiming_uniform_(self.weight, a=0.0)
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the transposed 1D convolution using custom CUDA kernel.
+        """
+        # The custom kernel expects weight in shape (out_channels, in_channels, kernel_size) 
+        # based on my implementation above: weight_ptr[y * in_channels * kernel_size + c * kernel_size + k]
+        # where y is out_channel, c is in_channel, k is kernel index.
+        # PyTorch nn.ConvTranspose1d stores weights as (in_channels, out_channels, kernel_size).
+        # So we need to transpose the weight tensor before passing it to the custom kernel.
+        
+        # Transpose weight from (in_channels, out_channels, kernel_size) to (out_channels, in_channels, kernel_size)
+        weight_t = self.weight.transpose(0, 1).contiguous()
+        
+        bias = self.bias if self.bias is not None else torch.empty(0, device=x.device)
+        
+        return conv_transpose_1d_module.conv_transpose_1d_cuda(
+            x, 
+            weight_t, 
+            bias, 
+            self.stride, 
+            self.padding, 
+            self.dilation
+        )
+
+import math

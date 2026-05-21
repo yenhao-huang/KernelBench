@@ -1,0 +1,28 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 71.386,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "runtime_error": "Expected tensor for argument #1 'indices' to have one of the following scalar types: Long, Int; but got torch.cuda.FloatTensor instead (while checking arguments for embedding)",
+      "runtime_error_name": "builtins.RuntimeError"
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_codex_cuda_all/generated_kernels/level_4/problem_15.py",
+  "level": 4,
+  "model_name": "codex-gpt-5.5",
+  "precision": "fp32",
+  "problem_id": 15,
+  "problem_name": "15_google-reformer-enwik8_bs1024_seq32.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_codex_cuda_all/raw_generation/level_4/problem_15.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

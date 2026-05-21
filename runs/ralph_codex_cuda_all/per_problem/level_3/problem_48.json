@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 111.221,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "1401622144.000000",
+        "1392636416.000000",
+        "1446445184.000000",
+        "1459250304.000000",
+        "1360050560.000000"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "1055531162664960.000000",
+        "914793674309632.000000",
+        "914793674309632.000000",
+        "862017116176384.000000",
+        "914793674309632.000000"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_codex_cuda_all/generated_kernels/level_3/problem_48.py",
+  "level": 3,
+  "model_name": "codex-gpt-5.5",
+  "precision": "fp32",
+  "problem_id": 48,
+  "problem_name": "48_Mamba2ReturnY.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_codex_cuda_all/raw_generation/level_3/problem_48.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

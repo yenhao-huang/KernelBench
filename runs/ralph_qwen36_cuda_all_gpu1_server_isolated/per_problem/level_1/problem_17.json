@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 42.169,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "1318580.250000",
+        "1321435.250000",
+        "1321664.375000",
+        "1320134.500000",
+        "1314881.000000"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "4401906688.000000",
+        "4409015808.000000",
+        "4441466368.000000",
+        "4400942080.000000",
+        "4422633984.000000"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_1/problem_17.py",
+  "level": 1,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 17,
+  "problem_name": "17_Matmul_with_transposed_B.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_1/problem_17.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

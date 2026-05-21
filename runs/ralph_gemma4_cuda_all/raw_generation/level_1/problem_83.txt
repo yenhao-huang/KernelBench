@@ -1,0 +1,199 @@
+name: depthwise_conv2d_asymmetric_kernel
+
+depthwise_conv2d_asymmetric_kernel`
+
+depthwise_2d_conv_asymmetric_kernel_cuda_source = 1
+
+depthwise_ways_to_optimize-
+ ways_to_size-size-
+square-square-
+square-idx-square-cdim-cdim-cdim-cdim-
+size-size-let-size-block-block-let-
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# CUDA kernel for asymmetric depthwise convolution (kernel_size x 1)
+depthwise_conv2d_asymmetric_kernel_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void depthwise_conv2d_asymmetric_kernel_impl(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* __restrict__ output,
+    int batch_size, int channels, int height, int width,
+    int kernel_h, int kernel_w, int stride, int padding, int dilation,
+    int out_h, int out_w) 
+{
+    // Each thread handles one output pixel (batch, channel, h, w)
+    int w_idx = blockIdx.x * blockDim.x + threadIdx.x;
+                
+    int h_idx = blockIdx.y * blockDim.y + threadIdx.y;
+                
+    int b_idx = blockIdx.z;
+
+    if (w_idx < out_w) && (h_idx < out_h) && (b_idx < batch_size) {
+        int c_idx = threadIdx.x % 1; // Placeholder for channel logic if needed, 
+        // but for depthwise, depthwise_conv2d_asymmetric_kernel_impl is 
+        // // Each thread a single output pixel (batch, channel, out_h, out_w)
+        // // We'll use a
+        // // (batch, channel, height, width)
+            
+            
+            
+            
+            
+            // We'll use a 2D grid of (batch, channel, out_h, out_w)
+    }
+}
+"""
+```
+
+thought
+<channel|>```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# CUDA kernel for asymmetric depthwise convolution (kernel_size x 1)
+# This kernel optimizes the depthwise convolution by treating it as a 1D spatial convolution 
+# applied per channel, which is the nature of a (K, 1) kernel.
+depthwise_conv_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void depthwise_asymmetric_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* __restrict__ output,
+    int batch_size, int channels, int in_h, int in_w,
+    int kernel_h, int kernel_w, int stride, int padding, int dilation,
+    int out_h, int out_w) 
+{
+    // Indexing: [batch, channel, height, width]
+    int w_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int h_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int c_idx = blockIdx.z % channels;
+    int b_idx = blockIdx.z / channels;
+
+    if (b_idx < batch_size && c_idx < channels && h_idx < out_h && w_idx < out_w) {
+        float sum = 0.0f;
+        
+        // The kernel is (kernel_h, 1)
+        for (int kh = 0; kh < kernel_h; ++kh) {
+            for (int kw = 0; kw < kernel_w; ++kw) {
+                int in_h_idx = h_idx * stride - padding + kh * dilation;
+                int in_w_idx = w_idx * stride - padding + kw * dilation;
+
+                if (in_h_idx >= 0 && in_h_idx < in_h && in_w_idx >= 0 && in_w_idx < in_w) {
+                    // weight shape: [channels, kernel_h, kernel_w]
+                    // input shape: [batch, channels, in_h, in_w]
+                    int weight_idx = c_idx * (kernel_h * kernel_w) + kh * kernel_w + kw;
+                    int input_idx = (((b_idx * channels + c_idx) * in_h + in_h_idx) * in_w) + in_w_idx;
+                    sum += input[input_idx] * weight[weight_idx];
+                }
+            }
+        }
+
+        if (bias != nullptr) {
+            sum += bias[c_idx];
+        }
+
+        int out_idx = (((b_idx * channels + c_idx) * out_h + h_idx) * out_w) + w_idx;
+        output[out_idx] = sum;
+    }
+}
+
+torch::Tensor depthwise_asymmetric_cuda(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    at::optional<torch::Tensor> bias,
+    int stride, int padding, int dilation) 
+{
+    const int batch_size = input.size(0);
+    const int channels = input.size(1);
+    const int in_h = input.size(2);
+    const int in_w = input.size(3);
+    
+    const int kernel_h = weight.size(1);
+    const int kernel_w = weight.size(2);
+
+    const int out_h = (in_h + 2 * padding - dilation * (kernel_h - 1) - 1) / stride + 1;
+    const int out_w = (in_w + 2 * padding - dilation * (kernel_w - 1) - 1) / stride + 1;
+
+    auto output = torch::empty({batch_size, channels, out_h, out_w}, input.options());
+    const float* bias_ptr = bias.has_value() ? bias.value().data_ptr<float>() : nullptr;
+
+    dim3 block(16, 16);
+    dim3 grid((out_w + block.x - 1) / block.x, (out_h + block.y - 1) / block.y, batch_size * channels);
+
+    depthwise_asymmetric_kernel<<<grid, block>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias_ptr,
+        output.data_ptr<float>(),
+        batch_size, channels, in_h, in_w,
+        kernel_h, kernel_w, stride, padding, dilation,
+        out_h, out_w
+    );
+
+    return output;
+}
+"""
+
+depthwise_conv_cpp_source = """
+torch::Tensor depthwise_asymmetric_cuda(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    at::optional<torch::Tensor> bias,
+    int stride, int padding, int dilation);
+"""
+
+# Compile the inline CUDA code
+depthwise_op = load_inline(
+    name="depthwise_op",
+    cpp_sources=depthwise_conv_cpp_source,
+    cuda_sources=depthwise_conv_cuda_source,
+    functions=["depthwise_asymmetric_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized version of the asymmetric depthwise convolution using a custom CUDA kernel.
+    """
+    def __init__(self, in_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, bias: bool = False):
+        super(ModelNew, self).__init__()
+        self.in_channels = in_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        
+        # We still use nn.Parameter to manage weights and biases via PyTorch's autograd
+        # The weight shape for depthwise is (in_channels, kernel_h, kernel_w)
+        self.weight = nn.Parameter(torch.randn(in_channels, kernel_size, 1))
+        if bias:
+            self.bias = nn.Parameter(torch.randn(in_channels))
+        else:
+            self.register_parameter('bias', None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure inputs are contiguous for the CUDA kernel
+        x = x.contiguous()
+        weight = self.weight.contiguous()
+        
+        # Call the custom CUDA operator
+        return depthwise_op.depthwise_asymmetric_cuda(
+            x, 
+            weight, 
+            self.bias, 
+            self.stride, 
+            self.padding, 
+            self.dilation
+        )
+```

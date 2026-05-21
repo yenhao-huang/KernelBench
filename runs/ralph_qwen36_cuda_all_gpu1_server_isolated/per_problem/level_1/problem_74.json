@@ -1,0 +1,28 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 156.098,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "correctness_issue": "Output shape mismatch: Expected torch.Size([32, 64, 131084]), got torch.Size([32, 64, 131165])",
+      "correctness_issue_name": "correctness_issue",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090"
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_1/problem_74.py",
+  "level": 1,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 74,
+  "problem_name": "74_conv_transposed_1D_dilated.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_1/problem_74.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

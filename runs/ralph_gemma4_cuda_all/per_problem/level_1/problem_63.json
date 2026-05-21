@@ -1,0 +1,29 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 40.763,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "runtime_error": "CUDA out of memory. Tried to allocate 1.99 GiB. GPU 0 has a total capacity of 23.52 GiB of which 894.44 MiB is free. Including non-PyTorch memory, this process has 17.41 GiB memory in use. Of the a...",
+      "runtime_error_name": "torch.OutOfMemoryError",
+      "runtime_error_traceback": "Traceback (most recent call last):\n  File \"/workspace/external/KernelBench/src/kernelbench/eval.py\", line 804, in run_and_check_correctness\n    if not torch.allclose(\ntorch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1.99 GiB. GPU 0 has a total capacity of 23.52 GiB of which 894.44 MiB is free. Including non-PyTorch memory, this process has 17.41 GiB memory in use. Of the allocated memory 16.95 GiB is allocated by PyTorch, and 17.67 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)\n"
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_gemma4_cuda_all/generated_kernels/level_1/problem_63.py",
+  "level": 1,
+  "model_name": "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
+  "precision": "fp32",
+  "problem_id": 63,
+  "problem_name": "63_conv_standard_2D__square_input__square_kernel.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_gemma4_cuda_all/raw_generation/level_1/problem_63.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

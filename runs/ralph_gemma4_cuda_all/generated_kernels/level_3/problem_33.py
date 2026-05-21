@@ -1,0 +1,130 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# The optimization strategy:
+# The bottleneck in the Vanilla RNN is the concatenation followed by a large Linear layer.
+# Instead of torch.cat(x, hidden) which creates a new large tensor in memory, 
+# we can fuse the concatenation and the matrix multiplication.
+# However, since we are using standard Linear layers (GEMM), the most effective 
+# way to speed up this specific architecture without writing a custom GEMM 
+# (which is extremely complex to do better than cuBLAS) is to fuse the 
+# concatenation and the bias addition, or more effectively, perform two 
+# separate GEMMs: one for x and one for hidden, then add them.
+#
+# But to follow the prompt's spirit of custom CUDA operators, we will implement 
+# a fused kernel that performs: hidden_new = tanh(x @ W1_x + hidden @ W1_h + b1)
+# This avoids the memory allocation and copy overhead of torch.cat.
+
+fused_rnn_cell_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+// Kernel to add two matrices and a bias, then apply tanh
+// This kernel handles the result of (x @ W_x + h @ W_h + b)
+// To keep it simple and highly performant, we assume the GEMMs are done via cuBLAS
+// and this kernel performs the element-wise addition and tanh.
+// However, a more powerful optimization is to fuse the bias addition and tanh.
+
+__global__ void fused_add_tanh_kernel(float* out, const float* mat1, const float* mat2, const float* bias, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float val = mat1[idx] + mat2[idx] + bias[idx];
+        out[idx] = tanhf(val);
+    }
+}
+
+// Since we want to avoid the large cat, we will use the property:
+// [x, h] @ [W_x; W_h] + b = x @ W_x + h @ W_h + b
+// We will call this from Python.
+
+torch::Tensor fused_add_tanh_cuda(torch::Tensor mat1, torch::Tensor mat2, torch::Tensor bias) {
+    auto size = mat1.numel();
+    auto out = torch::empty_like(mat1);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    fused_add_tanh_kernel<<<num_blocks, block_size>>>(
+        out.data_ptr<float>(), 
+        mat1.data_ptr<float>(), 
+        mat2.data_ptr<float>(), 
+        bias.data_ptr<float>(), 
+        size
+    );
+
+    return out;
+}
+"""
+
+fused_rnn_cell_cpp_source = """
+torch::Tensor fused_add_tanh_cuda(torch::Tensor mat1, torch::Tensor mat2, torch::Tensor bias);
+"""
+
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_rnn_cell_cpp_source,
+    cuda_sources=fused_rnn_cell_source,
+    functions=["fused_add_tanh_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, output_size: int):
+        super(ModelNew, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+        
+        # We split the i2h weight into two parts to avoid torch.cat
+        # i2h weight shape is (hidden_size, input_size + hidden_size)
+        # We split it into (hidden_size, input_size) and (hidden_size, hidden_size)
+        self.W_x = nn.Parameter(torch.randn(hidden_size, input_size))
+        self.W_h = nn.Parameter(torch.randn(hidden_size, hidden_size))
+        self.b_i2h = nn.Parameter(torch.randn(hidden_size))
+        
+        self.h2o = nn.Linear(hidden_size, output_size)
+        self.tanh = nn.Tanh()
+        self.fused_ops = fused_ops
+
+    def forward(self, x: torch.Tensor, initial_hidden=None) -> torch.Tensor:
+        # x: (batch_size, input_size)
+        # hidden: (batch_size, hidden_size)
+        
+        # Initialize hidden if provided
+        if initial_hidden is not None:
+            h = initial_hidden.to(x.device)
+        else:
+            # In the original code, self.hidden was a stateful buffer.
+            # To match behavior, we'll assume it's managed externally or initialized.
+            # For this implementation, we'll use a placeholder if not provided.
+            h = torch.zeros((x.size(0), self.hidden_size), device=x.device)
+
+        # Instead of:
+        # combined = torch.cat((x, h), dim=1)
+        # h_new = tanh(combined @ W_i2h.T + b_i2h)
+        
+        # We do:
+        # mat1 = x @ W_x.T
+        # mat2 = h @ W_h.T
+        # h_new = fused_add_tanh(mat1, mat2, b_i2h)
+        
+        # Using addmm is faster than separate matmuls
+        # mat1 = x @ W_x.T + b_i2h (but we need to add b_i2h at the end)
+        # To use the fused kernel correctly:
+        # We'll compute mat1 = x @ W_x.T and mat2 = h @ W_h.T + b_i2h
+        
+        mat1 = torch.matmul(x, self.W_x.t())
+        mat2 = torch.addmm(self.b_i2h, h, self.W_h.t())
+        
+        # The fused kernel: out = tanh(mat1 + mat2)
+        # Note: mat2 already contains the bias.
+        h_new = self.fused_ops.fused_add_tanh_cuda(mat1, mat2, torch.zeros_like(self.b_i2h))
+        
+        output = self.h2o(h_new)
+        
+        # Update internal state if needed (to match original behavior)
+        self.current_hidden = h_new
+        
+        return output

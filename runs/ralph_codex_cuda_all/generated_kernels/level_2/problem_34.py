@@ -1,0 +1,114 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math_constants.h>
+
+__global__ void ln_gelu_scale_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    float* __restrict__ out,
+    int rows,
+    int cols,
+    float eps,
+    float scale
+) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    extern __shared__ float smem[];
+    float* ssum = smem;
+    float* ssq = smem + blockDim.x;
+
+    float v = 0.0f;
+    if (tid < cols) {
+        v = x[row * cols + tid];
+    }
+
+    ssum[tid] = (tid < cols) ? v : 0.0f;
+    ssq[tid] = (tid < cols) ? v * v : 0.0f;
+    __syncthreads();
+
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            ssum[tid] += ssum[tid + s];
+            ssq[tid] += ssq[tid + s];
+        }
+        __syncthreads();
+    }
+
+    float mean = ssum[0] / (float)cols;
+    float var = ssq[0] / (float)cols - mean * mean;
+    float inv_std = rsqrtf(var + eps);
+
+    if (tid < cols) {
+        float y = (v - mean) * inv_std;
+        y = y * gamma[tid] + beta[tid];
+        float gelu = 0.5f * y * (1.0f + erff(y * 0.70710678118654752440f));
+        out[row * cols + tid] = gelu * scale;
+    }
+}
+
+torch::Tensor ln_gelu_scale_cuda(torch::Tensor x, torch::Tensor gamma, torch::Tensor beta, double eps, double scale) {
+    auto xc = x.contiguous();
+    auto out = torch::empty_like(xc);
+    int cols = (int)gamma.numel();
+    int rows = (int)(xc.numel() / cols);
+
+    int threads = 128;
+    ln_gelu_scale_kernel<<<rows, threads, threads * 2 * sizeof(float)>>>(
+        xc.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        out.data_ptr<float>(),
+        rows,
+        cols,
+        (float)eps,
+        (float)scale
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor ln_gelu_scale_cuda(torch::Tensor x, torch::Tensor gamma, torch::Tensor beta, double eps, double scale);
+"""
+
+ln_gelu_scale_ext = load_inline(
+    name="ln_gelu_scale_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["ln_gelu_scale_cuda"],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias=True, eps=1e-5, scaling_factor=1.0):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            bias=bias,
+        )
+        self.layer_norm = nn.LayerNorm(out_channels, eps=eps)
+        self.scaling_factor = scaling_factor
+        self.ln_gelu_scale = ln_gelu_scale_ext
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        return self.ln_gelu_scale.ln_gelu_scale_cuda(
+            x,
+            self.layer_norm.weight,
+            self.layer_norm.bias,
+            self.layer_norm.eps,
+            self.scaling_factor,
+        )

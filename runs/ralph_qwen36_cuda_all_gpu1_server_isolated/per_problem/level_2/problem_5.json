@@ -1,0 +1,44 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 44.885,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "0.527925",
+        "1.036578",
+        "1.036444",
+        "1.036442",
+        "1.036443"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "1.617091",
+        "1.999107",
+        "1.999057",
+        "1.999104",
+        "1.999083"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_2/problem_5.py",
+  "level": 2,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 5,
+  "problem_name": "5_ConvTranspose2d_Subtract_Tanh.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_2/problem_5.txt",
+  "static_warnings": [
+    "Uses torch computation op: torch.tanh"
+  ],
+  "status": "evaluated"
+}

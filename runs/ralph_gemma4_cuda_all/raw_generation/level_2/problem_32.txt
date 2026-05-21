@@ -1,0 +1,120 @@
+name = "ModelNew"
+name = "ModelNew"
+nameout = "ModelNew"
+nameout = "ModelNew"
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused scale and min operation
+# The scale and min operations are a1_fused_scale_min_source
+# The scale and min operation is a1_fused_scale_min_source
+# The scale and much more
+# The scale_factor is scale_factor
+# input: (B, C, H, W) (batch_size, out_channels, height, width)
+# output: (B, 1, H, W) (batch_size, 1, height, width)
+fused_scale_min_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_scale_min_kernel(const float* __restrict__ input, float* __restrict__ out, int batch_size, int out_channels, int height, int width, float scale_factor) {
+<-- ERROR: ERROR: ERROR: ERROR: ERROR: ERROR: ERROR: ERROR: ERROR: error in CUDA C++ code.
+<-- ERROR: ERROR: ERROR:</div>
+
+```
+
+<|channel>thought
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused scale and min operation
+# input: (B, C, H, W)
+# output: (B, 1, H, W)
+fused_scale_min_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <float.h>
+
+__global__ void fused_scale_min_kernel(const float* __restrict__ input, float* __restrict__ out, int B, int C, int H, int W, float scale_factor) {
+    // Each thread handles one (b, h, w) position
+    int hw = H * W;
+    int idx_b_hw = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx_b_hw < B * hw) {
+        int b = idx_b_hw / hw;
+        int hw_idx = idx_b_hw % hw;
+        int h = hw_idx / W;
+        int w = hw_idx % W;
+
+        float min_val = FLT_MAX;
+        for (int c = 0; c < C; ++c) {
+            float val = input[b * C * hw + c * hw + hw_idx];
+            float scaled_val = val * scale_factor;
+            if (scaled_val < min_val) {
+                min_val = scaled_val;
+            }
+        }
+        out[idx_b_hw] = min_val;
+    }
+}
+
+torch::Tensor fused_scale_min_cuda(torch::Tensor input, float scale_factor) {
+    auto B = input.size(0);
+    auto C = input.size(1);
+    auto H = input.size(2);
+    auto W = input.size(3);
+    
+    auto out = torch::empty({B, 1, H, W}, input.options());
+
+    int total_elements = B * H * W;
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    fused_scale_min_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(), 
+        out.data_ptr<float>(), 
+        B, C, H, W, 
+        scale_factor
+    );
+
+    return out;
+}
+"""
+
+fused_scale_min_cpp_source = """
+torch::Tensor fused_scale_min_cuda(torch::Tensor input, float scale_factor);
+"""
+
+fused_scale_min_lib = load_inline(
+    name="fused_scale_min",
+    cpp_sources=fused_scale_min_cpp_source,
+    cuda_sources=fused_scale_min_source,
+    functions=["fused_scale_min_cuda"],
+    verbose=False
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model that performs a convolution, then uses a fused CUDA kernel 
+    to scale and find the minimum along the channel dimension.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, scale_factor):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.scale_factor = scale_factor
+        self.fused_op = fused_scale_min_lib
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, height, width).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, 1, height, width).
+        """
+        x = self.conv(x)
+        # Fusing x * scale_factor and torch.min(x, dim=1)
+        x = self.fused_op.fused_scale_min_cuda(x, self.scale_factor)
+        return x
+```

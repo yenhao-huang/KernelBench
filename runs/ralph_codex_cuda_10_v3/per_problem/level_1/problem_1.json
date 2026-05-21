@@ -1,0 +1,16 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 0.001,
+  "error": "[Errno 28] No space left on device: '/tmp/tmpgwsakos_'",
+  "error_type": "builtins.OSError",
+  "generated_kernel_path": "runs/ralph_codex_cuda_10_v3/generated_kernels/level_1/problem_1.py",
+  "level": 1,
+  "model_name": "codex-gpt-5.5",
+  "precision": "fp32",
+  "problem_id": 1,
+  "problem_name": "1_Square_matrix_multiplication_.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_codex_cuda_10_v3/raw_generation/level_1/problem_1.txt",
+  "status": "generation_error",
+  "traceback": "Traceback (most recent call last):\n  File \"/workspace/external/KernelBench/scripts/ralph_eval_gemma4_cuda_all.py\", line 249, in _evaluate_one\n    raw_generation = inference_server(prompt)\n  File \"/workspace/external/KernelBench/scripts/ralph_eval_gemma4_cuda_all.py\", line 149, in <lambda>\n    return lambda prompt: _query_codex_cli(prompt, args)\n  File \"/workspace/external/KernelBench/scripts/ralph_eval_gemma4_cuda_all.py\", line 120, in _query_codex_cli\n    with tempfile.TemporaryDirectory() as tmpdir:\n  File \"/home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/tempfile.py\", line 835, in __init__\n    self.name = mkdtemp(suffix, prefix, dir)\n  File \"/home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/tempfile.py\", line 384, in mkdtemp\n    _os.mkdir(file, 0o700)\nOSError: [Errno 28] No space left on device: '/tmp/tmpgwsakos_'\n"
+}

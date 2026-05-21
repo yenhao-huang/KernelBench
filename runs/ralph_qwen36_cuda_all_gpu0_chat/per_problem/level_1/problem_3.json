@@ -1,0 +1,28 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 105.427,
+  "eval_result": {
+    "compiled": false,
+    "correctness": false,
+    "metadata": {
+      "compilation_error": "Error building extension 'bmm_custom': [1/3] /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=bmm_custom -DTORCH_API_INCLUDE_EXTENSION_H -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/include -isystem /home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 --compiler-options '-fPIC' -std=c++17 -c /home/howard/.cache/torch_extensions/py310_cu128/bmm_custom/cuda.cu -o cuda.cuda.o \nFAILED: [code=2] cuda.cuda.o \n/workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=bmm_custom -DTORCH_API_INCLUDE_EXTENSION_H -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/include -isystem /home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 --compiler-options '-fPIC' -std=c++17 -c /home/howard/.cache/torch_extensions/py310_cu128/bmm_custom/cuda.cu -o cuda.cuda.o \n/home/howard/.cache/torch_extensions/py310_cu128/bmm_custom/cuda.cu(69): error: identifier \"tx\" is undefined\n          int local_col = tx;\n                          ^\n\n1 error detected in the compilation of \"/home/howard/.cache/torch_extensions/py310_cu128/bmm_custom/cuda.cu\".\n[2/3] c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=bmm_custom -DTORCH_API_INCLUDE_EXTENSION_H -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/include -isystem /home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -fPIC -std=c++17 -O3 -c /home/howard/.cache/torch_extensions/py310_cu128/bmm_custom/main.cpp -o main.o \nninja: build stopped: subcommand failed.\n",
+      "compilation_error_name": "builtins.RuntimeError",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090"
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu0_chat/generated_kernels/level_1/problem_3.py",
+  "level": 1,
+  "model_name": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "precision": "fp32",
+  "problem_id": 3,
+  "problem_name": "3_Batched_matrix_multiplication.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu0_chat/raw_generation/level_1/problem_3.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

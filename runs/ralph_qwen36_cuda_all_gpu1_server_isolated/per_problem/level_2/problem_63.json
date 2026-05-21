@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 71.171,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "10.424122",
+        "10.424009",
+        "10.417690",
+        "10.421835",
+        "10.418928"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "126.784927",
+        "124.331680",
+        "132.090912",
+        "121.062798",
+        "133.308548"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_2/problem_63.py",
+  "level": 2,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 63,
+  "problem_name": "63_Gemm_ReLU_Divide.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_2/problem_63.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

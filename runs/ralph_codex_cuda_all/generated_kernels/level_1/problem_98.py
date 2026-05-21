@@ -1,0 +1,120 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+kl_div_cpp_sources = """
+torch::Tensor kl_div_batchmean_cuda(torch::Tensor predictions, torch::Tensor targets);
+"""
+
+kl_div_cuda_sources = """
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void kl_div_partial_kernel(
+    const float* __restrict__ predictions,
+    const float* __restrict__ targets,
+    float* __restrict__ partial,
+    long long n
+) {
+    extern __shared__ float smem[];
+    int tid = threadIdx.x;
+    int global_tid = blockIdx.x * blockDim.x + tid;
+    int stride = blockDim.x * gridDim.x;
+
+    float acc = 0.0f;
+    for (long long i = global_tid; i < n; i += stride) {
+        float t = targets[i];
+        float p = predictions[i];
+        acc += t * (logf(t) - logf(p));
+    }
+
+    smem[tid] = acc;
+    __syncthreads();
+
+    for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            smem[tid] += smem[tid + offset];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        partial[blockIdx.x] = smem[0];
+    }
+}
+
+__global__ void kl_div_final_kernel(
+    const float* __restrict__ partial,
+    float* __restrict__ out,
+    int nblocks,
+    float inv_batch
+) {
+    extern __shared__ float smem[];
+    int tid = threadIdx.x;
+
+    float acc = 0.0f;
+    for (int i = tid; i < nblocks; i += blockDim.x) {
+        acc += partial[i];
+    }
+
+    smem[tid] = acc;
+    __syncthreads();
+
+    for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            smem[tid] += smem[tid + offset];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out[0] = smem[0] * inv_batch;
+    }
+}
+
+torch::Tensor kl_div_batchmean_cuda(torch::Tensor predictions, torch::Tensor targets) {
+    const long long n = predictions.numel();
+    const int batch = predictions.size(0);
+    const int threads = 256;
+    const int blocks = 1024;
+
+    auto partial = torch::empty({blocks}, predictions.options());
+    auto out = torch::empty({}, predictions.options());
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    kl_div_partial_kernel<<<blocks, threads, threads * sizeof(float), stream>>>(
+        predictions.data_ptr<float>(),
+        targets.data_ptr<float>(),
+        partial.data_ptr<float>(),
+        n
+    );
+
+    kl_div_final_kernel<<<1, threads, threads * sizeof(float), stream>>>(
+        partial.data_ptr<float>(),
+        out.data_ptr<float>(),
+        blocks,
+        1.0f / static_cast<float>(batch)
+    );
+
+    return out;
+}
+"""
+
+kl_div_ext = load_inline(
+    name="kl_div_batchmean_ext",
+    cpp_sources=kl_div_cpp_sources,
+    cuda_sources=kl_div_cuda_sources,
+    functions=["kl_div_batchmean_cuda"],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.kl_div_ext = kl_div_ext
+
+    def forward(self, predictions, targets):
+        return self.kl_div_ext.kl_div_batchmean_cuda(predictions, targets)

@@ -1,0 +1,14 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 1.376,
+  "error": "No extractable code block or raw Python/CUDA module found.",
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu0/generated_kernels/level_2/problem_79.py",
+  "level": 2,
+  "model_name": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "precision": "fp32",
+  "problem_id": 79,
+  "problem_name": "79_Conv3d_Multiply_InstanceNorm_Clamp_Multiply_Max.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu0/raw_generation/level_2/problem_79.txt",
+  "status": "extraction_failed"
+}

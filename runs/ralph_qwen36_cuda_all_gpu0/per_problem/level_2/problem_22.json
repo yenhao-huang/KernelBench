@@ -1,0 +1,14 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 1.455,
+  "error": "No extractable code block or raw Python/CUDA module found.",
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu0/generated_kernels/level_2/problem_22.py",
+  "level": 2,
+  "model_name": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "precision": "fp32",
+  "problem_id": 22,
+  "problem_name": "22_Matmul_Scale_ResidualAdd_Clamp_LogSumExp_Mish.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu0/raw_generation/level_2/problem_22.txt",
+  "status": "extraction_failed"
+}

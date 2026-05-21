@@ -1,0 +1,136 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <float.h>
+
+__global__ void fused_conv_softmax_pool_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ bias,
+    float* __restrict__ out,
+    int B, int Cin, int Cout,
+    int D, int H, int W,
+    int K, int OD, int OH, int OW
+) {
+    int idx = blockIdx.x;
+    int oc = threadIdx.x;
+
+    int ow = idx % OW;
+    idx /= OW;
+    int oh = idx % OH;
+    idx /= OH;
+    int od = idx % OD;
+    idx /= OD;
+    int b = idx;
+
+    float best = 0.0f;
+
+    for (int pd = 0; pd < 4; ++pd) {
+        int cd = od * 4 + pd;
+        for (int ph = 0; ph < 4; ++ph) {
+            int ch = oh * 4 + ph;
+            for (int pw = 0; pw < 4; ++pw) {
+                int cw = ow * 4 + pw;
+
+                float v = bias[oc];
+                for (int ic = 0; ic < Cin; ++ic) {
+                    for (int kd = 0; kd < K; ++kd) {
+                        int xd = cd + kd;
+                        for (int kh = 0; kh < K; ++kh) {
+                            int xh = ch + kh;
+                            for (int kw = 0; kw < K; ++kw) {
+                                int xw = cw + kw;
+                                int xoff = (((b * Cin + ic) * D + xd) * H + xh) * W + xw;
+                                int woff = ((((oc * Cin + ic) * K + kd) * K + kh) * K + kw);
+                                v += x[xoff] * w[woff];
+                            }
+                        }
+                    }
+                }
+
+                __shared__ float vals[16];
+                vals[oc] = v;
+                __syncthreads();
+
+                float m = vals[0];
+                #pragma unroll
+                for (int c = 1; c < 16; ++c) {
+                    m = fmaxf(m, vals[c]);
+                }
+
+                float s = 0.0f;
+                #pragma unroll
+                for (int c = 0; c < 16; ++c) {
+                    s += expf(vals[c] - m);
+                }
+
+                float sm = expf(v - m) / s;
+                best = fmaxf(best, sm);
+                __syncthreads();
+            }
+        }
+    }
+
+    int ooff = (((b * Cout + oc) * OD + od) * OH + oh) * OW + ow;
+    out[ooff] = best;
+}
+
+torch::Tensor fused_conv_softmax_pool_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor bias) {
+    const int B = x.size(0);
+    const int Cin = x.size(1);
+    const int D = x.size(2);
+    const int H = x.size(3);
+    const int W = x.size(4);
+    const int Cout = w.size(0);
+    const int K = w.size(2);
+
+    const int CD = D - K + 1;
+    const int CH = H - K + 1;
+    const int CW = W - K + 1;
+    const int OD = (CD / 2) / 2;
+    const int OH = (CH / 2) / 2;
+    const int OW = (CW / 2) / 2;
+
+    auto out = torch::empty({B, Cout, OD, OH, OW}, x.options());
+    int blocks = B * OD * OH * OW;
+    fused_conv_softmax_pool_kernel<<<blocks, Cout>>>(
+        x.data_ptr<float>(),
+        w.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        B, Cin, Cout, D, H, W, K, OD, OH, OW
+    );
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor fused_conv_softmax_pool_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor bias);
+"""
+
+fused_conv_softmax_pool = load_inline(
+    name="fused_conv_softmax_pool_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["fused_conv_softmax_pool_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.op = fused_conv_softmax_pool
+
+    def forward(self, x):
+        return self.op.fused_conv_softmax_pool_cuda(
+            x.contiguous(),
+            self.conv.weight.contiguous(),
+            self.conv.bias.contiguous(),
+        )

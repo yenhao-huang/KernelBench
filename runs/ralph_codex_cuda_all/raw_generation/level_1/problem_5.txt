@@ -1,0 +1,77 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cstdint>
+
+__global__ void scalar_mul_kernel(const float* __restrict__ a, float* __restrict__ out, float s, int64_t n) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        out[idx] = a[idx] * s;
+    }
+}
+
+__global__ void scalar_mul_vec4_kernel(const float4* __restrict__ a, float4* __restrict__ out, float s, int64_t n4) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n4) {
+        float4 v = a[idx];
+        v.x *= s;
+        v.y *= s;
+        v.z *= s;
+        v.w *= s;
+        out[idx] = v;
+    }
+}
+
+torch::Tensor scalar_mul_cuda(torch::Tensor a, double s_double) {
+    auto out = torch::empty_like(a);
+    int64_t n = a.numel();
+    float s = static_cast<float>(s_double);
+
+    const int threads = 256;
+    uintptr_t ap = reinterpret_cast<uintptr_t>(a.data_ptr<float>());
+    uintptr_t op = reinterpret_cast<uintptr_t>(out.data_ptr<float>());
+
+    if ((n % 4 == 0) && ((ap & 15) == 0) && ((op & 15) == 0)) {
+        int64_t n4 = n / 4;
+        int blocks = static_cast<int>((n4 + threads - 1) / threads);
+        scalar_mul_vec4_kernel<<<blocks, threads>>>(
+            reinterpret_cast<const float4*>(a.data_ptr<float>()),
+            reinterpret_cast<float4*>(out.data_ptr<float>()),
+            s,
+            n4
+        );
+    } else {
+        int blocks = static_cast<int>((n + threads - 1) / threads);
+        scalar_mul_kernel<<<blocks, threads>>>(a.data_ptr<float>(), out.data_ptr<float>(), s, n);
+    }
+
+    return out;
+}
+"""
+
+cpp_sources = "torch::Tensor scalar_mul_cuda(torch::Tensor a, double s_double);"
+
+scalar_mul_ext = load_inline(
+    name="scalar_mul_ext_fp32",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["scalar_mul_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.scalar_mul_ext = scalar_mul_ext
+
+    def forward(self, A: torch.Tensor, s: float) -> torch.Tensor:
+        return self.scalar_mul_ext.scalar_mul_cuda(A, s)
+```

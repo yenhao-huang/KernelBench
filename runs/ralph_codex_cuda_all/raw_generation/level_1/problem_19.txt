@@ -1,0 +1,99 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+relu_cpp_source = """
+torch::Tensor relu_cuda(torch::Tensor x);
+"""
+
+relu_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdint.h>
+
+__device__ __forceinline__ float relu_f32(float v) {
+    return v > 0.0f ? v : 0.0f;
+}
+
+__global__ void relu_float4_kernel(const float4* __restrict__ x,
+                                   float4* __restrict__ out,
+                                   long long n4) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long stride = (long long)blockDim.x * gridDim.x;
+
+    for (long long i = idx; i < n4; i += stride) {
+        float4 v = x[i];
+        v.x = relu_f32(v.x);
+        v.y = relu_f32(v.y);
+        v.z = relu_f32(v.z);
+        v.w = relu_f32(v.w);
+        out[i] = v;
+    }
+}
+
+__global__ void relu_scalar_kernel(const float* __restrict__ x,
+                                   float* __restrict__ out,
+                                   long long n) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long stride = (long long)blockDim.x * gridDim.x;
+
+    for (long long i = idx; i < n; i += stride) {
+        out[i] = relu_f32(x[i]);
+    }
+}
+
+torch::Tensor relu_cuda(torch::Tensor x) {
+    auto out = torch::empty_like(x);
+    long long n = x.numel();
+
+    const int threads = 256;
+    long long work = n;
+    bool use_vec4 = ((((uintptr_t)x.data_ptr<float>()) & 15) == 0) &&
+                    ((((uintptr_t)out.data_ptr<float>()) & 15) == 0) &&
+                    ((n & 3LL) == 0);
+
+    if (use_vec4) {
+        work = n >> 2;
+        int blocks = (int)((work + threads - 1) / threads);
+        if (blocks > 4096) blocks = 4096;
+        if (blocks < 1) blocks = 1;
+        relu_float4_kernel<<<blocks, threads>>>(
+            reinterpret_cast<const float4*>(x.data_ptr<float>()),
+            reinterpret_cast<float4*>(out.data_ptr<float>()),
+            work
+        );
+    } else {
+        int blocks = (int)((work + threads - 1) / threads);
+        if (blocks > 4096) blocks = 4096;
+        if (blocks < 1) blocks = 1;
+        relu_scalar_kernel<<<blocks, threads>>>(
+            x.data_ptr<float>(),
+            out.data_ptr<float>(),
+            n
+        );
+    }
+
+    return out;
+}
+"""
+
+_relu_ext = load_inline(
+    name="custom_relu_f32_vec4_ext",
+    cpp_sources=relu_cpp_source,
+    cuda_sources=relu_cuda_source,
+    functions=["relu_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.relu_op = _relu_ext
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.relu_op.relu_cuda(x)
+```

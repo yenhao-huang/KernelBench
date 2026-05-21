@@ -1,0 +1,187 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+depthwise_conv2d_cpp_source = """
+torch::Tensor depthwise_conv2d_cuda(torch::Tensor x, torch::Tensor weight, c10::optional<torch::Tensor> bias, int stride, int padding);
+"""
+
+depthwise_conv2d_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void depthwise3x3_s1p0_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ y,
+    int total,
+    int N,
+    int C,
+    int H,
+    int W,
+    int OC,
+    int OH,
+    int OW,
+    int multiplier,
+    bool has_bias
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int ow = idx % OW;
+    int t = idx / OW;
+    int oh = t % OH;
+    t /= OH;
+    int oc = t % OC;
+    int n = t / OC;
+
+    int c = oc / multiplier;
+    int x_base = ((n * C + c) * H + oh) * W + ow;
+    int w_base = oc * 9;
+
+    float acc = 0.0f;
+    acc += x[x_base] * w[w_base];
+    acc += x[x_base + 1] * w[w_base + 1];
+    acc += x[x_base + 2] * w[w_base + 2];
+
+    x_base += W;
+    acc += x[x_base] * w[w_base + 3];
+    acc += x[x_base + 1] * w[w_base + 4];
+    acc += x[x_base + 2] * w[w_base + 5];
+
+    x_base += W;
+    acc += x[x_base] * w[w_base + 6];
+    acc += x[x_base + 1] * w[w_base + 7];
+    acc += x[x_base + 2] * w[w_base + 8];
+
+    if (has_bias) acc += b[oc];
+    y[idx] = acc;
+}
+
+__global__ void depthwise_generic_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ y,
+    int total,
+    int N,
+    int C,
+    int H,
+    int W,
+    int OC,
+    int K,
+    int stride,
+    int padding,
+    int OH,
+    int OW,
+    int multiplier,
+    bool has_bias
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int ow = idx % OW;
+    int t = idx / OW;
+    int oh = t % OH;
+    t /= OH;
+    int oc = t % OC;
+    int n = t / OC;
+
+    int c = oc / multiplier;
+    int ih0 = oh * stride - padding;
+    int iw0 = ow * stride - padding;
+
+    float acc = 0.0f;
+    for (int kh = 0; kh < K; ++kh) {
+        int ih = ih0 + kh;
+        if (ih < 0 || ih >= H) continue;
+        for (int kw = 0; kw < K; ++kw) {
+            int iw = iw0 + kw;
+            if (iw < 0 || iw >= W) continue;
+            float xv = x[((n * C + c) * H + ih) * W + iw];
+            float wv = w[(oc * K + kh) * K + kw];
+            acc += xv * wv;
+        }
+    }
+
+    if (has_bias) acc += b[oc];
+    y[idx] = acc;
+}
+
+torch::Tensor depthwise_conv2d_cuda(torch::Tensor x, torch::Tensor weight, c10::optional<torch::Tensor> bias, int stride, int padding) {
+    int N = x.size(0);
+    int C = x.size(1);
+    int H = x.size(2);
+    int W = x.size(3);
+    int OC = weight.size(0);
+    int K = weight.size(2);
+    int OH = (H + 2 * padding - K) / stride + 1;
+    int OW = (W + 2 * padding - K) / stride + 1;
+    int multiplier = OC / C;
+
+    auto y = torch::empty({N, OC, OH, OW}, x.options());
+    int total = N * OC * OH * OW;
+
+    const float* bias_ptr = nullptr;
+    bool has_bias = bias.has_value() && bias.value().defined();
+    if (has_bias) bias_ptr = bias.value().data_ptr<float>();
+
+    int block = 256;
+    int grid = (total + block - 1) / block;
+
+    if (K == 3 && stride == 1 && padding == 0) {
+        depthwise3x3_s1p0_kernel<<<grid, block>>>(
+            x.data_ptr<float>(),
+            weight.data_ptr<float>(),
+            bias_ptr,
+            y.data_ptr<float>(),
+            total, N, C, H, W, OC, OH, OW, multiplier, has_bias
+        );
+    } else {
+        depthwise_generic_kernel<<<grid, block>>>(
+            x.data_ptr<float>(),
+            weight.data_ptr<float>(),
+            bias_ptr,
+            y.data_ptr<float>(),
+            total, N, C, H, W, OC, K, stride, padding, OH, OW, multiplier, has_bias
+        );
+    }
+
+    return y;
+}
+"""
+
+depthwise_conv2d_ext = load_inline(
+    name="depthwise_conv2d_ext",
+    cpp_sources=depthwise_conv2d_cpp_source,
+    cuda_sources=depthwise_conv2d_cuda_source,
+    functions=["depthwise_conv2d_cuda"],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, bias: bool = False):
+        super(ModelNew, self).__init__()
+        self.conv2d = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=(kernel_size, kernel_size),
+            stride=stride,
+            padding=padding,
+            groups=in_channels,
+            bias=bias,
+        )
+        self.stride = stride
+        self.padding = padding
+        self.depthwise_conv2d = depthwise_conv2d_ext
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.depthwise_conv2d.depthwise_conv2d_cuda(
+            x,
+            self.conv2d.weight,
+            self.conv2d.bias,
+            self.stride,
+            self.padding,
+        )

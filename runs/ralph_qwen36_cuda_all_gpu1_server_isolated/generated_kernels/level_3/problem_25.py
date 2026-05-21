@@ -1,0 +1,457 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernels for optimized operations
+custom_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper macro for CUDA error checking
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA error in %s at line %d: %s\\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while(0)
+
+// Kernel for Group Convolution (1x1 or 3x3) + BatchNorm + ReLU fusion
+// This kernel performs: out = ReLU(BN(Conv(x)))
+// Note: For simplicity and correctness in this inline example, we implement a standard 
+// group conv followed by fused BN+ReLU. A full cuDNN-like implementation is too large for inline.
+// We will use a simplified but efficient approach: 
+// 1. Custom Group Conv (naive but correct)
+// 2. Fused BatchNorm + ReLU
+
+__global__ void group_conv_kernel(const float* input, const float* weight, const float* bias, float* output, 
+                                  int batch_size, int in_channels, int out_channels, int height, int width, 
+                                  int kernel_h, int kernel_w, int stride, int padding, int groups) {
+    // Each thread handles one output element
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    int total_out_elements = batch_size * out_channels * height * width;
+    if (idx >= total_out_elements) return;
+
+    // Decompose index
+    int w_idx = idx % width;
+    int h_idx = (idx / width) % height;
+    int c_idx = (idx / (width * height)) % out_channels;
+    int b_idx = idx / (width * height * out_channels);
+
+    // Determine group and channel within group
+    int group_id = c_idx / (out_channels / groups);
+    int group_channel_out = c_idx % (out_channels / groups);
+    
+    int in_channels_per_group = in_channels / groups;
+    int out_channels_per_group = out_channels / groups;
+
+    float sum = 0.0f;
+    
+    // Iterate over input channels in this group
+    for (int ic = 0; ic < in_channels_per_group; ++ic) {
+        int in_channel = group_id * in_channels_per_group + ic;
+        
+        // Iterate over kernel height and width
+        for (int kh = 0; kh < kernel_h; ++kh) {
+            for (int kw = 0; kw < kernel_w; ++kw) {
+                int ih = h_idx * stride + kh - padding;
+                int iw = w_idx * stride + kw - padding;
+                
+                if (ih >= 0 && ih < height && iw >= 0 && iw < width) {
+                    // Input index: [b, c, h, w]
+                    int input_idx = b_idx * in_channels * height * width + 
+                                    in_channel * height * width + 
+                                    ih * width + iw;
+                    
+                    // Weight index: [out_c, in_c, kh, kw]
+                    // Note: Standard PyTorch conv weight layout is [out_c, in_c/groups, kh, kw] for grouped
+                    int weight_idx = c_idx * in_channels_per_group * kernel_h * kernel_w + 
+                                     ic * kernel_h * kernel_w + 
+                                     kh * kernel_w + kw;
+                    
+                    sum += input[input_idx] * weight[weight_idx];
+                }
+            }
+        }
+    }
+
+    // Add bias
+    if (bias != nullptr) {
+        sum += bias[c_idx];
+    }
+
+    output[idx] = sum;
+}
+
+// Kernel for BatchNorm + ReLU fusion
+__global__ void bn_relu_kernel(const float* input, const float* gamma, const float* beta, 
+                               float* output, int size, float eps) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+
+    // For this simplified inline version, we assume running_mean and running_var are not used 
+    // or passed separately. In a real scenario, you'd pass them. 
+    // Here, we implement training mode BN: normalize using batch stats.
+    // However, since we don't have batch stats in the kernel signature easily without complex args,
+    // we will assume the input is already normalized or use a simplified scale/shift if mean/var are 0/1.
+    // To make this robust for the specific ShuffleNet context where BN follows Conv:
+    // We will actually implement a simpler fused Op: Conv -> (implicit BN params passed) -> ReLU
+    
+    // Let's change strategy: We will pass running_mean and running_var to the kernel if in eval, 
+    // or compute batch stats. Computing batch stats inside the kernel is expensive.
+    // Instead, let's just do a simple Scale/Shift + ReLU assuming the Conv kernel outputs raw logits 
+    // and we apply BN parameters here. But wait, standard PyTorch BN uses batch statistics during training.
+    
+    // To keep this inline code compilable and functional without external state management complexity:
+    // We will implement a "Fused Conv2d + BatchNorm (training mode simplified)" by passing 
+    // the necessary stats or assuming pre-computed stats for inference-like behavior in the kernel call?
+    // No, let's stick to the example structure. The example replaces simple ops.
+    
+    // Let's replace ChannelShuffle with a highly optimized CUDA kernel.
+    // And replace the Conv+BN+ReLU chain with a custom fused kernel that handles Group Conv + BN (using batch stats) + ReLU.
+    // Actually, implementing full BatchNorm with batch stats in a single inline kernel is verbose.
+    
+    // Alternative: Replace ChannelShuffle and the final Add.
+    // ChannelShuffle is memory bound and can be optimized.
+    // The main bottleneck is usually the Convolutions.
+    
+    // Let's implement a specialized GroupConv + BN (using provided running_mean/var for simplicity in this demo, 
+    // or just standard BN if we pass stats). 
+    // Given the constraints of "inline", let's focus on ChannelShuffle and the Element-wise Add, 
+    // and a simplified Conv fusion.
+    
+    // Actually, let's just optimize ChannelShuffle and the final addition, as they are pure logic/memory ops.
+    // The Convolution is best left to cuDNN unless we write a full GEMM/Conv engine.
+    
+    // However, the prompt asks for speedups. ChannelShuffle is often a bottleneck in ShuffleNet.
+}
+
+// Optimized Channel Shuffle Kernel
+__global__ void channel_shuffle_kernel(const float* input, float* output, 
+                                       int batch_size, int channels, int height, int width, 
+                                       int groups) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    int total_elements = batch_size * channels * height * width;
+    if (idx >= total_elements) return;
+
+    // Decompose index to find source channel
+    int w_idx = idx % width;
+    int h_idx = (idx / width) % height;
+    int c_idx = (idx / (width * height)) % channels;
+    int b_idx = idx / (width * height * channels);
+
+    int channels_per_group = channels / groups;
+    
+    // The shuffle operation is:
+    // x.view(B, G, C/G, H, W).transpose(1, 2).contiguous().view(B, C, H, W)
+    // This means the element at (b, g, c_g, h, w) moves to (b, c_g, g, h, w) in the transposed view?
+    // Let's trace:
+    // Original: [B, G, C/G, H, W] -> Transpose(1,2) -> [B, C/G, G, H, W] -> Flatten -> [B, C, H, W]
+    // The element at original index (b, g, c_g, h, w) ends up at:
+    // New Channel Index = c_g * groups + g
+    
+    int group_id = c_idx / channels_per_group;
+    int channel_in_group = c_idx % channels_per_group;
+    
+    int new_channel_idx = channel_in_group * groups + group_id;
+    
+    int output_idx = b_idx * channels * height * width + 
+                     new_channel_idx * height * width + 
+                     h_idx * width + w_idx;
+                     
+    output[output_idx] = input[idx];
+}
+
+// Optimized Element-wise Add with ReLU (for the shortcut)
+__global__ void add_relu_kernel(const float* a, const float* b, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    
+    float val = a[idx] + b[idx];
+    // ReLU activation
+    out[idx] = val > 0.0f ? val : 0.0f;
+}
+
+// Python bindings for Channel Shuffle
+torch::Tensor channel_shuffle_cuda(torch::Tensor x, int groups) {
+    auto batch_size = x.size(0);
+    auto channels = x.size(1);
+    auto height = x.size(2);
+    auto width = x.size(3);
+    
+    auto output = torch::empty_like(x);
+    
+    const int block_size = 256;
+    int total_elements = batch_size * channels * height * width;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    channel_shuffle_kernel<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(), 
+        output.data_ptr<float>(), 
+        batch_size, channels, height, width, groups
+    );
+    
+    CUDA_CHECK(cudaGetLastError());
+    return output;
+}
+
+// Python bindings for Add + ReLU
+torch::Tensor add_relu_cuda(torch::Tensor a, torch::Tensor b) {
+    auto size = a.numel();
+    auto out = torch::empty_like(a);
+    
+    const int block_size = 256;
+    int num_blocks = (size + block_size - 1) / block_size;
+    
+    add_relu_kernel<<<num_blocks, block_size>>>(
+        a.data_ptr<float>(), 
+        b.data_ptr<float>(), 
+        out.data_ptr<float>(), 
+        size
+    );
+    
+    CUDA_CHECK(cudaGetLastError());
+    return out;
+}
+
+"""
+
+custom_cpp_source = (
+    "torch::Tensor channel_shuffle_cuda(torch::Tensor x, int groups);"
+    "torch::Tensor add_relu_cuda(torch::Tensor a, torch::Tensor b);"
+);
+
+// Compile the inline CUDA code
+cuda_module = load_inline(
+    name="shuffle_opt",
+    cpp_sources=custom_cpp_source,
+    cuda_sources=custom_cuda_source,
+    functions=["channel_shuffle_cuda", "add_relu_cuda"],
+    verbose=False,
+    extra_cflags=["-O2"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, groups=3):
+        """
+        Optimized ShuffleNet unit implementation.
+        
+        :param in_channels: Number of input channels.
+        :param out_channels: Number of output channels.
+        :param groups: Number of groups for group convolution.
+        """
+        super(ModelNew, self).__init__()
+        
+        # Ensure the output channels are divisible by groups
+        assert out_channels % 4 == 0
+        mid_channels = out_channels // 4
+        
+        # First 1x1 group convolution
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size=1, stride=1, padding=0, groups=groups, bias=False)
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+        
+        # Depthwise 3x3 convolution
+        self.conv2 = nn.Conv2d(mid_channels, mid_channels, kernel_size=3, stride=1, padding=1, groups=mid_channels, bias=False)
+        self.bn2 = nn.BatchNorm2d(mid_channels)
+        
+        # Second 1x1 group convolution
+        self.conv3 = nn.Conv2d(mid_channels, out_channels, kernel_size=1, stride=1, padding=0, groups=groups, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels)
+        
+        # Optimized Shuffle operation using CUDA
+        self.groups = groups
+        
+        # Shortcut connection if input and output channels are the same
+        if in_channels == out_channels:
+            self.shortcut = nn.Sequential()
+        else:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+    
+    def forward(self, x):
+        """
+        Optimized Forward pass for ShuffleNet unit.
+        
+        :param x: Input tensor, shape (batch_size, in_channels, height, width)
+        :return: Output tensor, shape (batch_size, out_channels, height, width)
+        """
+        # Standard Conv/BN/ReLU blocks
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        
+        # Optimized Channel Shuffle
+        out = cuda_module.channel_shuffle_cuda(out, self.groups)
+        
+        out = F.relu(self.bn3(self.conv3(out)))
+        
+        # Optimized Shortcut Addition + ReLU (if needed, though original code adds then returns, 
+        # the original code does: out += shortcut(x); return out; 
+        # The original code does NOT apply ReLU after addition. 
+        # However, looking at the original code:
+        # out = F.relu(self.bn3(self.conv3(out)))
+        # out += self.shortcut(x)
+        # return out
+        # So no ReLU after addition. I will just use optimized add.
+        
+        shortcut_out = self.shortcut(x)
+        
+        # Use optimized element-wise addition
+        out = cuda_module.add_relu_cuda(out, shortcut_out) # Note: Original didn't have ReLU here, but let's stick to exact logic
+        
+        # Correction: The original code does NOT apply ReLU after the addition. 
+        # My kernel `add_relu_kernel` applies ReLU. I should create a pure add kernel or modify usage.
+        # Let's assume the user wants speedup. If I use add_relu, I change semantics if ReLU wasn't there.
+        # Original: out += shortcut(x); return out;
+        # So I need a pure add kernel.
+        
+        # Let's redefine the binding to be safe or just use torch.add for the last step if strict parity is needed.
+        # But wait, the prompt says "replace pytorch operators... to get speedups".
+        # If I change semantics (adding ReLU), it's wrong.
+        # Let's assume the `add_relu` kernel was a mistake in my thought process for the final step.
+        # I will use standard torch.add for the final step to ensure correctness, 
+        # OR I can write a pure add kernel.
+        
+        # To keep it simple and correct:
+        out = out + shortcut_out
+        
+        return out
+
+# Re-defining ModelNew with corrected logic for the final addition to match original semantics exactly
+class ModelNewCorrected(nn.Module):
+    def __init__(self, in_channels, out_channels, groups=3):
+        """
+        Optimized ShuffleNet unit implementation.
+        
+        :param in_channels: Number of input channels.
+        :param out_channels: Number of output channels.
+        :param groups: Number of groups for group convolution.
+        """
+        super(ModelNewCorrected, self).__init__()
+        
+        # Ensure the output channels are divisible by groups
+        assert out_channels % 4 == 0
+        mid_channels = out_channels // 4
+        
+        # First 1x1 group convolution
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size=1, stride=1, padding=0, groups=groups, bias=False)
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+        
+        # Depthwise 3x3 convolution
+        self.conv2 = nn.Conv2d(mid_channels, mid_channels, kernel_size=3, stride=1, padding=1, groups=mid_channels, bias=False)
+        self.bn2 = nn.BatchNorm2d(mid_channels)
+        
+        # Second 1x1 group convolution
+        self.conv3 = nn.Conv2d(mid_channels, out_channels, kernel_size=1, stride=1, padding=0, groups=groups, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels)
+        
+        # Optimized Shuffle operation using CUDA
+        self.groups = groups
+        
+        # Shortcut connection if input and output channels are the same
+        if in_channels == out_channels:
+            self.shortcut = nn.Sequential()
+        else:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+    
+    def forward(self, x):
+        """
+        Optimized Forward pass for ShuffleNet unit.
+        
+        :param x: Input tensor, shape (batch_size, in_channels, height, width)
+        :return: Output tensor, shape (batch_size, out_channels, height, width)
+        """
+        # Standard Conv/BN/ReLU blocks
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        
+        # Optimized Channel Shuffle
+        out = cuda_module.channel_shuffle_cuda(out, self.groups)
+        
+        out = F.relu(self.bn3(self.conv3(out)))
+        
+        # Shortcut connection
+        shortcut_out = self.shortcut(x)
+        
+        # Element-wise addition (matching original semantics: no ReLU after add)
+        out = out + shortcut_out
+        
+        return out
+
+# Since I cannot redefine the class name easily in the output block without confusion, 
+# and the prompt asks for "ModelNew", I will provide ModelNew using the corrected logic.
+# Note: The `cuda_module` is defined in the global scope above.
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, groups=3):
+        """
+        Optimized ShuffleNet unit implementation.
+        
+        :param in_channels: Number of input channels.
+        :param out_channels: Number of output channels.
+        :param groups: Number of groups for group convolution.
+        """
+        super(ModelNew, self).__init__()
+        
+        # Ensure the output channels are divisible by groups
+        assert out_channels % 4 == 0
+        mid_channels = out_channels // 4
+        
+        # First 1x1 group convolution
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size=1, stride=1, padding=0, groups=groups, bias=False)
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+        
+        # Depthwise 3x3 convolution
+        self.conv2 = nn.Conv2d(mid_channels, mid_channels, kernel_size=3, stride=1, padding=1, groups=mid_channels, bias=False)
+        self.bn2 = nn.BatchNorm2d(mid_channels)
+        
+        # Second 1x1 group convolution
+        self.conv3 = nn.Conv2d(mid_channels, out_channels, kernel_size=1, stride=1, padding=0, groups=groups, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels)
+        
+        # Optimized Shuffle operation using CUDA
+        self.groups = groups
+        
+        # Shortcut connection if input and output channels are the same
+        if in_channels == out_channels:
+            self.shortcut = nn.Sequential()
+        else:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+    
+    def forward(self, x):
+        """
+        Optimized Forward pass for ShuffleNet unit.
+        
+        :param x: Input tensor, shape (batch_size, in_channels, height, width)
+        :return: Output tensor, shape (batch_size, out_channels, height, width)
+        """
+        # Standard Conv/BN/ReLU blocks
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        
+        # Optimized Channel Shuffle
+        out = cuda_module.channel_shuffle_cuda(out, self.groups)
+        
+        out = F.relu(self.bn3(self.conv3(out)))
+        
+        # Shortcut connection
+        shortcut_out = self.shortcut(x)
+        
+        # Element-wise addition (matching original semantics: no ReLU after add)
+        out = out + shortcut_out
+        
+        return out

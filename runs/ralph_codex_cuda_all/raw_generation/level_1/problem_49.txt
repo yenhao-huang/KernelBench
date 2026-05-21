@@ -1,0 +1,156 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+max_reduce_cpp_source = """
+torch::Tensor max_reduce_dim0_cuda(torch::Tensor x);
+torch::Tensor max_reduce_dim1_cuda(torch::Tensor x);
+torch::Tensor max_reduce_dim2_cuda(torch::Tensor x);
+"""
+
+max_reduce_cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <float.h>
+
+#define TILE_COLS 16
+#define REDUCE_THREADS 16
+
+__global__ void max_dim1_kernel(const float* __restrict__ x, float* __restrict__ out, int B, int D1, int D2) {
+    int b = blockIdx.y;
+    int col_base = blockIdx.x * TILE_COLS;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int col = col_base + tx;
+
+    __shared__ float smem[REDUCE_THREADS][TILE_COLS];
+
+    float v = -FLT_MAX;
+    if (b < B && col < D2) {
+        const float* ptr = x + ((long long)b * D1 * D2) + col;
+        for (int k = ty; k < D1; k += REDUCE_THREADS) {
+            float val = ptr[(long long)k * D2];
+            v = fmaxf(v, val);
+        }
+    }
+
+    smem[ty][tx] = v;
+    __syncthreads();
+
+    if (ty == 0 && col < D2) {
+        float m = smem[0][tx];
+        #pragma unroll
+        for (int i = 1; i < REDUCE_THREADS; ++i) {
+            m = fmaxf(m, smem[i][tx]);
+        }
+        out[(long long)b * D2 + col] = m;
+    }
+}
+
+__global__ void max_dim2_kernel(const float* __restrict__ x, float* __restrict__ out, int B, int D1, int D2) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    extern __shared__ float sdata[];
+    float m = -FLT_MAX;
+
+    if (row < B * D1) {
+        const float* ptr = x + (long long)row * D2;
+        for (int c = tid; c < D2; c += blockDim.x) {
+            m = fmaxf(m, ptr[c]);
+        }
+    }
+
+    sdata[tid] = m;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sdata[tid] = fmaxf(sdata[tid], sdata[tid + stride]);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0 && row < B * D1) {
+        out[row] = sdata[0];
+    }
+}
+
+__global__ void max_dim0_kernel(const float* __restrict__ x, float* __restrict__ out, int B, int D1, int D2) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = D1 * D2;
+    if (idx >= total) return;
+
+    float m = -FLT_MAX;
+    for (int b = 0; b < B; ++b) {
+        m = fmaxf(m, x[(long long)b * total + idx]);
+    }
+    out[idx] = m;
+}
+
+torch::Tensor max_reduce_dim1_cuda(torch::Tensor x) {
+    int B = (int)x.size(0);
+    int D1 = (int)x.size(1);
+    int D2 = (int)x.size(2);
+    auto out = torch::empty({B, D2}, x.options());
+
+    dim3 block(TILE_COLS, REDUCE_THREADS);
+    dim3 grid((D2 + TILE_COLS - 1) / TILE_COLS, B);
+    max_dim1_kernel<<<grid, block>>>(x.data_ptr<float>(), out.data_ptr<float>(), B, D1, D2);
+    return out;
+}
+
+torch::Tensor max_reduce_dim2_cuda(torch::Tensor x) {
+    int B = (int)x.size(0);
+    int D1 = (int)x.size(1);
+    int D2 = (int)x.size(2);
+    auto out = torch::empty({B, D1}, x.options());
+
+    int threads = 256;
+    int rows = B * D1;
+    max_dim2_kernel<<<rows, threads, threads * sizeof(float)>>>(x.data_ptr<float>(), out.data_ptr<float>(), B, D1, D2);
+    return out;
+}
+
+torch::Tensor max_reduce_dim0_cuda(torch::Tensor x) {
+    int B = (int)x.size(0);
+    int D1 = (int)x.size(1);
+    int D2 = (int)x.size(2);
+    auto out = torch::empty({D1, D2}, x.options());
+
+    int total = D1 * D2;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    max_dim0_kernel<<<blocks, threads>>>(x.data_ptr<float>(), out.data_ptr<float>(), B, D1, D2);
+    return out;
+}
+"""
+
+max_reduce_ext = load_inline(
+    name="max_reduce_ext_kernelbench",
+    cpp_sources=max_reduce_cpp_source,
+    cuda_sources=max_reduce_cuda_source,
+    functions=["max_reduce_dim0_cuda", "max_reduce_dim1_cuda", "max_reduce_dim2_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+        self.max_reduce = max_reduce_ext
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dim = self.dim
+        if dim < 0:
+            dim += 3
+        if dim == 1:
+            return self.max_reduce.max_reduce_dim1_cuda(x.contiguous())
+        if dim == 2:
+            return self.max_reduce.max_reduce_dim2_cuda(x.contiguous())
+        return self.max_reduce.max_reduce_dim0_cuda(x.contiguous())
+```

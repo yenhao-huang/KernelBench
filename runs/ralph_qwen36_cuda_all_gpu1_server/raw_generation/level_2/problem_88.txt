@@ -1,0 +1,238 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernels
+custom_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+// Helper for fast sigmoid approximation or standard exp-based sigmoid
+__device__ __forceinline__ float sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+// Kernel 1: Fused GEMM + GroupNorm + Swish + Multiply + Swish
+// This kernel performs the entire forward pass logic in one go to minimize memory traffic.
+// It assumes input x is (batch, in_features), weight W is (out_features, in_features), bias b is (out_features).
+// It computes:
+// 1. y = x @ W^T + b
+// 2. GroupNorm on y with num_groups and channels=out_features
+// 3. swish(y) = y * sigmoid(y)
+// 4. z = swish(y) * multiply_weight
+// 5. out = z * sigmoid(z)
+
+__global__ void fused_model_kernel(
+    const float* __restrict__ x,      // (batch_size, in_features)
+    const float* __restrict__ weight, // (out_features, in_features)
+    const float* __restrict__ bias,   // (out_features,)
+    const float* __restrict__ multiply_weight, // (out_features,)
+    float* __restrict__ out,          // (batch_size, out_features)
+    int batch_size,
+    int in_features,
+    int out_features,
+    int num_groups
+) {
+    int batch_idx = blockIdx.y;
+    int feat_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch_idx >= batch_size || feat_idx >= out_features) return;
+
+    // 1. GEMM: Compute y[feat_idx] for this batch item
+    float sum = 0.0f;
+    const float* x_row = x + batch_idx * in_features;
+    const float* w_col = weight + feat_idx * in_features; // Weight is stored as (out, in), so row feat_idx is the column for matmul
+    
+    // Unroll or simple loop for GEMM part
+    for (int i = 0; i < in_features; ++i) {
+        sum += x_row[i] * w_col[i];
+    }
+    
+    float y = sum + bias[feat_idx];
+
+    // 2. GroupNorm
+    // We need to compute mean and var over the group for this specific feature index across all groups? 
+    // No, GroupNorm normalizes per-group. The input shape is (N, C). 
+    // Groups are formed by splitting C into num_groups. Each group has C/num_groups channels.
+    // However, here we are processing one feature (channel) at a time in the thread.
+    // To do GroupNorm correctly in a single kernel without shared memory coordination across threads for the same group, 
+    // it's complex because mean/var must be computed over the spatial/group dimensions first.
+    
+    // Alternative Strategy: Since out_features is large (8192) and batch is 1024, 
+    // doing GroupNorm in a separate kernel or fused carefully is better.
+    // But let's try to fuse GEMM + Swish + Multiply + Swish, and leave GroupNorm as a standard call if fusion is too complex for correctness.
+    // Actually, the prompt asks for speedups. Fusing GEMM+Swish+Mul+Swish is very effective. 
+    // Let's implement a kernel that does: GEMM -> Swish -> Mul -> Swish.
+    // We will call GroupNorm separately using PyTorch's optimized implementation or a custom one if needed.
+    // Given the constraints, let's fuse the non-normalization parts which are compute-heavy and memory-bound.
+    
+    // Let's restart the kernel design:
+    // Kernel 1: Fused GEMM + Swish + Multiply + Swish
+    // We assume GroupNorm is handled by PyTorch or a separate optimized kernel. 
+    // To maximize speedup, we can fuse GEMM and the subsequent element-wise ops.
+    
+    // Re-writing kernel to be purely the fused part:
+    // Input: x (N, D_in), Weight (D_out, D_in), Bias (D_out), MulWeight (D_out)
+    // Output: out (N, D_out)
+    // Logic: 
+    // temp = GEMM(x, W, b)
+    // temp = temp * sigmoid(temp)  [Swish]
+    // temp = temp * MulWeight      [Multiply]
+    // out = temp * sigmoid(temp)   [Swish again]
+    
+    // Wait, the original code:
+    // x = GEMM(x)
+    // x = GroupNorm(x)
+    // x = x * sigmoid(x)
+    // x = x * multiply_weight
+    // x = x * sigmoid(x)
+    
+    // So GroupNorm is in the middle. 
+    // We can fuse: Swish1 -> Multiply -> Swish2.
+    // And we can fuse GEMM + Swish1? No, because GroupNorm is between them.
+    // However, we can replace GroupNorm with a custom kernel and fuse the rest.
+    // Or, we can replace ALL of them with one giant kernel if we implement GroupNorm inside it.
+    
+    // Implementing GroupNorm inside the kernel:
+    // For each batch item, we have C=out_features channels.
+    // We split C into num_groups. Each group has G = C/num_groups channels.
+    // For a specific channel c in batch n:
+    // 1. Identify which group it belongs to: g = c / G
+    // 2. The mean and variance for this group must be computed over all channels in that group for this batch item.
+    // This requires two passes or shared memory reduction.
+    
+    // Given the complexity of implementing a correct, fast GroupNorm from scratch in inline CUDA without bugs,
+    // and the fact that PyTorch's GroupNorm is already quite optimized, 
+    // the biggest win usually comes from fusing the GEMM with the activation if possible, or optimizing the GEMM itself.
+    
+    // Let's try a different approach: 
+    // 1. Custom GEMM kernel (using cuBLAS is best, but let's assume we want custom). Actually, cuBLAS is hard to beat.
+    // 2. Custom GroupNorm? PyTorch's is good.
+    // 3. Fuse the last three operations: Swish -> Mul -> Swish. This is trivial and saves memory writes/reads.
+    
+    // Let's implement a kernel for the fused tail: x * sigmoid(x) * w * sigmoid(x*w_sigmoid) ? No.
+    // Sequence:
+    // 1. y = GroupNorm(GEMM(x))
+    // 2. z = y * sigmoid(y)
+    // 3. w_val = z * multiply_weight
+    // 4. out = w_val * sigmoid(w_val)
+    
+    // We can fuse steps 2, 3, 4 into one kernel that takes the output of GroupNorm and produces the final output.
+    // This saves writing y to global memory and reading it back for step 2.
+    
+    // Let's define a kernel for this fused tail operation.
+}
+
+// Kernel: Fused Swish * Mul * Swish
+__global__ void fused_tail_kernel(
+    const float* __restrict__ input,      // (batch_size, out_features) - Output of GroupNorm
+    const float* __restrict__ multiply_weight, // (out_features,)
+    float* __restrict__ output,           // (batch_size, out_features)
+    int batch_size,
+    int out_features
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * out_features;
+
+    if (idx < total_elements) {
+        float val = input[idx];
+        
+        // Step 1: Swish
+        float swished = val * sigmoid(val);
+        
+        // Step 2: Multiply by weight
+        int feat_idx = idx % out_features;
+        float multiplied = swished * multiply_weight[feat_idx];
+        
+        // Step 3: Swish again
+        output[idx] = multiplied * sigmoid(multiplied);
+    }
+}
+
+// Kernel: Custom GroupNorm (Simplified for correctness and speed)
+// This kernel computes GroupNorm. It's complex to do efficiently in a single pass without shared memory tiling.
+// For the sake of this exercise, we will use PyTorch's built-in GroupNorm for the normalization step 
+// because writing a bug-free, high-performance GroupNorm from scratch is extremely error-prone and lengthy.
+// The main optimization here is fusing the post-normalization operations.
+
+torch::Tensor fused_tail_cuda(torch::Tensor input, torch::Tensor multiply_weight) {
+    auto batch_size = input.size(0);
+    auto out_features = input.size(1);
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    const int total_elements = batch_size * out_features;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    fused_tail_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        multiply_weight.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        out_features
+    );
+
+    return output;
+}
+
+// We also provide a custom GEMM wrapper if needed, but cuBLAS via torch.mm is usually optimal.
+// However, to demonstrate "custom CUDA operators", we can wrap the whole thing or just the tail.
+// Let's stick to fusing the tail as it's a clear memory-bound optimization.
+
+"""
+
+custom_cpp_source = (
+    "torch::Tensor fused_tail_cuda(torch::Tensor input, torch::Tensor multiply_weight);"
+)
+
+# Compile the inline CUDA code
+fused_tail_module = load_inline(
+    name="fused_tail",
+    cpp_sources=custom_cpp_source,
+    cuda_sources=custom_cuda_source,
+    functions=["fused_tail_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model that replaces the post-GroupNorm operations with a custom fused CUDA kernel.
+    This reduces memory traffic by avoiding intermediate writes to global memory for the 
+    Swish -> Multiply -> Swish sequence.
+    """
+    def __init__(self, in_features, out_features, num_groups, multiply_weight_shape):
+        super(ModelNew, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.group_norm = nn.GroupNorm(num_groups, out_features)
+        self.multiply_weight = nn.Parameter(torch.randn(multiply_weight_shape)) 
+        self.fused_tail = fused_tail_module
+
+    def forward(self, x):
+        # (batch_size, in_features) -> (batch_size, out_features)
+        x = self.gemm(x)
+        
+        # (batch_size, out_features) -> (batch_size, out_features)
+        # Using PyTorch's optimized GroupNorm
+        x = self.group_norm(x)
+        
+        # Fused operation: Swish -> Multiply -> Swish
+        # This replaces:
+        # x = x * torch.sigmoid(x)
+        # x = x * self.multiply_weight
+        # x = x * torch.sigmoid(x)
+        x = self.fused_tail.fused_tail_cuda(x, self.multiply_weight)
+        
+        return x
+
+# Helper functions to match the interface
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, num_groups, multiply_weight_shape]
+```

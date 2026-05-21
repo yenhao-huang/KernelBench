@@ -1,0 +1,191 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+import os
+
+# We will replace the core Linear (Matmul) operations with a custom fused kernel.
+# Standard PyTorch matmul is already highly optimized, but for the sake of this exercise 
+# and to demonstrate custom CUDA integration in a transformer-like architecture, 
+# we will implement a custom GEMM + Bias Add + ReLU (if applicable) or just GEMM+Bias.
+# However, since BigBird uses standard attention and MLPs, the most impactful single 
+# replacement that is easy to inline correctly without complex memory management for 
+# large tensors in a simple example is often the Linear layer's forward pass.
+
+# Note: Replacing the entire AutoModelForCausalLM with custom CUDA kernels for every 
+# operation (Attention, LayerNorm, etc.) in a single inline block is extremely verbose 
+# and error-prone due to memory allocation complexities. 
+# Instead, we will create a custom Linear layer implementation that replaces the standard 
+# nn.Linear forward pass using a custom CUDA kernel for Matrix Multiplication + Bias Addition.
+# This demonstrates the capability requested.
+
+custom_linear_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Kernel for Matmul (A @ B^T) + Bias
+// A: [M, K]
+// B: [N, K] -> Transposed to [K, N] internally or handled by layout
+// Bias: [N]
+// Out: [M, N]
+
+__global__ void matmul_bias_kernel(
+    const float* __restrict__ A, 
+    const float* __restrict__ B, 
+    const float* __restrict__ Bias, 
+    float* __restrict__ Out, 
+    int M, 
+    int N, 
+    int K) 
+{
+    // Each thread block handles a tile of the output matrix.
+    // We use a simple row-major approach for correctness and simplicity in this inline example.
+    // For production, you would use shared memory tiling (e.g., CUTLASS style).
+    
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < M && col < N) {
+        float sum = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            sum += A[row * K + k] * B[col * K + k]; // B is stored as [N, K] in PyTorch Linear weight
+        }
+        Out[row * N + col] = sum + Bias[col];
+    }
+}
+
+torch::Tensor custom_linear_forward_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias) {
+    // Input: [Batch, SeqLen, Hidden] -> [M, K] where M = Batch*SeqLen, K = Hidden
+    // Weight: [Hidden, Hidden] -> [N, K] where N=Hidden, K=Hidden
+    // Bias: [Hidden]
+    
+    auto m = input.size(0) * input.size(1);
+    auto k = input.size(2);
+    auto n = weight.size(0);
+
+    auto out = torch::zeros({input.size(0), input.size(1), n}, input.options());
+
+    const int block_x = 32;
+    const int block_y = 8;
+    
+    dim3 block(block_x, block_y);
+    dim3 grid((n + block_x - 1) / block_x, (m + block_y - 1) / block_y);
+
+    matmul_bias_kernel<<<grid, block>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        m, n, k
+    );
+
+    cudaDeviceSynchronize();
+    return out;
+}
+"""
+
+custom_linear_cpp_source = (
+    "torch::Tensor custom_linear_forward_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias);"
+)
+
+# Compile the inline CUDA code
+custom_linear_lib = load_inline(
+    name="custom_linear_lib",
+    cpp_sources=custom_linear_cpp_source,
+    cuda_sources=custom_linear_source,
+    functions=["custom_linear_forward_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"]
+)
+
+
+class CustomLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / (fan_in ** 0.5) if fan_in > 0 else 0
+        if self.bias is not None:
+            uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        # x shape: [*, in_features]
+        # We need to flatten the first dimensions to treat it as [M, K]
+        original_shape = x.shape
+        m = x.numel() // self.in_features
+        k = self.in_features
+        
+        # Reshape to [M, K]
+        x_flat = x.view(m, k)
+        
+        # Call custom CUDA kernel
+        out_flat = custom_linear_lib.custom_linear_forward_cuda(x_flat, self.weight, self.bias)
+        
+        # Reshape back to original shape with last dim being out_features
+        new_shape = list(original_shape[:-1]) + [self.out_features]
+        return out_flat.view(new_shape)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, model_name, config):
+        super().__init__()
+        self.model_name = model_name
+        self.config = config
+        
+        # Load the original model to get weights and structure
+        from transformers import AutoModelForCausalLM
+        self.original_model = AutoModelForCausalLM.from_pretrained(model_name, config=config)
+        
+        # We will replace all Linear layers in the model with our CustomLinear
+        # This is a recursive replacement strategy
+        self._replace_linear_layers(self.original_model)
+        
+        # Rename to mimic the original interface
+        self.model = self.original_model
+
+    def _replace_linear_layers(self, module):
+        for name, child in module.named_children():
+            if isinstance(child, nn.Linear):
+                # Create new CustomLinear with same dimensions
+                new_linear = CustomLinear(
+                    in_features=child.in_features,
+                    out_features=child.out_features,
+                    bias=child.bias is not None
+                )
+                # Copy weights and biases
+                with torch.no_grad():
+                    new_linear.weight.copy_(child.weight)
+                    if child.bias is not None:
+                        new_linear.bias.copy_(child.bias)
+                
+                setattr(module, name, new_linear)
+            else:
+                self._replace_linear_layers(child)
+
+    def forward(self, x):
+        return self.model(x).logits
+
+
+model_name = "google/bigbird-roberta-base"
+config = AutoConfig.from_pretrained(model_name)
+vocab_size = config.vocab_size
+sequence_length = 4095
+batch_size = 1
+
+def get_inputs():
+    inputs = torch.randint(0, vocab_size, (batch_size, sequence_length))
+    return [inputs]
+
+def get_init_inputs():
+    return [model_name, config]

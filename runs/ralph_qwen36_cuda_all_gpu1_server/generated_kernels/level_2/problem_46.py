@@ -1,0 +1,171 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for the fused operation:
+# 1. Conv2d (implied via standard PyTorch or could be custom, but here we focus on the element-wise chain)
+# 2. Subtract scalar
+# 3. Tanh
+# 4. Subtract scalar
+# 5. AvgPool2d
+
+# Note: Implementing a full custom Conv2d from scratch in inline CUDA is extremely verbose and error-prone 
+# compared to leveraging cuDNN via torch.nn.functional.conv2d or keeping nn.Conv2d. 
+# The prompt asks for speedups by replacing operators. The element-wise chain (sub, tanh, sub) followed by pooling 
+# is a good candidate for fusion to reduce memory bandwidth pressure and kernel launch overhead.
+# However, AvgPool2d is also an operator. 
+# Let's fuse: (x - s1), tanh, (result - s2), then AvgPool.
+# Actually, AvgPool can be done efficiently in CUDA. 
+# We will create a single kernel that performs:
+# 1. Conv2d (using standard torch for simplicity as custom conv is huge, OR we assume the bottleneck is the element-wise ops)
+#    *Correction*: The prompt says "replace pytorch operators". Replacing Conv2d with a custom one is possible but very complex. 
+#    Let's focus on fusing the element-wise operations and the pooling into a single kernel to minimize memory traffic.
+#    Alternatively, we can replace the entire sequence after conv with a custom kernel if we pass the conv output.
+    
+# Strategy: 
+# We will keep nn.Conv2d as it is highly optimized in cuDNN. 
+# We will replace the subsequent operations (sub1, tanh, sub2, avgpool) with a single custom CUDA kernel.
+# This reduces memory writes/reads between these steps.
+
+fused_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+// Helper for tanh approximation or exact calculation
+__device__ inline float fast_tanh(float x) {
+    return tanhf(x);
+}
+
+__global__ void fused_sub_tanh_sub_pool_kernel(
+    const float* input,      // Output of Conv2d: [N, C, H, W]
+    float* output,           // Final result: [N, C, H', W']
+    int N, int C, int H, int W,
+    int pool_size,
+    float subtract1_val,
+    float subtract2_val
+) {
+    // Each thread handles one element of the final pooled output
+    // Output dimensions: N x C x (H/pool_size) x (W/pool_size)
+    
+    int out_w = W / pool_size;
+    int out_h = H / pool_size;
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C * out_h * out_w;
+    
+    if (idx >= total_elements) return;
+    
+    // Decode index to coordinates
+    int temp = idx;
+    int w_out = temp % out_w;
+    temp /= out_w;
+    int h_out = temp % out_h;
+    temp /= out_h;
+    int c = temp % C;
+    int n = temp / C;
+    
+    // Calculate the starting position in the input tensor for this output element
+    // Input is [N, C, H, W]
+    // The pooling window starts at h_out * pool_size, w_out * pool_size
+    
+    float sum = 0.0f;
+    int window_area = pool_size * pool_size;
+    
+    for (int ph = 0; ph < pool_size; ++ph) {
+        for (int pw = 0; pw < pool_size; ++pw) {
+            int h_in = h_out * pool_size + ph;
+            int w_in = w_out * pool_size + pw;
+            
+            // Index in input tensor [N, C, H, W]
+            int in_idx = ((n * C + c) * H + h_in) * W + w_in;
+            
+            float val = input[in_idx];
+            
+            // Apply operations: (val - subtract1_val), tanh, then - subtract2_val
+            val = val - subtract1_val;
+            val = fast_tanh(val);
+            val = val - subtract2_val;
+            
+            sum += val;
+        }
+    }
+    
+    // Average pooling: divide by window area
+    output[idx] = sum / window_area;
+}
+
+torch::Tensor fused_ops_cuda(torch::Tensor conv_output, float subtract1_value, float subtract2_value, int kernel_size_pool) {
+    auto N = conv_output.size(0);
+    auto C = conv_output.size(1);
+    auto H = conv_output.size(2);
+    auto W = conv_output.size(3);
+    
+    // Check if dimensions are divisible by pool size
+    TORCH_CHECK(H % kernel_size_pool == 0, "Height must be divisible by pool size");
+    TORCH_CHECK(W % kernel_size_pool == 0, "Width must be divisible by pool size");
+    
+    int out_h = H / kernel_size_pool;
+    int out_w = W / kernel_size_pool;
+    
+    auto output = torch::empty({N, C, out_h, out_w}, conv_output.options());
+    
+    const int block_size = 256;
+    int total_elements = N * C * out_h * out_w;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    fused_sub_tanh_sub_pool_kernel<<<num_blocks, block_size>>>(
+        conv_output.data_ptr<float>(),
+        output.data_ptr<float>(),
+        N, C, H, W,
+        kernel_size_pool,
+        subtract1_value,
+        subtract2_value
+    );
+    
+    return output;
+}
+"""
+
+fused_ops_cpp_source = (
+    "torch::Tensor fused_ops_cuda(torch::Tensor conv_output, float subtract1_value, float subtract2_value, int kernel_size_pool);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_source,
+    functions=["fused_ops_cuda"],
+    verbose=False,
+    extra_cflags=["-O2"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model that performs a convolution, then fuses subtraction, tanh, 
+    another subtraction, and average pooling into a single CUDA kernel.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, subtract1_value, subtract2_value, kernel_size_pool):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.subtract1_value = subtract1_value
+        self.subtract2_value = subtract2_value
+        self.kernel_size_pool = kernel_size_pool
+
+    def forward(self, x):
+        # Standard Conv2d (highly optimized via cuDNN)
+        x = self.conv(x)
+        
+        # Fused custom CUDA operator for the rest of the chain
+        x = fused_ops.fused_ops_cuda(x, self.subtract1_value, self.subtract2_value, self.kernel_size_pool)
+        
+        return x
+
+def get_inputs():
+    return [torch.rand(128, 64, 128, 128)]
+
+def get_init_inputs():
+    return [64, 128, 3, 0.5, 0.2, 2]

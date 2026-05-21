@@ -1,0 +1,127 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__device__ __forceinline__ float hardswish_f(float x) {
+    float t = fminf(fmaxf(x + 3.0f, 0.0f), 6.0f);
+    return x * t * 0.16666666666666666f;
+}
+
+__device__ __forceinline__ float mish_f(float x) {
+    float sp;
+    if (x > 20.0f) {
+        sp = x;
+    } else {
+        sp = log1pf(expf(x));
+    }
+    return x * tanhf(sp);
+}
+
+__global__ void sub_hswish_pool_mish_kernel(
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int n,
+    int c,
+    int h,
+    int w,
+    float subtract_value,
+    int pool_k,
+    int out_h,
+    int out_w,
+    int total
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int ow = idx % out_w;
+    int tmp = idx / out_w;
+    int oh = tmp % out_h;
+    tmp /= out_h;
+    int ch = tmp % c;
+    int b = tmp / c;
+
+    int base = ((b * c + ch) * h) * w;
+    int ih0 = oh * pool_k;
+    int iw0 = ow * pool_k;
+
+    float maxv = -3.4028234663852886e38f;
+
+    for (int kh = 0; kh < pool_k; ++kh) {
+        int ih = ih0 + kh;
+        if (ih >= h) continue;
+        for (int kw = 0; kw < pool_k; ++kw) {
+            int iw = iw0 + kw;
+            if (iw >= w) continue;
+            float v = x[base + ih * w + iw] - subtract_value;
+            v = hardswish_f(v);
+            maxv = fmaxf(maxv, v);
+        }
+    }
+
+    out[idx] = mish_f(maxv);
+}
+
+torch::Tensor sub_hswish_pool_mish_cuda(torch::Tensor x, double subtract_value, int64_t pool_k) {
+    int n = (int)x.size(0);
+    int c = (int)x.size(1);
+    int h = (int)x.size(2);
+    int w = (int)x.size(3);
+    int pk = (int)pool_k;
+    int out_h = h / pk;
+    int out_w = w / pk;
+
+    auto out = torch::empty({n, c, out_h, out_w}, x.options());
+    int total = n * c * out_h * out_w;
+
+    const int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+
+    sub_hswish_pool_mish_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        n,
+        c,
+        h,
+        w,
+        (float)subtract_value,
+        pk,
+        out_h,
+        out_w,
+        total
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor sub_hswish_pool_mish_cuda(torch::Tensor x, double subtract_value, int64_t pool_k);
+"""
+
+fused_ops = load_inline(
+    name="fused_sub_hswish_pool_mish_ops",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["sub_hswish_pool_mish_cuda"],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, subtract_value, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.subtract_value = float(subtract_value)
+        self.pool_kernel_size = int(pool_kernel_size)
+        self.fused_ops = fused_ops
+
+    def forward(self, x):
+        x = self.conv(x)
+        return self.fused_ops.sub_hswish_pool_mish_cuda(
+            x, self.subtract_value, self.pool_kernel_size
+        )

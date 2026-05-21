@@ -1,0 +1,130 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+pointwise_conv2d_cpp_source = """
+torch::Tensor pointwise_conv2d_cuda(torch::Tensor x, torch::Tensor weight, c10::optional<torch::Tensor> bias);
+"""
+
+pointwise_conv2d_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+#define TILE_PIXELS 16
+#define TILE_OC 8
+
+__global__ void pointwise_conv2d_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ out,
+    int N,
+    int C,
+    int H,
+    int Wd,
+    int K,
+    int has_bias
+) {
+    extern __shared__ float smem[];
+    float* sx = smem;
+    float* sw = sx + C * TILE_PIXELS;
+
+    const int lane_pix = threadIdx.x;
+    const int lane_oc = threadIdx.y;
+    const int tid = lane_oc * TILE_PIXELS + lane_pix;
+
+    const int HW = H * Wd;
+    const int total_pixels = N * HW;
+    const int pix_base = blockIdx.x * TILE_PIXELS;
+    const int oc_base = blockIdx.y * TILE_OC;
+
+    for (int i = tid; i < C * TILE_PIXELS; i += TILE_PIXELS * TILE_OC) {
+        int c = i / TILE_PIXELS;
+        int p_local = i - c * TILE_PIXELS;
+        int p = pix_base + p_local;
+        if (p < total_pixels) {
+            int n = p / HW;
+            int hw = p - n * HW;
+            sx[i] = x[((n * C + c) * HW) + hw];
+        } else {
+            sx[i] = 0.0f;
+        }
+    }
+
+    for (int i = tid; i < TILE_OC * C; i += TILE_PIXELS * TILE_OC) {
+        int oc_local = i / C;
+        int c = i - oc_local * C;
+        int oc = oc_base + oc_local;
+        sw[i] = (oc < K) ? w[oc * C + c] : 0.0f;
+    }
+
+    __syncthreads();
+
+    int p = pix_base + lane_pix;
+    int oc = oc_base + lane_oc;
+
+    if (p < total_pixels && oc < K) {
+        float acc = has_bias ? b[oc] : 0.0f;
+
+        #pragma unroll 4
+        for (int c = 0; c < C; ++c) {
+            acc += sx[c * TILE_PIXELS + lane_pix] * sw[lane_oc * C + c];
+        }
+
+        int n = p / HW;
+        int hw = p - n * HW;
+        out[((n * K + oc) * HW) + hw] = acc;
+    }
+}
+
+torch::Tensor pointwise_conv2d_cuda(torch::Tensor x, torch::Tensor weight, c10::optional<torch::Tensor> bias) {
+    const int N = x.size(0);
+    const int C = x.size(1);
+    const int H = x.size(2);
+    const int Wd = x.size(3);
+    const int K = weight.size(0);
+
+    auto out = torch::empty({N, K, H, Wd}, x.options());
+
+    const int total_pixels = N * H * Wd;
+    dim3 block(TILE_PIXELS, TILE_OC);
+    dim3 grid((total_pixels + TILE_PIXELS - 1) / TILE_PIXELS, (K + TILE_OC - 1) / TILE_OC);
+
+    const bool has_bias = bias.has_value() && bias.value().defined();
+    const float* bias_ptr = has_bias ? bias.value().data_ptr<float>() : nullptr;
+    const int shared_bytes = (C * TILE_PIXELS + TILE_OC * C) * sizeof(float);
+
+    pointwise_conv2d_kernel<<<grid, block, shared_bytes>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias_ptr,
+        out.data_ptr<float>(),
+        N, C, H, Wd, K,
+        has_bias ? 1 : 0
+    );
+
+    return out;
+}
+"""
+
+pointwise_conv2d = load_inline(
+    name="pointwise_conv2d_inline_cuda",
+    cpp_sources=pointwise_conv2d_cpp_source,
+    cuda_sources=pointwise_conv2d_cuda_source,
+    functions=["pointwise_conv2d_cuda"],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, bias: bool = False):
+        super(ModelNew, self).__init__()
+        self.conv1d = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=bias)
+        self.pointwise_conv2d = pointwise_conv2d
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.pointwise_conv2d.pointwise_conv2d_cuda(
+            x,
+            self.conv1d.weight,
+            self.conv1d.bias,
+        )

@@ -1,0 +1,141 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+avgpool2d_cpp_source = """
+torch::Tensor avgpool2d_cuda(torch::Tensor x, int kernel_size, int stride, int padding);
+"""
+
+avgpool2d_cuda_source = """
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+
+__global__ void avgpool2d_k11_s11_p0_kernel(
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int total,
+    int C,
+    int H,
+    int W,
+    int OH,
+    int OW
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int ow = idx % OW;
+    int t = idx / OW;
+    int oh = t % OH;
+    t /= OH;
+    int c = t % C;
+    int n = t / C;
+
+    int ih0 = oh * 11;
+    int iw0 = ow * 11;
+    const float* base = x + ((n * C + c) * H + ih0) * W + iw0;
+
+    float sum = 0.0f;
+    #pragma unroll
+    for (int kh = 0; kh < 11; ++kh) {
+        const float* row = base + kh * W;
+        #pragma unroll
+        for (int kw = 0; kw < 11; ++kw) {
+            sum += row[kw];
+        }
+    }
+    y[idx] = sum * 0.008264462809917355f;
+}
+
+__global__ void avgpool2d_generic_kernel(
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int total,
+    int C,
+    int H,
+    int W,
+    int OH,
+    int OW,
+    int K,
+    int S,
+    int P
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int ow = idx % OW;
+    int t = idx / OW;
+    int oh = t % OH;
+    t /= OH;
+    int c = t % C;
+    int n = t / C;
+
+    int ih0 = oh * S - P;
+    int iw0 = ow * S - P;
+    float sum = 0.0f;
+
+    for (int kh = 0; kh < K; ++kh) {
+        int ih = ih0 + kh;
+        if (ih < 0 || ih >= H) continue;
+        for (int kw = 0; kw < K; ++kw) {
+            int iw = iw0 + kw;
+            if (iw >= 0 && iw < W) {
+                sum += x[((n * C + c) * H + ih) * W + iw];
+            }
+        }
+    }
+    y[idx] = sum / float(K * K);
+}
+
+torch::Tensor avgpool2d_cuda(torch::Tensor x, int kernel_size, int stride, int padding) {
+    int N = x.size(0);
+    int C = x.size(1);
+    int H = x.size(2);
+    int W = x.size(3);
+
+    int OH = (H + 2 * padding - kernel_size) / stride + 1;
+    int OW = (W + 2 * padding - kernel_size) / stride + 1;
+
+    auto y = torch::empty({N, C, OH, OW}, x.options());
+    int total = N * C * OH * OW;
+
+    const int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    if (kernel_size == 11 && stride == 11 && padding == 0) {
+        avgpool2d_k11_s11_p0_kernel<<<blocks, threads, 0, stream>>>(
+            x.data_ptr<float>(), y.data_ptr<float>(), total, C, H, W, OH, OW
+        );
+    } else {
+        avgpool2d_generic_kernel<<<blocks, threads, 0, stream>>>(
+            x.data_ptr<float>(), y.data_ptr<float>(), total, C, H, W, OH, OW,
+            kernel_size, stride, padding
+        );
+    }
+
+    return y;
+}
+"""
+
+avgpool2d_ext = load_inline(
+    name="avgpool2d_ext_k11_opt",
+    cpp_sources=avgpool2d_cpp_source,
+    cuda_sources=avgpool2d_cuda_source,
+    functions=["avgpool2d_cuda"],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, kernel_size: int, stride: int = None, padding: int = 0):
+        super().__init__()
+        self.kernel_size = int(kernel_size)
+        self.stride = int(kernel_size if stride is None else stride)
+        self.padding = int(padding)
+        self.avgpool2d_ext = avgpool2d_ext
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.avgpool2d_ext.avgpool2d_cuda(
+            x, self.kernel_size, self.stride, self.padding
+        )

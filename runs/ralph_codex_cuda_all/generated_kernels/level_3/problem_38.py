@@ -1,0 +1,274 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+lstm_cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__device__ __forceinline__ float sigmoidf_fast(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+__global__ void lstm_dir_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ h0,
+    const float* __restrict__ c0,
+    const float* __restrict__ w_ih,
+    const float* __restrict__ w_hh,
+    const float* __restrict__ b_ih,
+    const float* __restrict__ b_hh,
+    float* __restrict__ y,
+    int B,
+    int T,
+    int I,
+    int H,
+    int reverse,
+    int out_offset
+) {
+    int b = blockIdx.x;
+    int h = threadIdx.x;
+
+    extern __shared__ float smem[];
+    float* prev_h = smem;
+    float* prev_c = smem + H;
+    float* next_h = smem + 2 * H;
+    float* next_c = smem + 3 * H;
+
+    if (h < H) {
+        prev_h[h] = h0[b * H + h];
+        prev_c[h] = c0[b * H + h];
+    }
+    __syncthreads();
+
+    for (int s = 0; s < T; ++s) {
+        int t = reverse ? (T - 1 - s) : s;
+
+        if (h < H) {
+            float gi = b_ih[h] + b_hh[h];
+            float gf = b_ih[H + h] + b_hh[H + h];
+            float gg = b_ih[2 * H + h] + b_hh[2 * H + h];
+            float go = b_ih[3 * H + h] + b_hh[3 * H + h];
+
+            const float* xrow = x + (b * T + t) * I;
+            const float* wi_i = w_ih + h * I;
+            const float* wi_f = w_ih + (H + h) * I;
+            const float* wi_g = w_ih + (2 * H + h) * I;
+            const float* wi_o = w_ih + (3 * H + h) * I;
+
+            for (int j = 0; j < I; ++j) {
+                float xv = xrow[j];
+                gi += wi_i[j] * xv;
+                gf += wi_f[j] * xv;
+                gg += wi_g[j] * xv;
+                go += wi_o[j] * xv;
+            }
+
+            const float* wh_i = w_hh + h * H;
+            const float* wh_f = w_hh + (H + h) * H;
+            const float* wh_g = w_hh + (2 * H + h) * H;
+            const float* wh_o = w_hh + (3 * H + h) * H;
+
+            for (int j = 0; j < H; ++j) {
+                float hv = prev_h[j];
+                gi += wh_i[j] * hv;
+                gf += wh_f[j] * hv;
+                gg += wh_g[j] * hv;
+                go += wh_o[j] * hv;
+            }
+
+            float in_gate = sigmoidf_fast(gi);
+            float forget_gate = sigmoidf_fast(gf);
+            float cell_gate = tanhf(gg);
+            float out_gate = sigmoidf_fast(go);
+
+            float c = forget_gate * prev_c[h] + in_gate * cell_gate;
+            float hv = out_gate * tanhf(c);
+
+            next_c[h] = c;
+            next_h[h] = hv;
+            y[(b * T + t) * (2 * H) + out_offset + h] = hv;
+        }
+
+        __syncthreads();
+
+        if (h < H) {
+            prev_h[h] = next_h[h];
+            prev_c[h] = next_c[h];
+        }
+
+        __syncthreads();
+    }
+}
+
+__global__ void linear_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ bias,
+    float* __restrict__ y,
+    int B,
+    int K,
+    int O
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * O;
+    if (idx >= total) return;
+
+    int b = idx / O;
+    int o = idx - b * O;
+
+    float acc = bias[o];
+    const float* xrow = x + b * K;
+    const float* wrow = w + o * K;
+
+    for (int k = 0; k < K; ++k) {
+        acc += xrow[k] * wrow[k];
+    }
+
+    y[idx] = acc;
+}
+
+torch::Tensor lstm_layer_cuda(
+    torch::Tensor x,
+    torch::Tensor h0_f,
+    torch::Tensor c0_f,
+    torch::Tensor h0_r,
+    torch::Tensor c0_r,
+    torch::Tensor w_ih_f,
+    torch::Tensor w_hh_f,
+    torch::Tensor b_ih_f,
+    torch::Tensor b_hh_f,
+    torch::Tensor w_ih_r,
+    torch::Tensor w_hh_r,
+    torch::Tensor b_ih_r,
+    torch::Tensor b_hh_r
+) {
+    int B = x.size(0);
+    int T = x.size(1);
+    int I = x.size(2);
+    int H = h0_f.size(1);
+
+    auto y = torch::empty({B, T, 2 * H}, x.options());
+    int threads = H;
+    size_t shmem = 4 * H * sizeof(float);
+
+    lstm_dir_kernel<<<B, threads, shmem>>>(
+        x.data_ptr<float>(),
+        h0_f.data_ptr<float>(),
+        c0_f.data_ptr<float>(),
+        w_ih_f.data_ptr<float>(),
+        w_hh_f.data_ptr<float>(),
+        b_ih_f.data_ptr<float>(),
+        b_hh_f.data_ptr<float>(),
+        y.data_ptr<float>(),
+        B, T, I, H, 0, 0
+    );
+
+    lstm_dir_kernel<<<B, threads, shmem>>>(
+        x.data_ptr<float>(),
+        h0_r.data_ptr<float>(),
+        c0_r.data_ptr<float>(),
+        w_ih_r.data_ptr<float>(),
+        w_hh_r.data_ptr<float>(),
+        b_ih_r.data_ptr<float>(),
+        b_hh_r.data_ptr<float>(),
+        y.data_ptr<float>(),
+        B, T, I, H, 1, H
+    );
+
+    return y;
+}
+
+torch::Tensor linear_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor bias) {
+    int B = x.size(0);
+    int K = x.size(1);
+    int O = w.size(0);
+
+    auto y = torch::empty({B, O}, x.options());
+    int threads = 128;
+    int blocks = (B * O + threads - 1) / threads;
+
+    linear_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        w.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        y.data_ptr<float>(),
+        B, K, O
+    );
+
+    return y;
+}
+"""
+
+lstm_cpp_source = r"""
+torch::Tensor lstm_layer_cuda(
+    torch::Tensor x,
+    torch::Tensor h0_f,
+    torch::Tensor c0_f,
+    torch::Tensor h0_r,
+    torch::Tensor c0_r,
+    torch::Tensor w_ih_f,
+    torch::Tensor w_hh_f,
+    torch::Tensor b_ih_f,
+    torch::Tensor b_hh_f,
+    torch::Tensor w_ih_r,
+    torch::Tensor w_hh_r,
+    torch::Tensor b_ih_r,
+    torch::Tensor b_hh_r
+);
+torch::Tensor linear_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor bias);
+"""
+
+lstm_ext = load_inline(
+    name="kernelbench_lstm_bidir_fp32_v1",
+    cpp_sources=lstm_cpp_source,
+    cuda_sources=lstm_cuda_source,
+    functions=["lstm_layer_cuda", "linear_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.0):
+        super(ModelNew, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.lstm = nn.LSTM(
+            input_size,
+            hidden_size,
+            num_layers,
+            batch_first=True,
+            dropout=dropout,
+            bidirectional=True,
+        )
+        self.fc = nn.Linear(hidden_size * 2, output_size)
+        self.ext = lstm_ext
+
+    def forward(self, x, h0, c0):
+        out = x.contiguous()
+        h0c = h0.contiguous()
+        c0c = c0.contiguous()
+
+        for layer in range(self.num_layers):
+            suffix = str(layer)
+            out = self.ext.lstm_layer_cuda(
+                out,
+                h0c[2 * layer].contiguous(),
+                c0c[2 * layer].contiguous(),
+                h0c[2 * layer + 1].contiguous(),
+                c0c[2 * layer + 1].contiguous(),
+                getattr(self.lstm, "weight_ih_l" + suffix).contiguous(),
+                getattr(self.lstm, "weight_hh_l" + suffix).contiguous(),
+                getattr(self.lstm, "bias_ih_l" + suffix).contiguous(),
+                getattr(self.lstm, "bias_hh_l" + suffix).contiguous(),
+                getattr(self.lstm, "weight_ih_l" + suffix + "_reverse").contiguous(),
+                getattr(self.lstm, "weight_hh_l" + suffix + "_reverse").contiguous(),
+                getattr(self.lstm, "bias_ih_l" + suffix + "_reverse").contiguous(),
+                getattr(self.lstm, "bias_hh_l" + suffix + "_reverse").contiguous(),
+            )
+
+        last = out[:, -1, :].contiguous()
+        return self.ext.linear_cuda(last, self.fc.weight.contiguous(), self.fc.bias.contiguous())

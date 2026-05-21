@@ -1,0 +1,125 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for KL Divergence with online softmax/logsumexp optimization
+# We compute: sum_t [ t * (log(p) - log(t)) ] = sum_t [ t * log(p/t) ]
+# To avoid numerical instability and improve performance, we can fuse the log_softmax-like operations.
+# However, since targets are already probabilities (softmaxed), we just need log(predictions).
+# We will compute: reduction='batchmean' means sum over all elements divided by total number of elements.
+# KL(P || Q) = sum P(x) * log(P(x)/Q(x))
+# Here predictions is P, targets is Q.
+# Note: The input to kl_div in PyTorch is usually log_input and target. 
+# The model does torch.nn.functional.kl_div(torch.log(predictions), targets, ...)
+# So we compute sum(targets * (log(predictions) - log(targets)))
+
+kl_div_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+__global__ void kl_div_kernel(const float* predictions, const float* targets, float* out_sum, int total_elements) {
+    // Each thread handles one element
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < total_elements) {
+        float p = predictions[idx];
+        float t = targets[idx];
+        
+        // Avoid log(0) by adding a small epsilon, though softmax outputs are > 0 usually.
+        // Standard practice for numerical stability in KL div when inputs are probabilities.
+        if (p <= 0.0f) p = 1e-7f;
+        if (t <= 0.0f) t = 1e-7f;
+        
+        float log_p = logf(p);
+        float log_t = logf(t);
+        
+        // KL term: t * (log(p) - log(t))
+        float kl_term = t * (log_p - log_t);
+        
+        atomicAdd(out_sum, kl_term);
+    }
+}
+
+torch::Tensor kl_div_cuda(torch::Tensor predictions, torch::Tensor targets) {
+    // Ensure inputs are contiguous and on CUDA
+    if (!predictions.is_contiguous()) predictions = predictions.contiguous();
+    if (!targets.is_contiguous()) targets = targets.contiguous();
+    
+    int total_elements = predictions.numel();
+    
+    // Use a single float accumulator for the sum. 
+    // For very large tensors, atomicAdd on global memory can be slow.
+    // A better approach is to use shared memory or multiple accumulators per block.
+    // Given the size (8192*2 * 8192*2 is huge? No, batch_size=16384, input_shape=(16384,), total ~ 2.6e8),
+    // atomicAdd might be a bottleneck. Let's use a more optimized reduction strategy if possible, 
+    // but for simplicity and correctness in inline code, we'll stick to atomicAdd or a simple block-level sum.
+    
+    // Optimized approach: Each block sums into shared memory, then writes to global.
+    // However, implementing full warp-reduction in inline CUDA is verbose.
+    // Let's use a simpler atomicAdd first, but optimize the kernel launch config.
+    
+    float h_sum = 0.0f;
+    torch::Tensor d_sum = torch::zeros({1}, predictions.options());
+    
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    // If the tensor is too large, atomicAdd might be slow. 
+    // Let's try a two-pass reduction or just rely on atomicAdd for now as it's robust.
+    // For 2.6e8 elements, atomicAdd is acceptable if bandwidth-bound, but compute-bound here.
+    
+    kl_div_kernel<<<num_blocks, block_size>>>(predictions.data_ptr<float>(), targets.data_ptr<float>(), d_sum.data_ptr<float>(), total_elements);
+    
+    // Copy result back to host
+    float sum_val = 0.0f;
+    cudaMemcpy(&sum_val, d_sum.data_ptr<float>(), sizeof(float), cudaMemcpyDeviceToHost);
+    
+    // Batchmean reduction: divide by total number of elements
+    float mean_val = sum_val / static_cast<float>(total_elements);
+    
+    return torch::tensor(mean_val, predictions.options());
+}
+"""
+
+kl_div_cpp_source = (
+    "torch::Tensor kl_div_cuda(torch::Tensor predictions, torch::Tensor targets);"
+)
+
+# Compile the inline CUDA code for KL Divergence
+kl_div_op = load_inline(
+    name="kl_div_cuda",
+    cpp_sources=kl_div_cpp_source,
+    cuda_sources=kl_div_source,
+    functions=["kl_div_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    A model that computes Kullback-Leibler Divergence for comparing two distributions.
+    Optimized with custom CUDA operator.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, predictions, targets):
+        # The original model does: torch.nn.functional.kl_div(torch.log(predictions), targets, reduction='batchmean')
+        # Our custom kernel computes sum(targets * (log(predictions) - log(targets))) / total_elements
+        return kl_div_op.kl_div_cuda(predictions, targets)
+
+
+def get_inputs():
+    batch_size = 8192 * 2
+    input_shape = (8192 * 2,)
+    dim = 1
+    scale = torch.rand(())
+    return [(torch.rand(batch_size, *input_shape)*scale).softmax(dim=-1), torch.rand(batch_size, *input_shape).softmax(dim=-1)]
+
+def get_init_inputs():
+    return []
+```

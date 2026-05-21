@@ -1,0 +1,80 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+mean_reduce_cpp_source = """
+torch::Tensor mean_dim1_cuda(torch::Tensor x);
+"""
+
+mean_reduce_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void mean_dim1_kernel(const float* __restrict__ x,
+                                 float* __restrict__ out,
+                                 int B, int R, int C) {
+    __shared__ float partial[8][32];
+
+    int col = blockIdx.x * 32 + threadIdx.x;
+    int b = blockIdx.y;
+    int ty = threadIdx.y;
+
+    float sum = 0.0f;
+    if (col < C) {
+        const float* base = x + ((long long)b * R * C) + col;
+        #pragma unroll 4
+        for (int r = ty; r < R; r += 8) {
+            sum += base[(long long)r * C];
+        }
+    }
+
+    partial[ty][threadIdx.x] = sum;
+    __syncthreads();
+
+    if (ty == 0 && col < C) {
+        float total = partial[0][threadIdx.x]
+                    + partial[1][threadIdx.x]
+                    + partial[2][threadIdx.x]
+                    + partial[3][threadIdx.x]
+                    + partial[4][threadIdx.x]
+                    + partial[5][threadIdx.x]
+                    + partial[6][threadIdx.x]
+                    + partial[7][threadIdx.x];
+        out[(long long)b * C + col] = total / (float)R;
+    }
+}
+
+torch::Tensor mean_dim1_cuda(torch::Tensor x) {
+    int B = (int)x.size(0);
+    int R = (int)x.size(1);
+    int C = (int)x.size(2);
+
+    auto out = torch::empty({B, C}, x.options());
+
+    dim3 block(32, 8);
+    dim3 grid((C + 31) / 32, B);
+
+    mean_dim1_kernel<<<grid, block>>>(x.data_ptr<float>(), out.data_ptr<float>(), B, R, C);
+    return out;
+}
+"""
+
+mean_reduce_ext = load_inline(
+    name="mean_reduce_dim1_ext",
+    cpp_sources=mean_reduce_cpp_source,
+    cuda_sources=mean_reduce_cuda_source,
+    functions=["mean_dim1_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+        self.mean_reduce_ext = mean_reduce_ext
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.mean_reduce_ext.mean_dim1_cuda(x)

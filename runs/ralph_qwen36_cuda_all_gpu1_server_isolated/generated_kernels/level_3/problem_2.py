@@ -1,0 +1,335 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused Matmul + ReLU
+# This kernel performs: out = max(0, x @ W^T + b)
+# It is optimized for large matrix multiplications typical in deep learning.
+fused_matmul_relu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper macro for CUDA error checking
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA error in %s at line %d: %s\\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while (0)
+
+// Kernel for Fused Matmul + ReLU
+// Computes out = max(0, x * w^T + bias)
+// x: [M, K]
+// w: [N, K] (weights are stored in row-major, so we compute x @ w^T)
+// bias: [N]
+// out: [M, N]
+__global__ void fused_matmul_relu_kernel(
+    const float* __restrict__ x, 
+    const float* __restrict__ w, 
+    const float* __restrict__ bias, 
+    float* __restrict__ out, 
+    int M, 
+    int K, 
+    int N) 
+{
+    // Each thread block handles a tile of the output matrix.
+    // We use a 2D grid for M and N dimensions to maximize occupancy and coalescing.
+    
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < M && col < N) {
+        float sum = 0.0f;
+        
+        // Perform the dot product for this output element
+        // x[row, :] dot w[col, :]
+        // Note: w is stored as [N, K], so w[col] is the row corresponding to output feature col.
+        for (int k = 0; k < K; ++k) {
+            sum += x[row * K + k] * w[col * K + k];
+        }
+        
+        // Add bias and apply ReLU
+        float val = sum + bias[col];
+        out[row * N + col] = (val > 0.0f) ? val : 0.0f;
+    }
+}
+
+torch::Tensor fused_matmul_relu_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor bias) {
+    // Validate inputs
+    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+    TORCH_CHECK(w.is_cuda(), "w must be a CUDA tensor");
+    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
+    
+    TORCH_CHECK(x.dim() == 2, "x must be 2D");
+    TORCH_CHECK(w.dim() == 2, "w must be 2D");
+    TORCH_CHECK(bias.dim() == 1, "bias must be 1D");
+    
+    int M = x.size(0);
+    int K_in = x.size(1);
+    int N = w.size(0);
+    int K_w = w.size(1);
+    
+    TORCH_CHECK(K_in == K_w, "Input features of x must match input features of w");
+    TORCH_CHECK(bias.size(0) == N, "Bias size must match output features N");
+
+    auto out = torch::zeros({M, N}, x.options());
+
+    // Define block and grid dimensions
+    // Typical block size: 16x16 or 32x32. Let's use 16x16 for better occupancy on many GPUs.
+    dim3 block(16, 16);
+    dim3 grid((N + block.x - 1) / block.x, (M + block.y - 1) / block.y);
+
+    fused_matmul_relu_kernel<<<grid, block>>>(
+        x.data_ptr<float>(), 
+        w.data_ptr<float>(), 
+        bias.data_ptr<float>(), 
+        out.data_ptr<float>(), 
+        M, K_in, N
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+    
+    return out;
+}
+"""
+
+fused_matmul_relu_cpp_source = (
+    "torch::Tensor fused_matmul_relu_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor bias);"
+)
+
+# Compile the inline CUDA code for Fused Matmul + ReLU
+fused_ops = load_inline(
+    name="fused_matmul_relu",
+    cpp_sources=fused_matmul_relu_cpp_source,
+    cuda_sources=fused_matmul_relu_source,
+    functions=["fused_matmul_relu_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_layer_sizes, output_size) -> None:
+        super(ModelNew, self).__init__()
+        
+        # Store parameters as buffers so they are part of the module state
+        # We will initialize them in forward or via a separate init step if needed, 
+        # but for this custom operator approach, we assume weights are passed or registered.
+        # However, to make it a drop-in replacement for nn.Sequential with learnable params,
+        # we need to store the weights and biases as nn.Parameter.
+        
+        self.layers = []
+        current_input_size = input_size
+        
+        for hidden_size in hidden_layer_sizes:
+            # Register weight and bias as parameters
+            w = nn.Parameter(torch.empty(hidden_size, current_input_size, dtype=torch.float32, device='cuda'))
+            b = nn.Parameter(torch.zeros(hidden_size, dtype=torch.float32, device='cuda'))
+            
+            # Initialize weights (Kaiming uniform for ReLU)
+            nn.init.kaiming_uniform_(w, a=0.0, nonlinearity='relu')
+            
+            self.layers.append({'weight': w, 'bias': b})
+            current_input_size = hidden_size
+        
+        # Output layer
+        w_out = nn.Parameter(torch.empty(output_size, current_input_size, dtype=torch.float32, device='cuda'))
+        b_out = nn.Parameter(torch.zeros(output_size, dtype=torch.float32, device='cuda'))
+        nn.init.kaiming_uniform_(w_out, a=0.0, nonlinearity='relu')
+        
+        self.layers.append({'weight': w_out, 'bias': b_out})
+
+    def forward(self, x):
+        """
+        :param x: The input tensor, shape (batch_size, input_size)
+        :return: The output tensor, shape (batch_size, output_size)
+        """
+        for i, layer in enumerate(self.layers):
+            w = layer['weight']
+            b = layer['bias']
+            
+            # Use the custom fused CUDA operator
+            x = fused_ops.fused_matmul_relu_cuda(x, w, b)
+            
+            # Note: The last layer does not need ReLU if it's a regression or logit output.
+            # However, the original architecture applied ReLU to all layers including the last one 
+            # because nn.ReLU was appended after every Linear, including the last one.
+            # Let's check the original code:
+            # for hidden_size in hidden_layer_sizes:
+            #     layers.append(nn.Linear(...))
+            #     layers.append(nn.ReLU())
+            # layers.append(nn.Linear(...))  <-- No ReLU after the last linear in the loop?
+            # Wait, the original code:
+            # for hidden_size in hidden_layer_sizes:
+            #     layers.append(nn.Linear(current_input_size, hidden_size))
+            #     layers.append(nn.ReLU())
+            #     current_input_size = hidden_size
+            # layers.append(nn.Linear(current_input_size, output_size))
+            # So the last layer does NOT have a ReLU.
+            
+            # My fused kernel applies ReLU. I need to handle the last layer differently.
+            if i < len(self.layers) - 1:
+                # ReLU is already applied in the kernel
+                pass
+            else:
+                # Last layer: remove ReLU from the result
+                x = torch.relu(x) # Wait, original code did NOT apply relu to last layer.
+                # Let's re-read carefully:
+                # "layers.append(nn.Linear(current_input_size, output_size))" is outside the loop.
+                # So no ReLU after the final linear.
+                # But my kernel applies ReLU unconditionally.
+                # I must modify the kernel or post-process.
+                # Post-processing is safer and easier to implement without changing kernel logic for this specific case.
+                # Actually, let's just subtract the ReLU effect? No, that's hard.
+                # Better: Create a separate kernel or flag. 
+                # Or, simply apply ReLU to all layers except the last one in the loop, and no ReLU for the last.
+                # Since I can't easily change the kernel signature dynamically without overhead, 
+                # I will just apply ReLU to all intermediate layers (which is correct) and ensure the last layer doesn't get it.
+                # But my kernel DOES apply it. So I need to undo it or use a different path.
+                
+                # Let's assume the standard practice: Last layer usually doesn't have activation if it's regression/classification logits.
+                # The original code explicitly did NOT put ReLU after the last Linear.
+                # So for the last layer, I should compute x @ W^T + b without ReLU.
+                
+                # To keep it simple and robust, I'll use a separate small kernel or just torch.mm for the last layer if needed.
+                # But to show off CUDA optimization, let's assume we want to optimize everything.
+                # I will create a second kernel for "Matmul + Bias" without ReLU.
+                
+                # For now, let's stick to the single fused kernel and just accept that the last layer has ReLU?
+                # No, that changes the model behavior.
+                # Let's add a second kernel for linear only.
+                pass
+
+        return x
+
+# To make this fully correct and optimized, I will define a second kernel for Linear (no ReLU) 
+# and use it for the last layer.
+
+linear_only_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA error in %s at line %d: %s\\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while (0)
+
+__global__ void linear_kernel(
+    const float* __restrict__ x, 
+    const float* __restrict__ w, 
+    const float* __restrict__ bias, 
+    float* __restrict__ out, 
+    int M, 
+    int K, 
+    int N) 
+{
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < M && col < N) {
+        float sum = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            sum += x[row * K + k] * w[col * K + k];
+        }
+        out[row * N + col] = sum + bias[col];
+    }
+}
+
+torch::Tensor linear_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor bias) {
+    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+    TORCH_CHECK(w.is_cuda(), "w must be a CUDA tensor");
+    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
+    
+    int M = x.size(0);
+    int K_in = x.size(1);
+    int N = w.size(0);
+    int K_w = w.size(1);
+    
+    TORCH_CHECK(K_in == K_w, "Input features of x must match input features of w");
+    TORCH_CHECK(bias.size(0) == N, "Bias size must match output features N");
+
+    auto out = torch::zeros({M, N}, x.options());
+
+    dim3 block(16, 16);
+    dim3 grid((N + block.x - 1) / block.x, (M + block.y - 1) / block.y);
+
+    linear_kernel<<<grid, block>>>(
+        x.data_ptr<float>(), 
+        w.data_ptr<float>(), 
+        bias.data_ptr<float>(), 
+        out.data_ptr<float>(), 
+        M, K_in, N
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+    
+    return out;
+}
+"""
+
+linear_cpp_source = (
+    "torch::Tensor linear_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor bias);"
+)
+
+# Compile the inline CUDA code for Linear (no ReLU)
+linear_ops = load_inline(
+    name="linear_only",
+    cpp_sources=linear_cpp_source,
+    cuda_sources=linear_only_source,
+    functions=["linear_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_layer_sizes, output_size) -> None:
+        super(ModelNew, self).__init__()
+        
+        self.layers = []
+        current_input_size = input_size
+        
+        for hidden_size in hidden_layer_sizes:
+            w = nn.Parameter(torch.empty(hidden_size, current_input_size, dtype=torch.float32, device='cuda'))
+            b = nn.Parameter(torch.zeros(hidden_size, dtype=torch.float32, device='cuda'))
+            
+            # Initialize weights (Kaiming uniform for ReLU)
+            nn.init.kaiming_uniform_(w, a=0.0, nonlinearity='relu')
+            
+            self.layers.append({'weight': w, 'bias': b, 'use_relu': True})
+            current_input_size = hidden_size
+        
+        # Output layer (no ReLU in original architecture)
+        w_out = nn.Parameter(torch.empty(output_size, current_input_size, dtype=torch.float32, device='cuda'))
+        b_out = nn.Parameter(torch.zeros(output_size, dtype=torch.float32, device='cuda'))
+        nn.init.kaiming_uniform_(w_out, a=0.0, nonlinearity='relu')
+        
+        self.layers.append({'weight': w_out, 'bias': b_out, 'use_relu': False})
+
+    def forward(self, x):
+        """
+        :param x: The input tensor, shape (batch_size, input_size)
+        :return: The output tensor, shape (batch_size, output_size)
+        """
+        for layer in self.layers:
+            w = layer['weight']
+            b = layer['bias']
+            use_relu = layer['use_relu']
+            
+            if use_relu:
+                x = fused_ops.fused_matmul_relu_cuda(x, w, b)
+            else:
+                x = linear_ops.linear_cuda(x, w, b)
+        
+        return x

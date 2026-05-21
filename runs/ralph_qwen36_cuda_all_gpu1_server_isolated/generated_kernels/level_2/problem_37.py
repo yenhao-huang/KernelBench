@@ -1,0 +1,153 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused Matmul + Swish + Bias Add
+# This fuses: x @ W^T -> sigmoid(x) * x -> + bias
+fused_matmul_swish_bias_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+__global__ void fused_matmul_swish_bias_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* __restrict__ output,
+    int batch_size,
+    int in_features,
+    int out_features) 
+{
+    // Each thread handles one element of the output matrix (batch_idx, out_idx)
+    int batch_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int out_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch_idx < batch_size && out_idx < out_features) {
+        float sum = 0.0f;
+        
+        // Perform the dot product for this specific output element
+        #pragma unroll
+        for (int i = 0; i < in_features; ++i) {
+            // Input is (batch, in), Weight is (out, in) in PyTorch Linear usually, 
+            // but let's assume standard layout: input [B, I], weight [O, I] -> output [B, O]
+            // x[i] * w[out_idx][i]
+            sum += input[batch_idx * in_features + i] * weight[out_idx * in_features + i];
+        }
+
+        // Apply Swish: x * sigmoid(x)
+        // sigmoid(x) = 1 / (1 + exp(-x))
+        float s = 1.0f / (1.0f + expf(-sum));
+        float swished = sum * s;
+
+        // Add bias
+        output[batch_idx * out_features + out_idx] = swished + bias[out_idx];
+    }
+}
+
+torch::Tensor fused_matmul_swish_bias_cuda(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    torch::Tensor bias) 
+{
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(weight.is_cuda(), "Weight must be a CUDA tensor");
+    TORCH_CHECK(bias.is_cuda(), "Bias must be a CUDA tensor");
+
+    auto batch_size = input.size(0);
+    auto in_features = input.size(1);
+    auto out_features = weight.size(0);
+
+    TORCH_CHECK(input.size(1) == weight.size(1), "Input features must match weight input features");
+    TORCH_CHECK(bias.size(0) == out_features, "Bias size must match output features");
+
+    auto output = torch::zeros({batch_size, out_features}, input.options());
+
+    dim3 threads_per_block(32, 32); // 1024 threads per block
+    dim3 num_blocks((out_features + threads_per_block.x - 1) / threads_per_block.x,
+                    (batch_size + threads_per_block.y - 1) / threads_per_block.y);
+
+    fused_matmul_swish_bias_kernel<<<num_blocks, threads_per_block>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        in_features,
+        out_features
+    );
+
+    return output;
+}
+"""
+
+fused_matmul_swish_bias_cpp_source = (
+    "torch::Tensor fused_matmul_swish_bias_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_matmul_swish_bias_cpp_source,
+    cuda_sources=fused_matmul_swish_bias_source,
+    functions=["fused_matmul_swish_bias_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    A model that performs a matrix multiplication, applies Swish activation, sums with a bias term, and normalizes with GroupNorm.
+    Optimized with custom CUDA for the Matmul+Swish+Bias part.
+    """
+    def __init__(self, in_features, out_features, num_groups, bias_shape):
+        super(ModelNew, self).__init__()
+        # We keep GroupNorm as is because it's complex to optimize efficiently in a single kernel 
+        # without significant overhead for small batch sizes or specific group counts, 
+        # and the prompt allows leaving some operators unchanged.
+        # The heavy lifting (Matmul) is fused with activation and bias addition.
+        self.num_groups = num_groups
+        self.out_features = out_features
+        
+        # Initialize parameters manually to match nn.Linear behavior but store them for CUDA access
+        # nn.Linear stores weight as (out, in) and bias as (out,)
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias_param = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        # Fused Matmul + Swish + Bias Add
+        x = fused_ops.fused_matmul_swish_bias_cuda(x, self.weight, self.bias_param)
+        
+        # GroupNorm
+        # Reshape for GroupNorm if necessary, but here input is (B, O) which fits standard GN
+        x = torch.nn.functional.group_norm(
+            x, 
+            self.num_groups, 
+            weight=None, 
+            bias=None, 
+            eps=1e-05
+        )
+        
+        return x
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    batch_size = 32768
+    in_features = 1024
+    return [torch.rand(batch_size, in_features).cuda()]
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    batch_size = 32768
+    in_features = 1024
+    out_features = 4096
+    num_groups = 64
+    bias_shape = (out_features,)
+    return [in_features, out_features, num_groups, bias_shape]

@@ -1,0 +1,606 @@
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernels for optimized operations
+custom_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper macro for CUDA error checking
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA error in %s at line %d: %s\\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while(0)
+
+// 1. Optimized Conv2d + BatchNorm2d + ReLU Fusion
+// This kernel performs convolution, batch normalization, and relu in a single pass.
+// It assumes the input is NCHW format.
+__global__ void conv_bn_relu_kernel(
+    const float* __restrict__ input, 
+    const float* __restrict__ weight, 
+    const float* __restrict__ bias, // Pre-computed: bn_weight * (1/sqrt(var+eps)) + bn_bias_shift
+    const float* __restrict__ gamma, // BN scale
+    const float* __restrict__ beta,  // BN shift
+    float* __restrict__ output,
+    int N, int C_in, int H_in, int W_in,
+    int C_out, int K_h, int K_w,
+    int stride_h, int stride_w,
+    int pad_h, int pad_w) 
+{
+    // Each thread handles one output element
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    int total_elements = N * C_out * H_out * W_out; // Note: H_out/W_out need to be calculated or passed
+    
+    if (idx >= total_elements) return;
+
+    // Decode indices
+    int w_idx = idx % W_out;
+    int temp = idx / W_out;
+    int h_idx = temp % H_out;
+    temp = temp / H_out;
+    int c_idx = temp % C_out;
+    int n_idx = temp / C_out;
+
+    float sum = 0.0f;
+    
+    // Convolution loop
+    for (int k = 0; k < K_h * K_w; ++k) {
+        int kh = k / K_w;
+        int kw = k % K_w;
+        
+        int ih = h_idx * stride_h - pad_h + kh;
+        int iw = w_idx * stride_w - pad_w + kw;
+        
+        if (ih >= 0 && ih < H_in && iw >= 0 && iw < W_in) {
+            // Weight index: [C_out, C_in/K, K_h, K_w] for grouped? 
+            // Standard Conv2d weight shape: [out_channels, in_channels/groups, kernel_height, kernel_width]
+            // For simplicity in this fused kernel, we assume standard conv or handle groups via stride logic if needed.
+            // However, to keep it general and fast, let's assume standard dense conv for the main path 
+            // or handle group convolution by adjusting the inner loop.
+            
+            // Let's stick to a generic approach: iterate over input channels involved in this output channel.
+            // This is inefficient for grouped convs if not careful. 
+            // Better: Pass groups info and adjust weight indexing.
+        }
+    }
+    
+    // Apply BN and ReLU
+    float val = sum; // Placeholder, actual convolution logic needs to be precise
+    val = val * gamma[c_idx] + beta[c_idx];
+    if (val < 0) val = 0.0f;
+    
+    output[idx] = val;
+}
+
+// Since writing a fully generic fused conv+bn+relu from scratch in inline CUDA is complex and error-prone 
+// without cuDNN, we will focus on optimizing the specific bottlenecks of ShuffleNet:
+// 1. ChannelShuffle (memory intensive transpose)
+// 2. Depthwise Convolution (often slow due to small kernels)
+// 3. Group Convolution
+
+// Optimized Channel Shuffle Kernel
+__global__ void channel_shuffle_kernel(
+    const float* __restrict__ input, 
+    float* __restrict__ output, 
+    int batch_size, 
+    int channels, 
+    int height, 
+    int width, 
+    int groups) 
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * channels * height * width;
+    
+    if (idx >= total_elements) return;
+
+    // Decode linear index to N, C, H, W
+    int w = idx % width;
+    int temp = idx / width;
+    int h = temp % height;
+    temp = temp / height;
+    int c = temp % channels;
+    int n = temp / channels;
+
+    // Shuffle logic:
+    // Original shape: (N, G, C_per_G, H, W) -> Transpose(1,2) -> (N, C_per_G, G, H, W) -> Flatten
+    // New index calculation:
+    // Group index g = c / C_per_G
+    // Channel within group cg = c % C_per_G
+    
+    int c_per_group = channels / groups;
+    int g = c / c_per_group;
+    int cg = c % c_per_group;
+    
+    // After transpose, the channel index becomes: cg * groups + g
+    int new_c = cg * groups + g;
+    
+    // Calculate new linear index
+    int new_idx = n * channels * height * width + new_c * height * width + h * width + w;
+    
+    output[new_idx] = input[idx];
+}
+
+// Optimized Depthwise Convolution (3x3)
+// Uses shared memory for tiling to reduce global memory access
+__global__ void depthwise_conv3x3_kernel(
+    const float* __restrict__ input, 
+    const float* __restrict__ weight, // Shape: [C, 1, 3, 3]
+    const float* __restrict__ bias,   // Shape: [C]
+    float* __restrict__ output,
+    int N, int C, int H_in, int W_in,
+    int H_out, int W_out) 
+{
+    // Block dimensions
+    const int TILE_SIZE = 16;
+    
+    // Each block handles a tile of the output image
+    int bx = blockIdx.x * TILE_SIZE;
+    int by = blockIdx.y * TILE_SIZE;
+    
+    // Thread indices within the block
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    
+    // Shared memory for input tile + padding
+    __shared__ float shared_input[TILE_SIZE + 2][TILE_SIZE + 2];
+    __shared__ float shared_weight[3][3]; // Small kernel, fits in shared mem easily
+    
+    // Load weight into shared memory (constant across threads in block)
+    if (tx < 3 && ty < 3) {
+        int w_idx = ty * 3 + tx;
+        shared_weight[ty][tx] = weight[w_idx];
+    }
+    __syncthreads();
+
+    // Calculate global input coordinates for this thread's output pixel
+    int out_x = bx + tx;
+    int out_y = by + ty;
+    
+    if (out_x >= W_out || out_y >= H_out) return;
+
+    // Load input tile into shared memory with halo/padding
+    int in_x = out_x - 1;
+    int in_y = out_y - 1;
+    
+    for (int i = ty; i < TILE_SIZE + 2; i += blockDim.y) {
+        for (int j = tx; j < TILE_SIZE + 2; j += blockDim.x) {
+            int global_in_x = in_x + j;
+            int global_in_y = in_y + i;
+            
+            if (global_in_x >= 0 && global_in_x < W_in && global_in_y >= 0 && global_in_y < H_in) {
+                // We need to load for all channels. This is tricky with one block per output tile.
+                // Standard approach: One thread per output pixel, but we need to iterate C.
+                // Or: One block per channel? No, that's inefficient.
+                // Let's use a simpler approach: Each thread computes one output element for ONE channel.
+                // But we launched 16x16 threads. 
+                // Better: Grid-stride loop over channels or launch grid covering N*C*H_out*W_out.
+            } else {
+                shared_input[i][j] = 0.0f;
+            }
+        }
+    }
+    
+    // This kernel structure is getting complex for inline code without careful tiling strategy.
+    // Let's revert to a simpler, highly optimized element-wise approach for the main bottlenecks 
+    // and rely on cuDNN for the heavy lifting of Conv2d if possible, OR write a very specific Depthwise kernel.
+    
+    // Actually, let's just implement the Channel Shuffle efficiently and leave standard convs to PyTorch/cuDNN 
+    // unless we can prove they are slower. In ShuffleNet, ChannelShuffle is unique and often unoptimized in generic libraries.
+}
+
+// Wrapper for Channel Shuffle
+torch::Tensor channel_shuffle_cuda(torch::Tensor x, int groups) {
+    auto batch_size = x.size(0);
+    auto channels = x.size(1);
+    auto height = x.size(2);
+    auto width = x.size(3);
+    
+    auto output = torch::empty_like(x);
+    
+    const int block_size = 256;
+    int total_elements = batch_size * channels * height * width;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    channel_shuffle_kernel<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(), 
+        output.data_ptr<float>(), 
+        batch_size, 
+        channels, 
+        height, 
+        width, 
+        groups
+    );
+    
+    CUDA_CHECK(cudaGetLastError());
+    return output;
+}
+
+// Wrapper for Depthwise Convolution (3x3) with BN and ReLU
+// This is a simplified version that assumes input/output are contiguous NCHW
+torch::Tensor depthwise_conv_bn_relu_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, torch::Tensor bn_gamma, torch::Tensor bn_beta) {
+    auto N = input.size(0);
+    auto C = input.size(1);
+    auto H_in = input.size(2);
+    auto W_in = input.size(3);
+    
+    // 3x3 conv with padding 1 results in same spatial dimensions
+    int H_out = H_in;
+    int W_out = W_in;
+    
+    auto output = torch::empty({N, C, H_out, W_out}, input.options());
+    
+    // Launch a kernel that iterates over N, C, H, W
+    const int block_size = 256;
+    int total_elements = N * C * H_out * W_out;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    // We need to pass all parameters. 
+    // Note: This kernel is a placeholder for the logic. A true optimized version would use shared memory tiling.
+    // For the sake of this exercise, we will implement a straightforward but correct CUDA kernel for Depthwise Conv+BN+ReLU.
+    
+    // Define the kernel inside the source string to capture variables? No, must be global.
+    // We'll define a generic depthwise conv kernel below.
+    
+    return output; 
+}
+
+// Generic Depthwise Conv3x3 + BN + ReLU Kernel
+__global__ void dw_conv_bn_relu_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight, // [C, 9]
+    const float* __restrict__ bias,   // [C]
+    const float* __restrict__ bn_gamma, // [C]
+    const float* __restrict__ bn_beta,  // [C]
+    float* __restrict__ output,
+    int N, int C, int H, int W) 
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C * H * W;
+    
+    if (idx >= total) return;
+    
+    // Decode indices
+    int w = idx % W;
+    int temp = idx / W;
+    int h = temp % H;
+    temp = temp / H;
+    int c = temp % C;
+    int n = temp / C;
+    
+    float sum = 0.0f;
+    
+    // Kernel weights are stored as [C, 3, 3] flattened to [C, 9]
+    // Offsets: -1,-1 -> 0, -1,0 -> 1, ..., 1,1 -> 8
+    
+    for (int ky = -1; ky <= 1; ++ky) {
+        for (int kx = -1; kx <= 1; ++kx) {
+            int ih = h + ky;
+            int iw = w + kx;
+            
+            float val = 0.0f;
+            if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
+                // Input index: N, C, H, W
+                int in_idx = ((n * C + c) * H + ih) * W + iw;
+                val = input[in_idx];
+            }
+            
+            // Weight index: C, ky+1, kx+1
+            int w_idx = c * 9 + (ky + 1) * 3 + (kx + 1);
+            sum += val * weight[w_idx];
+        }
+    }
+    
+    // Apply BN and ReLU
+    float out_val = sum * bn_gamma[c] + bn_beta[c];
+    if (out_val < 0.0f) out_val = 0.0f;
+    
+    output[idx] = out_val;
+}
+
+torch::Tensor dw_conv_bn_relu_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, torch::Tensor bn_gamma, torch::Tensor bn_beta) {
+    auto N = input.size(0);
+    auto C = input.size(1);
+    auto H = input.size(2);
+    auto W = input.size(3);
+    
+    auto output = torch::empty_like(input);
+    
+    const int block_size = 256;
+    int total_elements = N * C * H * W;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    dw_conv_bn_relu_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        bn_gamma.data_ptr<float>(),
+        bn_beta.data_ptr<float>(),
+        output.data_ptr<float>(),
+        N, C, H, W
+    );
+    
+    CUDA_CHECK(cudaGetLastError());
+    return output;
+}
+
+// Group Convolution 1x1 + BN + ReLU
+__global__ void group_conv1x1_bn_relu_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight, // [C_out, C_in/groups, 1, 1] -> flattened [C_out, C_in/groups]
+    const float* __restrict__ bias,   // [C_out]
+    const float* __restrict__ bn_gamma,
+    const float* __restrict__ bn_beta,
+    float* __restrict__ output,
+    int N, int C_in, int C_out, int H, int W, int groups) 
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C_out * H * W;
+    
+    if (idx >= total) return;
+    
+    // Decode indices for output
+    int w = idx % W;
+    int temp = idx / W;
+    int h = temp % H;
+    temp = temp / H;
+    int c_out = temp % C_out;
+    int n = temp / C_out;
+    
+    float sum = 0.0f;
+    
+    // Group index
+    int group = c_out / (C_out / groups);
+    int c_in_start = group * (C_in / groups);
+    int c_in_per_group = C_in / groups;
+    
+    // Iterate over input channels in this group
+    for (int i = 0; i < c_in_per_group; ++i) {
+        int c_in = c_in_start + i;
+        
+        // Input value at same spatial location
+        int in_idx = ((n * C_in + c_in) * H + h) * W + w;
+        float val = input[in_idx];
+        
+        // Weight index: [C_out, C_in_per_group]
+        int w_idx = c_out * c_in_per_group + i;
+        sum += val * weight[w_idx];
+    }
+    
+    // Apply BN and ReLU
+    float out_val = sum * bn_gamma[c_out] + bn_beta[c_out];
+    if (out_val < 0.0f) out_val = 0.0f;
+    
+    output[idx] = out_val;
+}
+
+torch::Tensor group_conv1x1_bn_relu_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, torch::Tensor bn_gamma, torch::Tensor bn_beta, int groups) {
+    auto N = input.size(0);
+    auto C_in = input.size(1);
+    auto H = input.size(2);
+    auto W = input.size(3);
+    auto C_out = weight.size(0);
+    
+    auto output = torch::empty({N, C_out, H, W}, input.options());
+    
+    const int block_size = 256;
+    int total_elements = N * C_out * H * W;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    group_conv1x1_bn_relu_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        bn_gamma.data_ptr<float>(),
+        bn_beta.data_ptr<float>(),
+        output.data_ptr<float>(),
+        N, C_in, C_out, H, W, groups
+    );
+    
+    CUDA_CHECK(cudaGetLastError());
+    return output;
+}
+
+// Pre-compute BN parameters for a Conv2d layer given its weight and bias (if any) and running stats
+// This is done in Python/C++ host code, but we provide a helper kernel if needed. 
+// For this implementation, we will pre-compute the effective gamma and beta in the Python wrapper.
+
+"""
+
+custom_cpp_source = """
+torch::Tensor channel_shuffle_cuda(torch::Tensor x, int groups);
+torch::Tensor dw_conv_bn_relu_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, torch::Tensor bn_gamma, torch::Tensor bn_beta);
+torch::Tensor group_conv1x1_bn_relu_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, torch::Tensor bn_gamma, torch::Tensor bn_beta, int groups);
+"""
+
+# Load the custom CUDA extensions
+custom_ops = load_inline(
+    name="custom_shuffle_ops",
+    cpp_sources=custom_cpp_source,
+    cuda_sources=custom_cuda_source,
+    functions=["channel_shuffle_cuda", "dw_conv_bn_relu_cuda", "group_conv1x1_bn_relu_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"]
+)
+
+class OptimizedChannelShuffle(nn.Module):
+    def __init__(self, groups):
+        super(OptimizedChannelShuffle, self).__init__()
+        self.groups = groups
+    
+    def forward(self, x):
+        return custom_ops.channel_shuffle_cuda(x, self.groups)
+
+class OptimizedConvBNReLU(nn.Module):
+    """
+    A module that fuses Conv2d, BatchNorm2d, and ReLU into a single CUDA kernel.
+    It pre-computes the effective BN parameters (gamma, beta) based on the running statistics.
+    """
+    def __init__(self, conv_layer, bn_layer):
+        super(OptimizedConvBNReLU, self).__init__()
+        self.conv = conv_layer
+        self.bn = bn_layer
+        
+        # Pre-compute effective gamma and beta for inference
+        # Effective Gamma = bn_weight / sqrt(bn_running_var + bn_eps)
+        # Effective Beta = bn_bias - bn_weight * bn_running_mean / sqrt(bn_running_var + bn_eps)
+        
+        with torch.no_grad():
+            self.register_buffer('effective_gamma', 
+                                 bn_layer.weight / torch.sqrt(bn_layer.running_var + bn_layer.eps))
+            self.register_buffer('effective_beta', 
+                                 bn_layer.bias - bn_layer.weight * bn_layer.running_mean / torch.sqrt(bn_layer.running_var + bn_layer.eps))
+            
+            # Store weight and bias for the kernel
+            # Note: For group convs, we need to ensure weights are contiguous and in the right shape
+            self.register_buffer('weight', conv_layer.weight)
+            self.register_buffer('bias', conv_layer.bias if conv_layer.bias is not None else torch.zeros(0))
+
+    def forward(self, x):
+        # Determine if it's a depthwise convolution (groups == channels) or group convolution
+        in_channels = self.conv.in_channels
+        out_channels = self.conv.out_channels
+        groups = self.conv.groups
+        
+        if groups == in_channels and self.conv.kernel_size == (3, 3):
+            # Depthwise Convolution
+            return custom_ops.dw_conv_bn_relu_cuda(
+                x, 
+                self.weight, 
+                self.bias, 
+                self.effective_gamma, 
+                self.effective_beta
+            )
+        elif groups > 1:
+            # Group Convolution (assuming 1x1 for ShuffleNet units, but generalizable)
+            return custom_ops.group_conv1x1_bn_relu_cuda(
+                x, 
+                self.weight, 
+                self.bias, 
+                self.effective_gamma, 
+                self.effective_beta, 
+                groups
+            )
+        else:
+            # Standard Convolution (fallback to PyTorch or implement another kernel)
+            # For this specific architecture, standard convs are only in the first layer and shortcut.
+            # We'll use PyTorch's optimized cuDNN for these as they are less frequent bottlenecks compared to grouped/dw.
+            out = self.conv(x)
+            out = self.bn(out)
+            return F.relu(out)
+
+class OptimizedShuffleNetUnit(nn.Module):
+    def __init__(self, in_channels, out_channels, groups=3):
+        super(OptimizedShuffleNetUnit, self).__init__()
+        
+        assert out_channels % 4 == 0
+        mid_channels = out_channels // 4
+        
+        # First 1x1 group convolution + BN + ReLU
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size=1, stride=1, padding=0, groups=groups, bias=False)
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+        self.conv_bn_relu1 = OptimizedConvBNReLU(self.conv1, self.bn1)
+        
+        # Depthwise 3x3 convolution + BN + ReLU
+        self.conv2 = nn.Conv2d(mid_channels, mid_channels, kernel_size=3, stride=1, padding=1, groups=mid_channels, bias=False)
+        self.bn2 = nn.BatchNorm2d(mid_channels)
+        self.conv_bn_relu2 = OptimizedConvBNReLU(self.conv2, self.bn2)
+        
+        # Shuffle operation
+        self.shuffle = OptimizedChannelShuffle(groups)
+        
+        # Second 1x1 group convolution + BN + ReLU
+        self.conv3 = nn.Conv2d(mid_channels, out_channels, kernel_size=1, stride=1, padding=0, groups=groups, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels)
+        self.conv_bn_relu3 = OptimizedConvBNReLU(self.conv3, self.bn3)
+        
+        # Shortcut connection
+        if in_channels == out_channels:
+            self.shortcut = nn.Sequential()
+        else:
+            self.shortcut_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
+            self.shortcut_bn = nn.BatchNorm2d(out_channels)
+            # Fuse shortcut conv+bn as well for consistency, though it's less critical
+            self.shortcut_conv_bn = OptimizedConvBNReLU(self.shortcut_conv, self.shortcut_bn)
+
+    def forward(self, x):
+        out = self.conv_bn_relu1(x)
+        out = self.conv_bn_relu2(out)
+        out = self.shuffle(out)
+        out = self.conv_bn_relu3(out)
+        
+        if isinstance(self.shortcut, nn.Sequential):
+            shortcut_out = self.shortcut_conv_bn(x)
+        else:
+            shortcut_out = x
+            
+        out += shortcut_out
+        return out
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000, groups=3, stages_repeats=[3, 7, 3], stages_out_channels=[24, 240, 480, 960]):
+        super(ModelNew, self).__init__()
+        
+        # First Conv + BN + ReLU
+        self.conv1 = nn.Conv2d(3, stages_out_channels[0], kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(stages_out_channels[0])
+        self.conv_bn_relu1 = OptimizedConvBNReLU(self.conv1, self.bn1)
+        
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        
+        # Stages
+        self.stage2 = self._make_stage(stages_out_channels[0], stages_out_channels[1], stages_repeats[0], groups)
+        self.stage3 = self._make_stage(stages_out_channels[1], stages_out_channels[2], stages_repeats[1], groups)
+        self.stage4 = self._make_stage(stages_out_channels[2], stages_out_channels[3], stages_repeats[2], groups)
+        
+        # Last Conv + BN + ReLU
+        self.conv5 = nn.Conv2d(stages_out_channels[3], 1024, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn5 = nn.BatchNorm2d(1024)
+        self.conv_bn_relu5 = OptimizedConvBNReLU(self.conv5, self.bn5)
+        
+        self.fc = nn.Linear(1024, num_classes)
+    
+    def _make_stage(self, in_channels, out_channels, repeats, groups):
+        layers = []
+        layers.append(OptimizedShuffleNetUnit(in_channels, out_channels, groups))
+        for _ in range(1, repeats):
+            layers.append(OptimizedShuffleNetUnit(out_channels, out_channels, groups))
+        return nn.Sequential(*layers)
+    
+    def forward(self, x):
+        x = self.conv_bn_relu1(x)
+        x = self.maxpool(x)
+        
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+        
+        x = self.conv_bn_relu5(x)
+        x = F.adaptive_avg_pool2d(x, (1, 1))
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        
+        return x
+
+# Test code
+batch_size = 10
+input_channels = 3
+height = 224
+width = 224
+num_classes = 1000
+
+def get_inputs():
+    return [torch.rand(batch_size, input_channels, height, width)]
+
+def get_init_inputs():
+    return [num_classes]
+```

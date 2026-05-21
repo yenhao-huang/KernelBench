@@ -1,0 +1,23 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 54.852,
+  "error": "Isolated KernelBench evaluator failed.",
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_1/problem_45.py",
+  "isolated_eval": {
+    "error": "CUDA error: an illegal memory access was encountered\nSearch for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n",
+    "error_type": "torch.AcceleratorError",
+    "ok": false,
+    "subprocess_output_tail": "Traceback (most recent call last):\n  File \"/workspace/external/KernelBench/src/kernelbench/eval.py\", line 783, in run_and_check_correctness\n    torch.cuda.synchronize(device=device)\n  File \"/workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/cuda/__init__.py\", line 1108, in synchronize\n    return torch._C._cuda_synchronize()\ntorch.AcceleratorError: CUDA error: an illegal memory access was encountered\nSearch for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n\n[Error] Exception happens during correctness check\nError in launching kernel for ModelNew: CUDA error: an illegal memory access was encountered\nSearch for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n\n\n[Full Traceback]:\n\n\n",
+    "subprocess_returncode": 0,
+    "traceback": "Traceback (most recent call last):\n  File \"<string>\", line 18, in <module>\n  File \"/workspace/external/KernelBench/src/kernelbench/eval.py\", line 698, in eval_kernel_against_ref\n    graceful_eval_cleanup(context, device, tempfile)\n  File \"/workspace/external/KernelBench/src/kernelbench/eval.py\", line 233, in graceful_eval_cleanup\n    torch.cuda.empty_cache()\n  File \"/workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/cuda/memory.py\", line 280, in empty_cache\n    torch._C._cuda_emptyCache()\ntorch.AcceleratorError: CUDA error: an illegal memory access was encountered\nSearch for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n\n"
+  },
+  "level": 1,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 45,
+  "problem_name": "45_Average_Pooling_2D.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_1/problem_45.txt",
+  "static_warnings": [],
+  "status": "evaluation_error"
+}

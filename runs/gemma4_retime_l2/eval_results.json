@@ -1,0 +1,1597 @@
+{
+    "5": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "6": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "7": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "8": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_issue": "Output shape mismatch: Expected torch.Size([128, 1, 1, 1]), got torch.Size([128])",
+                "correctness_issue_name": "correctness_issue"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "9": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "10": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "11": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 9.01,
+            "runtime_stats": {
+                "mean": 9.01,
+                "std": 0.00902,
+                "min": 8.99,
+                "max": 9.03,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "12": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "13": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "14": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "15": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 6.92,
+            "runtime_stats": {
+                "mean": 6.92,
+                "std": 0.0926,
+                "min": 6.87,
+                "max": 7.47,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "16": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 20.7,
+            "runtime_stats": {
+                "mean": 20.7,
+                "std": 5.61,
+                "min": 20.0,
+                "max": 76.5,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "17": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "18": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "19": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.001656",
+                    "0.001782",
+                    "0.001862",
+                    "0.001788",
+                    "0.001820"
+                ],
+                "avg_difference": [
+                    "0.000040",
+                    "0.000040",
+                    "0.000040",
+                    "0.000040",
+                    "0.000040"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "20": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "21": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "2.342567",
+                    "2.343966",
+                    "2.343851",
+                    "2.343287",
+                    "2.342779"
+                ],
+                "avg_difference": [
+                    "0.578605",
+                    "0.578573",
+                    "0.578614",
+                    "0.578621",
+                    "0.578595"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "22": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "23": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_issue": "Output shape mismatch: Expected torch.Size([128]), got torch.Size([128, 1])",
+                "correctness_issue_name": "correctness_issue"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "24": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "25": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "26": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.482782",
+                    "0.463349",
+                    "0.493953",
+                    "0.540131",
+                    "0.541555"
+                ],
+                "avg_difference": [
+                    "0.097610",
+                    "0.097612",
+                    "0.097607",
+                    "0.097612",
+                    "0.097609"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "27": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "28": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "29": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "30": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 2.94,
+            "runtime_stats": {
+                "mean": 2.94,
+                "std": 0.0266,
+                "min": 2.88,
+                "max": 2.97,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "31": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "32": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "33": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "34": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "35": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 11.6,
+            "runtime_stats": {
+                "mean": 11.6,
+                "std": 0.155,
+                "min": 11.6,
+                "max": 12.3,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "36": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "37": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 9.04,
+            "runtime_stats": {
+                "mean": 9.04,
+                "std": 0.196,
+                "min": 8.94,
+                "max": 11.0,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "38": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "39": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "40": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "41": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "42": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_issue": "Output shape mismatch: Expected torch.Size([16, 1]), got torch.Size([16])",
+                "correctness_issue_name": "correctness_issue"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "43": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "44": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "45": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 9.9,
+            "runtime_stats": {
+                "mean": 9.9,
+                "std": 0.179,
+                "min": 9.65,
+                "max": 10.3,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "46": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "47": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "48": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 3.75,
+            "runtime_stats": {
+                "mean": 3.75,
+                "std": 0.0382,
+                "min": 3.72,
+                "max": 3.87,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "49": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "50": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "error": "Kernel not found for problem 50 sample 0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "51": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "52": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "53": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "54": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "55": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 7.11,
+            "runtime_stats": {
+                "mean": 7.11,
+                "std": 0.0335,
+                "min": 7.0,
+                "max": 7.2,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "56": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 432.0,
+            "runtime_stats": {
+                "mean": 432.0,
+                "std": 2.45,
+                "min": 424.0,
+                "max": 437.0,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "57": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "58": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 20.2,
+            "runtime_stats": {
+                "mean": 20.2,
+                "std": 0.0602,
+                "min": 20.1,
+                "max": 20.8,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "59": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "60": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 26.8,
+            "runtime_stats": {
+                "mean": 26.8,
+                "std": 0.252,
+                "min": 26.7,
+                "max": 29.1,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "61": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "3.164705",
+                    "3.044429",
+                    "3.028094",
+                    "3.001028",
+                    "3.219660"
+                ],
+                "avg_difference": [
+                    "0.501029",
+                    "0.501094",
+                    "0.501091",
+                    "0.501031",
+                    "0.501054"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "62": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 3.73,
+            "runtime_stats": {
+                "mean": 3.73,
+                "std": 0.00877,
+                "min": 3.7,
+                "max": 3.75,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "63": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "64": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "65": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "66": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "67": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "68": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "69": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 2.96,
+            "runtime_stats": {
+                "mean": 2.96,
+                "std": 0.0558,
+                "min": 2.93,
+                "max": 3.11,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "70": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "71": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "72": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "error": "Kernel not found for problem 72 sample 0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "73": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "74": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "75": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "76": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "77": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "78": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 71.9,
+            "runtime_stats": {
+                "mean": 71.9,
+                "std": 0.0735,
+                "min": 71.7,
+                "max": 72.0,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "79": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "80": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "81": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "82": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "83": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "84": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "85": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "86": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "error": "Kernel not found for problem 86 sample 0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "87": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 12.4,
+            "runtime_stats": {
+                "mean": 12.4,
+                "std": 4.07,
+                "min": 11.9,
+                "max": 52.8,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "88": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 3.06,
+            "runtime_stats": {
+                "mean": 3.06,
+                "std": 0.0178,
+                "min": 3.02,
+                "max": 3.09,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "89": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "90": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "91": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "92": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "93": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "94": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "error": "Kernel not found for problem 94 sample 0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "95": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "96": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 20.6,
+            "runtime_stats": {
+                "mean": 20.6,
+                "std": 0.163,
+                "min": 20.5,
+                "max": 22.2,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "97": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "98": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "99": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ]
+}

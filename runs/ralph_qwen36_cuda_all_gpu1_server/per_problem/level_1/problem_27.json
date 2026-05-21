@@ -1,0 +1,16 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 6.647,
+  "error": "CUDA error: an illegal memory access was encountered\nSearch for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n",
+  "error_type": "torch.AcceleratorError",
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server/generated_kernels/level_1/problem_27.py",
+  "level": 1,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 27,
+  "problem_name": "27_SELU_.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server/raw_generation/level_1/problem_27.txt",
+  "status": "generation_error",
+  "traceback": "Traceback (most recent call last):\n  File \"/workspace/external/KernelBench/scripts/ralph_eval_gemma4_cuda_all.py\", line 283, in _evaluate_one\n    eval_result = eval_kernel_against_ref(\n  File \"/workspace/external/KernelBench/src/kernelbench/eval.py\", line 491, in eval_kernel_against_ref\n    set_seed(seed_num)  # set seed for reproducible input\n  File \"/workspace/external/KernelBench/src/kernelbench/eval.py\", line 66, in set_seed\n    torch.manual_seed(seed)\n  File \"/workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/random.py\", line 42, in manual_seed\n    return _manual_seed_impl(seed)\n  File \"/workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/random.py\", line 50, in _manual_seed_impl\n    torch.cuda.manual_seed_all(seed)\n  File \"/workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/cuda/random.py\", line 131, in manual_seed_all\n    _lazy_call(cb, seed_all=True)\n  File \"/workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/cuda/__init__.py\", line 355, in _lazy_call\n    callable()\n  File \"/workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/cuda/random.py\", line 129, in cb\n    default_generator.manual_seed(seed)\ntorch.AcceleratorError: CUDA error: an illegal memory access was encountered\nSearch for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n\n"
+}

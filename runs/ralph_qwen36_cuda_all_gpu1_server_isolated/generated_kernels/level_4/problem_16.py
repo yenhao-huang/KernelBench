@@ -1,0 +1,339 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+from transformers import AutoModelForCausalLM, AutoConfig
+
+# Define custom CUDA kernels for optimized operations
+# We will replace the core Linear (Matmul) and Softmax operations which are bottlenecks.
+# Specifically, we implement a fused Matmul + Add Bias + ReLU (if applicable) or just high-performance Matmul.
+# For GPT-2, the main bottleneck is the large matrix multiplications in the attention and MLP layers.
+# We will implement a highly optimized Matrix Multiplication kernel using shared memory tiling for FP32.
+
+matmul_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Simple but effective tiled matrix multiplication for FP32
+// Optimized for general shapes, assuming C-contiguous tensors
+__global__ void matmul_kernel(const float* A, const float* B, float* C, 
+                              int M, int N, int K) {
+    // Block dimensions
+    const int TILE_SIZE = 16;
+    
+    // Shared memory for tiles of A and B
+    __shared__ float As[TILE_SIZE][TILE_SIZE];
+    __shared__ float Bs[TILE_SIZE][TILE_SIZE];
+
+    // Thread indices within the block
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    
+    // Block indices
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+
+    // Global row and column indices for this thread's output element
+    int row = by * TILE_SIZE + ty;
+    int col = bx * TILE_SIZE + tx;
+
+    float sum = 0.0f;
+
+    // Loop over tiles
+    int num_tiles = (K + TILE_SIZE - 1) / TILE_SIZE;
+    for (int t = 0; t < num_tiles; ++t) {
+        // Load tile from A into shared memory
+        if (row < M && (t * TILE_SIZE + tx) < K) {
+            As[ty][tx] = A[row * K + t * TILE_SIZE + tx];
+        } else {
+            As[ty][tx] = 0.0f;
+        }
+
+        // Load tile from B into shared memory
+        if ((t * TILE_SIZE + ty) < K && col < N) {
+            Bs[ty][tx] = B[(t * TILE_SIZE + ty) * N + col];
+        } else {
+            Bs[ty][tx] = 0.0f;
+        }
+
+        __syncthreads();
+
+        // Compute partial dot product
+        for (int k = 0; k < TILE_SIZE; ++k) {
+            sum += As[ty][k] * Bs[k][tx];
+        }
+
+        __syncthreads();
+    }
+
+    // Write result to global memory
+    if (row < M && col < N) {
+        C[row * N + col] = sum;
+    }
+}
+
+torch::Tensor matmul_cuda(torch::Tensor A, torch::Tensor B) {
+    // Ensure inputs are contiguous and on CUDA
+    if (!A.is_contiguous()) A = A.contiguous();
+    if (!B.is_contiguous()) B = B.contiguous();
+    
+    auto M = A.size(0);
+    auto K = A.size(1);
+    auto N = B.size(1);
+
+    // Output tensor
+    auto C = torch::empty({M, N}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+
+    const int TILE_SIZE = 16;
+    dim3 block(TILE_SIZE, TILE_SIZE);
+    
+    // Calculate grid dimensions
+    int grid_x = (N + TILE_SIZE - 1) / TILE_SIZE;
+    int grid_y = (M + TILE_SIZE - 1) / TILE_SIZE;
+    dim3 grid(grid_x, grid_y);
+
+    matmul_kernel<<<grid, block>>>(A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), M, N, K);
+
+    return C;
+}
+"""
+
+matmul_cpp_source = (
+    "torch::Tensor matmul_cuda(torch::Tensor A, torch::Tensor B);"
+)
+
+# Compile the inline CUDA code for matrix multiplication
+matmul_op = load_inline(
+    name="matmul_cuda",
+    cpp_sources=matmul_cpp_source,
+    cuda_sources=matmul_source,
+    functions=["matmul_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, model_name, config):
+        super().__init__()
+        self.model_name = model_name
+        self.config = config
+        
+        # Load the original model
+        self.original_model = AutoModelForCausalLM.from_pretrained(model_name, config=config)
+        
+        # We will replace the linear layers in the transformer blocks with custom matmul + bias add
+        # Since we cannot easily monkey-patch every single layer's forward pass without modifying the source deeply,
+        # we will create a wrapper that intercepts the computation.
+        # However, to strictly follow "replace pytorch operators", we can override the forward method of specific submodules if needed,
+        # but a cleaner way for this specific task is to replace the `forward` of the entire model to use our custom ops where possible.
+        # Given the complexity of GPT-2's internal structure, replacing every single Linear layer with a custom kernel call in Python wrapper is verbose.
+        # Instead, we will implement a custom forward pass for the core logic if we were building from scratch, but here we are optimizing an existing architecture.
+        
+        # Strategy: We will replace the `forward` method of the ModelNew to manually execute the GPT-2 logic using our custom matmul where beneficial.
+        # However, GPT-2 has many layers. A more practical "optimization" in this context is to ensure that the heavy lifting (Matmul) uses our kernel.
+        # We can do this by replacing the `forward` of the `GPT2Block` or similar, but that requires importing internal classes.
+        
+        # Alternative: Since we have freedom, let's just wrap the original model and replace the linear layers' forward calls with our custom matmul+bias.
+        # This is complex to do dynamically for all layers. 
+        # Let's take a simpler approach: We will create a new ModelNew that mimics GPT-2 but uses our custom Matmul kernel for the large matrix multiplications.
+        
+        self.transformer = self.original_model.transformer
+        self.lm_head = self.original_model.lm_head
+        
+        # Replace all Linear layers in transformer with a custom module that uses matmul_cuda
+        self._replace_linear_layers()
+
+    def _replace_linear_layers(self):
+        """Recursively replace nn.Linear layers with a custom implementation using matmul_cuda"""
+        for name, module in self.transformer.named_modules():
+            if isinstance(module, torch.nn.Linear):
+                # Create a new module that uses our custom matmul
+                new_module = CustomLinear(module.in_features, module.out_features, module.bias is not None)
+                new_module.weight.data = module.weight.data.clone()
+                if module.bias is not None:
+                    new_module.bias.data = module.bias.data.clone()
+                
+                # Replace the module in the parent
+                parts = name.split('.')
+                parent = self.transformer
+                for part in parts[:-1]:
+                    parent = getattr(parent, part)
+                setattr(parent, parts[-1], new_module)
+
+    def forward(self, x):
+        return self.original_model(x).logits # This won't use our custom ops if we just call original. 
+                                            # We need to run the logic manually or ensure the replaced modules are used.
+        
+        # Actually, since we replaced the modules in self.transformer, calling self.original_model might not work as expected if it caches things.
+        # Let's re-implement the forward pass of GPT-2 using our modified transformer components.
+        
+        inputs_embeds = None
+        hidden_states = self.transformer.wte(x)  # Word embeddings
+        position_ids = torch.arange(0, x.size(1), dtype=torch.long, device=x.device)
+        position_ids = position_ids.unsqueeze(0).expand_as(x)
+        position_embeds = self.transformer.wpe(position_ids)
+        
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds + position_embeds
+        else:
+            hidden_states = hidden_states + position_embeds
+
+        # Attention mask handling (simplified for causal LM, assuming no padding mask for this example)
+        attention_mask = None
+        
+        # We need to iterate through the layers and apply them manually to ensure our custom linear layers are used
+        for i, layer in enumerate(self.transformer.h):
+            layer_outputs = layer(hidden_states, attention_mask=attention_mask, layer_past=None, use_cache=False)
+            hidden_states = layer_outputs[0]
+
+        hidden_states = self.transformer.ln_f(hidden_states)
+        
+        # LM Head: Linear projection
+        lm_logits = self.lm_head(hidden_states)
+        
+        return lm_logits
+
+
+class CustomLinear(torch.nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = torch.nn.Parameter(torch.empty(out_features, in_features))
+        if bias:
+            self.bias = torch.nn.Parameter(torch.empty(out_features))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Initialize like PyTorch's Linear (Kaiming uniform)
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, input):
+        # Use custom matmul kernel
+        # Input: (..., in_features) -> reshape to (M, K)
+        # Weight: (out_features, in_features) -> (K, N) where K=in_features, N=out_features
+        
+        original_shape = input.shape
+        M = 1
+        for dim in original_shape[:-1]:
+            M *= dim
+        K = self.in_features
+        N = self.out_features
+        
+        # Reshape input to (M, K)
+        x_reshaped = input.view(M, K)
+        
+        # Perform custom matmul: C = A @ B^T ? 
+        # PyTorch Linear is out = x @ W^T + b. 
+        # Our matmul_kernel does C = A @ B.
+        # So we need to pass Weight.T as B? Or transpose weight in kernel?
+        # Let's assume standard matrix multiplication: Out[i,j] = Sum_k A[i,k] * B[k,j]
+        # PyTorch Linear: Out[i,j] = Sum_k Input[i,k] * Weight[j,k]
+        # So if we want C = A @ B, then B must be Weight.T.
+        
+        weight_t = self.weight.t().contiguous() # (K, N)
+        
+        # Call custom matmul
+        out_matmul = matmul_op.matmul_cuda(x_reshaped, weight_t)
+        
+        if self.bias is not None:
+            out_matmul = out_matmul + self.bias
+        
+        # Reshape back to original shape
+        new_shape = list(original_shape[:-1]) + [N]
+        return out_matmul.view(new_shape)
+
+import math
+
+# Re-define ModelNew with the correct forward logic that uses the replaced layers
+class ModelNew(torch.nn.Module):
+    def __init__(self, model_name, config):
+        super().__init__()
+        self.model_name = model_name
+        self.config = config
+        
+        # Load the original model to get weights and structure
+        self.original_model = AutoModelForCausalLM.from_pretrained(model_name, config=config)
+        
+        # Extract components
+        self.transformer = self.original_model.transformer
+        self.lm_head = self.original_model.lm_head
+        
+        # Replace all Linear layers in transformer with custom implementation
+        self._replace_linear_layers()
+
+    def _replace_linear_layers(self):
+        """Recursively replace nn.Linear layers with a custom implementation using matmul_cuda"""
+        for name, module in self.transformer.named_modules():
+            if isinstance(module, torch.nn.Linear):
+                # Create a new module that uses our custom matmul
+                new_module = CustomLinear(module.in_features, module.out_features, module.bias is not None)
+                new_module.weight.data = module.weight.data.clone()
+                if module.bias is not None:
+                    new_module.bias.data = module.bias.data.clone()
+                
+                # Replace the module in the parent
+                parts = name.split('.')
+                parent = self.transformer
+                for part in parts[:-1]:
+                    parent = getattr(parent, part)
+                setattr(parent, parts[-1], new_module)
+
+    def forward(self, x):
+        # Manually implement GPT-2 forward pass to ensure custom layers are used
+        hidden_states = self.transformer.wte(x)  # Word embeddings
+        position_ids = torch.arange(0, x.size(1), dtype=torch.long, device=x.device)
+        position_ids = position_ids.unsqueeze(0).expand_as(x)
+        position_embeds = self.transformer.wpe(position_ids)
+        
+        hidden_states = hidden_states + position_embeds
+
+        # Attention mask is None for this simple causal case (no padding)
+        attention_mask = None
+        
+        # Iterate through layers
+        for i, layer in enumerate(self.transformer.h):
+            # Each layer is a GPT2Block which now contains CustomLinear layers
+            layer_outputs = layer(hidden_states, attention_mask=attention_mask, layer_past=None, use_cache=False)
+            hidden_states = layer_outputs[0]
+
+        hidden_states = self.transformer.ln_f(hidden_states)
+        
+        # LM Head: Linear projection (also replaced if it was a standard Linear, but lm_head is usually separate)
+        # We should also replace lm_head if we want full coverage, but the prompt says "replace pytorch operators in the given architecture".
+        # The lm_head is part of the model. Let's replace it too for consistency.
+        # However, lm_head is not inside transformer.h. It's a direct attribute.
+        # Let's check if lm_head is a Linear layer and replace it.
+        if isinstance(self.lm_head, torch.nn.Linear):
+            new_lm_head = CustomLinear(self.lm_head.in_features, self.lm_head.out_features, self.lm_head.bias is not None)
+            new_lm_head.weight.data = self.lm_head.weight.data.clone()
+            if self.lm_head.bias is not None:
+                new_lm_head.bias.data = self.lm_head.bias.data.clone()
+            lm_logits = new_lm_head(hidden_states)
+        else:
+            # If it's already something else, just use it (unlikely for GPT-2)
+            lm_logits = self.lm_head(hidden_states)
+        
+        return lm_logits
+
+# Helper function to get inputs
+def get_inputs():
+    model_name = "gpt2"
+    config = AutoConfig.from_pretrained(model_name)
+    vocab_size = config.vocab_size
+    sequence_length = 1023
+    batch_size = 1
+    inputs = torch.randint(0, vocab_size, (batch_size, sequence_length))
+    return [inputs]
+
+def get_init_inputs():
+    model_name = "gpt2"
+    config = AutoConfig.from_pretrained(model_name)
+    return [model_name, config]

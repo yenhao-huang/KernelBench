@@ -1,0 +1,124 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void conv_bn_scale_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ conv_bias,
+    const float* __restrict__ bn_weight,
+    const float* __restrict__ bn_bias,
+    const float* __restrict__ running_mean,
+    const float* __restrict__ running_var,
+    float* __restrict__ out,
+    int N, int C, int H, int W, int O, int K, int OH, int OW,
+    float eps, float scale
+) {
+    int ow = blockIdx.x * blockDim.x + threadIdx.x;
+    int oh = blockIdx.y * blockDim.y + threadIdx.y;
+    int no = blockIdx.z;
+    int n = no / O;
+    int o = no - n * O;
+
+    if (ow >= OW || oh >= OH) return;
+
+    float acc = conv_bias[o];
+
+    #pragma unroll
+    for (int c = 0; c < 8; ++c) {
+        #pragma unroll
+        for (int kh = 0; kh < 3; ++kh) {
+            #pragma unroll
+            for (int kw = 0; kw < 3; ++kw) {
+                int ih = oh + kh;
+                int iw = ow + kw;
+                float xv = x[((n * C + c) * H + ih) * W + iw];
+                float wv = w[((o * C + c) * K + kh) * K + kw];
+                acc = fmaf(xv, wv, acc);
+            }
+        }
+    }
+
+    float norm = (acc - running_mean[o]) * rsqrtf(running_var[o] + eps);
+    float y = (norm * bn_weight[o] + bn_bias[o]) * scale;
+    out[((n * O + o) * OH + oh) * OW + ow] = y;
+}
+
+torch::Tensor conv_bn_scale_cuda(
+    torch::Tensor x,
+    torch::Tensor w,
+    torch::Tensor conv_bias,
+    torch::Tensor bn_weight,
+    torch::Tensor bn_bias,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    double eps,
+    double scale
+) {
+    int N = x.size(0);
+    int C = x.size(1);
+    int H = x.size(2);
+    int W = x.size(3);
+    int O = w.size(0);
+    int K = w.size(2);
+    int OH = H - K + 1;
+    int OW = W - K + 1;
+
+    auto out = torch::empty({N, O, OH, OW}, x.options());
+
+    dim3 block(16, 8);
+    dim3 grid((OW + block.x - 1) / block.x, (OH + block.y - 1) / block.y, N * O);
+
+    conv_bn_scale_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        w.data_ptr<float>(),
+        conv_bias.data_ptr<float>(),
+        bn_weight.data_ptr<float>(),
+        bn_bias.data_ptr<float>(),
+        running_mean.data_ptr<float>(),
+        running_var.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C, H, W, O, K, OH, OW,
+        static_cast<float>(eps),
+        static_cast<float>(scale)
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = "torch::Tensor conv_bn_scale_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor conv_bias, torch::Tensor bn_weight, torch::Tensor bn_bias, torch::Tensor running_mean, torch::Tensor running_var, double eps, double scale);"
+
+conv_bn_scale_ext = load_inline(
+    name="conv_bn_scale_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["conv_bn_scale_cuda"],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.scaling_factor = scaling_factor
+        self.ext = conv_bn_scale_ext
+
+    def forward(self, x):
+        return self.ext.conv_bn_scale_cuda(
+            x,
+            self.conv.weight,
+            self.conv.bias,
+            self.bn.weight,
+            self.bn.bias,
+            self.bn.running_mean,
+            self.bn.running_var,
+            self.bn.eps,
+            self.scaling_factor,
+        )

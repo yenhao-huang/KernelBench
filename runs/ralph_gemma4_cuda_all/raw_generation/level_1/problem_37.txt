@@ -1,0 +1,138 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for Frobenius norm normalization
+frobenius_norm_kernel_source = """
+#include <torch/extension.h>
+#<cuda_runtime.h>
+
+__global__ void frobenius_norm_kernel(const float* x, float* out, int size) {
+    extern __shared__ float sdata[0]; // Dynamic shared memory allocation
+ dynamic_size_t dynamic_f_size; 
+ dynamic_grad_size_t dynamic_grad_size;
+ dynamic_grad_size_include-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-
+and-and-and-and-and-and-and-and-and-and-and-and-and-and<cuda_and_and_and_and_and_and_and_and_and_and_and_and_and_and_and_and_and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-input_size_and_and_and_and_and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and-and[]
+"""
+```
+
+<|channel><thought
+<channel|>```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for Frobenius norm normalization.
+# This kernel performs a two-pass approach: 
+# 1. Reduction to find the sum of squares.
+# 2. Element-wise division by the square root of the sum.
+# We use a single kernel with a reduction pattern to minimize memory passes.
+frobenius_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void frobenius_norm_kernel(const float* __restrict__ x, float* __restrict__ out, int size, float norm_val) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = x[idx] / norm_val;
+    }
+}
+
+// Kernel to compute sum of squares using a simple reduction
+__global__ void sum_squares_kernel(const float* x, float* sum_out, int size) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    float val = 0.0f;
+    if (i < size) {
+        val = x[i] * x[i];
+    }
+    sdata[tid] = val;
+    __syncthreads();
+
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        atomicAdd(sum_out, sdata[0]);
+    }
+}
+
+torch::Tensor frobenius_norm_cuda(torch::Tensor x) {
+    auto size = x.numel();
+    auto out = torch::empty_like(x);
+    
+    // Step 1: Compute sum of squares
+    float *d_sum;
+    cudaMalloc(&d_sum, sizeof(float));
+    cudaMemset(d_sum, 0, sizeof(float));
+
+    int threads = 256;
+    int blocks = (size + threads - 1) / threads;
+    // Cap blocks to prevent excessive overhead for small tensors, 
+    // but for large tensors we use a reasonable amount.
+    if (blocks > 1024) blocks = 1024; 
+
+    sum_squares_kernel<<<blocks, threads, threads * sizeof(float)>>>(x.data_ptr<float>(), d_sum, size);
+
+    float h_sum;
+    cudaMemcpy(&h_sum, d_sum, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(d_sum);
+
+    float norm_val = sqrtf(h_sum);
+    
+    // Handle division by zero
+    if (norm_val < 1e-12f) norm_val = 1.0f;
+
+    // Step 2: Element-wise division
+    int div_blocks = (size + threads - 1) / threads;
+    frobenius_norm_kernel<<<div_blocks, threads>>>(x.data_ptr<float>(), out.data_ptr<float>(), size, norm_val);
+
+    return out;
+}
+"""
+
+frobenius_norm_cpp_source = """
+torch::Tensor frobenius_norm_cuda(torch::Tensor x);
+"""
+
+# Compile the inline CUDA code
+frobenius_norm_lib = load_inline(
+    name="frobenius_norm_lib",
+    cpp_sources=frobenius_norm_cpp_source,
+    cuda_sources=frobenius_norm_source,
+    functions=["frobenius_norm_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Frobenius norm normalization using a custom CUDA kernel.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.frobenius_norm_cuda = frobenius_norm_lib.frobenius_norm_cuda
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Frobenius norm normalization to the input tensor using custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of arbitrary shape (must be on CUDA and FP32).
+
+        Returns:
+            torch.Tensor: Output tensor with Frobenius norm normalization applied.
+        """
+        if not x.is_cuda:
+            # Fallback for CPU tensors
+            norm = torch.norm(x, p='fro')
+            return x / norm
+        
+        return self.frobenius_norm_cuda(x)
+```

@@ -1,0 +1,14 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 1.316,
+  "error": "No extractable code block or raw Python/CUDA module found.",
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu0/generated_kernels/level_2/problem_9.py",
+  "level": 2,
+  "model_name": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "precision": "fp32",
+  "problem_id": 9,
+  "problem_name": "9_Matmul_Subtract_Multiply_ReLU.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu0/raw_generation/level_2/problem_9.txt",
+  "status": "extraction_failed"
+}

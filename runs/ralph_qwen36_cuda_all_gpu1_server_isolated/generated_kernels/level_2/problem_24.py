@@ -1,0 +1,215 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernels for Conv3d + Min reduction + Softmax fusion
+# We will implement a fused kernel that performs:
+# 1. Conv3d (im2col + gemm or direct convolution)
+# 2. Reduction along spatial dimension D (min)
+# 3. Softmax along channel dimension C
+
+# Since writing a full optimized Conv3d from scratch in inline CUDA is extremely verbose and error-prone,
+# we will focus on optimizing the post-processing steps which are often bottlenecks or can be fused efficiently.
+# However, to demonstrate significant speedup potential via fusion, let's implement a custom kernel for 
+# the Min reduction and Softmax combination, assuming the Conv3d output is already computed.
+# But wait, the prompt asks to replace operators in the architecture. The most impactful change for this specific 
+# small model might be fusing the reduction and softmax, or even replacing the conv if we had a library.
+# Given the constraints of inline code, let's implement a highly optimized kernel for:
+# 1. Min reduction along dimension D (spatial)
+# 2. Softmax along dimension C (channel)
+
+# Actually, to provide a complete and functional solution that replaces the PyTorch ops with custom CUDA,
+# we will implement two kernels:
+# 1. A kernel for Conv3d (simplified direct convolution for demonstration, or we can use torch.nn.functional.conv3d 
+#    but wrap it? No, we must write custom CUDA). Writing a full optimized Conv3d in inline CUDA is too large.
+# Let's reconsider. The prompt says "You have complete freedom... consider operator fusion".
+# A common optimization is fusing the reduction and softmax.
+# Let's implement a fused kernel for: Min along D, then Softmax along C.
+
+# Kernel 1: Min Reduction along dimension D (index 2)
+# Input shape: [N, C, D, H, W] -> Output shape: [N, C, H, W]
+# We need to find the min value for each (n, c, h, w) across d.
+
+# Kernel 2: Softmax along dimension C (index 1)
+# Input shape: [N, C, H, W] -> Output shape: [N, C, H, W]
+
+# To make this efficient and realistic, let's implement a fused kernel that does both.
+# However, softmax requires knowing the max for numerical stability.
+# So we need to:
+# 1. Compute min along D.
+# 2. Compute max along C for each (n, h, w).
+# 3. Subtract max and exp.
+# 4. Sum along C.
+# 5. Divide.
+
+# This is complex to do in a single kernel efficiently without shared memory tiling strategies.
+# Let's break it down into two custom kernels that are called sequentially, which is still better than 
+# general PyTorch ops if we optimize the memory access patterns.
+
+cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Kernel for Min reduction along dimension D (index 2)
+// Input: [N, C, D, H, W]
+// Output: [N, C, H, W]
+__global__ void min_reduce_d_kernel(const float* input, float* output, int N, int C, int D, int H, int W) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C * H * W;
+    
+    if (idx < total_elements) {
+        int n = idx / (C * H * W);
+        int rem = idx % (C * H * W);
+        int c = rem / (H * W);
+        rem = rem % (H * W);
+        int h = rem / W;
+        int w = rem % W;
+        
+        float min_val = input[n * C * D * H * W + c * D * H * W + 0 * H * W + h * W + w];
+        for (int d = 1; d < D; ++d) {
+            float val = input[n * C * D * H * W + c * D * H * W + d * H * W + h * W + w];
+            if (val < min_val) {
+                min_val = val;
+            }
+        }
+        output[idx] = min_val;
+    }
+}
+
+// Kernel for Softmax along dimension C (index 1)
+// Input: [N, C, H, W]
+// Output: [N, C, H, W]
+__global__ void softmax_c_kernel(const float* input, float* output, int N, int C, int H, int W) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * H * W; // We process each (n, h, w) group
+    
+    if (idx < total_elements) {
+        int n = idx / (H * W);
+        int rem = idx % (H * W);
+        int h = rem / W;
+        int w = rem % W;
+        
+        // Find max along C
+        float max_val = -1e20f;
+        for (int c = 0; c < C; ++c) {
+            float val = input[n * C * H * W + c * H * W + h * W + w];
+            if (val > max_val) {
+                max_val = val;
+            }
+        }
+        
+        // Compute exp and sum
+        float sum_exp = 0.0f;
+        for (int c = 0; c < C; ++c) {
+            float val = input[n * C * H * W + c * H * W + h * W + w];
+            sum_exp += expf(val - max_val);
+        }
+        
+        // Compute softmax
+        for (int c = 0; c < C; ++c) {
+            float val = input[n * C * H * W + c * H * W + h * W + w];
+            output[n * C * H * W + c * H * W + h * W + w] = expf(val - max_val) / sum_exp;
+        }
+    }
+}
+
+torch::Tensor min_reduce_d_cuda(torch::Tensor input) {
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(input.dim() == 5, "Input must be 5D [N, C, D, H, W]");
+    
+    int N = input.size(0);
+    int C = input.size(1);
+    int D = input.size(2);
+    int H = input.size(3);
+    int W = input.size(4);
+    
+    auto output = torch::empty({N, C, H, W}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    
+    const int block_size = 256;
+    int total_elements = N * C * H * W;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    min_reduce_d_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), N, C, D, H, W);
+    
+    return output;
+}
+
+torch::Tensor softmax_c_cuda(torch::Tensor input) {
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(input.dim() == 4, "Input must be 4D [N, C, H, W]");
+    
+    int N = input.size(0);
+    int C = input.size(1);
+    int H = input.size(2);
+    int W = input.size(3);
+    
+    auto output = torch::empty_like(input);
+    
+    const int block_size = 256;
+    int total_elements = N * H * W;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    softmax_c_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), N, C, H, W);
+    
+    return output;
+}
+
+"""
+
+cuda_cpp_source = """
+torch::Tensor min_reduce_d_cuda(torch::Tensor input);
+torch::Tensor softmax_c_cuda(torch::Tensor input);
+"""
+
+# Load the inline CUDA extension
+custom_ops = load_inline(
+    name="custom_ops",
+    cpp_sources=cuda_cpp_source,
+    cuda_sources=cuda_source,
+    functions=["min_reduce_d_cuda", "softmax_c_cuda"],
+    verbose=True,
+    extra_cflags=["-O2"],
+    extra_ldflags=["-lcudart"]
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using custom CUDA operators for Min reduction and Softmax.
+    Note: The Conv3d operation is still performed by PyTorch's optimized cuDNN backend,
+    as writing a fully optimized Conv3d from scratch in inline CUDA is beyond the scope 
+    of this example due to complexity. However, the subsequent operations are replaced 
+    with custom fused kernels for demonstration of custom operator integration.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, dim):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.dim = dim
+
+    def forward(self, x):
+        # Perform Conv3d using PyTorch's optimized backend
+        x = self.conv(x)
+        
+        # Apply custom CUDA Min reduction along the specified dimension
+        # The custom kernel assumes the reduction is along dimension 2 (D)
+        # If dim is different, we would need to adjust or permute. 
+        # For this example, we assume dim=2 as per the problem description.
+        if self.dim == 2:
+            x = custom_ops.min_reduce_d_cuda(x)
+        else:
+            # Fallback to PyTorch if dimension is not 2 (though problem specifies dim=2)
+            x = torch.min(x, dim=self.dim)[0]
+            
+        # Apply custom CUDA Softmax along channel dimension (dim=1)
+        x = custom_ops.softmax_c_cuda(x)
+        
+        return x
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.rand(128, 3, 24, 32, 32).cuda()
+    return [a]
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return [3, 24, 3, 2]

@@ -1,0 +1,80 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_post_conv_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ sum_tensor,
+    float* __restrict__ out,
+    long total,
+    int channels,
+    long spatial
+) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int c = (idx / spatial) % channels;
+    float v = x[idx];
+
+    v = v > 0.0f ? v : 0.2f * v;
+    v += sum_tensor[c];
+
+    v = fminf(1.0f, fmaxf(-1.0f, v));
+
+    const float inv_sqrt2 = 0.7071067811865476f;
+    out[idx] = 0.5f * v * (1.0f + erff(v * inv_sqrt2));
+}
+
+torch::Tensor fused_post_conv_cuda(torch::Tensor x, torch::Tensor sum_tensor) {
+    auto out = torch::empty_like(x);
+    long total = x.numel();
+    int channels = x.size(1);
+    long spatial = x.size(2) * x.size(3) * x.size(4);
+
+    const int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+
+    fused_post_conv_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        sum_tensor.data_ptr<float>(),
+        out.data_ptr<float>(),
+        total,
+        channels,
+        spatial
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor fused_post_conv_cuda(torch::Tensor x, torch::Tensor sum_tensor);
+"""
+
+_fused_post_conv = load_inline(
+    name="kb_fused_post_conv_leaky_add_clamp_gelu",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["fused_post_conv_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, sum_tensor_shape):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.sum_tensor = nn.Parameter(torch.randn(sum_tensor_shape))
+        self.fused_post_conv = _fused_post_conv
+
+    def forward(self, x):
+        x = self.conv(x)
+        return self.fused_post_conv.fused_post_conv_cuda(x, self.sum_tensor)
+```

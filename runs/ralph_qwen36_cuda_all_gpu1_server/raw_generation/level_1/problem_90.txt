@@ -1,0 +1,136 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for cumulative product
+cumprod_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+__global__ void cumprod_kernel(const float* input, float* output, int total_elements, int dim_size, int stride) {
+    // Each thread handles one element in the batch dimension (or outer dimensions)
+    // We iterate through the specified dimension
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < total_elements / dim_size) {
+        // Calculate the base pointer for this specific sequence along 'dim'
+        const float* seq_input = input + idx * stride;
+        float* seq_output = output + idx * stride;
+        
+        float current_prod = 1.0f;
+        for (int i = 0; i < dim_size; ++i) {
+            current_prod *= seq_input[i];
+            seq_output[i] = current_prod;
+        }
+    }
+}
+
+torch::Tensor cumprod_cuda(torch::Tensor x, int64_t dim) {
+    // Ensure input is contiguous and on CUDA
+    if (!x.is_contiguous()) {
+        x = x.contiguous();
+    }
+    
+    auto options = torch::TensorOptions().dtype(x.dtype()).device(x.device());
+    auto out = torch::empty_like(x, options);
+    
+    int64_t ndim = x.dim();
+    if (ndim == 0) return out;
+    
+    // Handle negative dimension
+    if (dim < 0) {
+        dim += ndim;
+    }
+    
+    // Get dimensions
+    int64_t dim_size = x.size(dim);
+    
+    // Calculate the number of elements in all other dimensions combined
+    // This is the number of independent sequences we need to process
+    int64_t total_elements = 1;
+    for (int i = 0; i < ndim; ++i) {
+        if (i != dim) {
+            total_elements *= x.size(i);
+        }
+    }
+    
+    // Calculate the stride (step size) to move from one element in 'dim' to the next
+    int64_t stride = 1;
+    for (int i = ndim - 1; i > dim; --i) {
+        stride *= x.size(i);
+    }
+    
+    if (total_elements == 0 || dim_size == 0) {
+        return out;
+    }
+
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    cumprod_kernel<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        total_elements,
+        dim_size,
+        stride
+    );
+    
+    // Check for kernel launch errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA Error in cumprod: %s\\n", cudaGetErrorString(err));
+    }
+    
+    return out;
+}
+"""
+
+cumprod_cpp_source = (
+    "torch::Tensor cumprod_cuda(torch::Tensor x, int64_t dim);"
+)
+
+# Compile the inline CUDA code for cumulative product
+cumprod_module = load_inline(
+    name="cumprod_custom",
+    cpp_sources=cumprod_cpp_source,
+    cuda_sources=cumprod_source,
+    functions=["cumprod_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    A model that performs a cumulative product operation along a specified dimension using custom CUDA.
+
+    Parameters:
+        dim (int): The dimension along which to perform the cumulative product operation.
+    """
+
+    def __init__(self, dim):
+        """
+        Initialize the CumulativeProductModelNew.
+
+        Args:
+            dim (int): The dimension along which to perform the cumulative product.
+        """
+        super(ModelNew, self).__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        """
+        Forward pass, computing the cumulative product along the specified dimension using custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).
+
+        Returns:
+            torch.Tensor: Tensor of the same shape as `x` after applying cumulative product along `dim`.
+        """
+        return cumprod_module.cumprod_cuda(x, self.dim)
+```

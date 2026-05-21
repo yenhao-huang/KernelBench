@@ -1,0 +1,28 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 65.477,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "runtime_error": "\"nll_loss_forward_reduce_cuda_kernel_2d_index\" not implemented for 'Float'",
+      "runtime_error_name": "builtins.NotImplementedError"
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_codex_cuda_all/generated_kernels/level_1/problem_95.py",
+  "level": 1,
+  "model_name": "codex-gpt-5.5",
+  "precision": "fp32",
+  "problem_id": 95,
+  "problem_name": "95_CrossEntropyLoss.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_codex_cuda_all/raw_generation/level_1/problem_95.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

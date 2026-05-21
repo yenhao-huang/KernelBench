@@ -1,0 +1,589 @@
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA implementation for GRU cell operations fused together.
+# This replaces the standard nn.GRU with a custom kernel that performs:
+# 1. Linear projections for r, z, n gates (W_ih * x + b_ih)
+# 2. Linear projections for h_t-1 (W_hh * h + b_hh)
+# 3. Element-wise operations and sigmoid/tanh activations
+# 4. Final output calculation
+
+gru_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper for sigmoid
+__device__ __forceinline__ float sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+// Helper for tanh
+__device__ __forceinline__ float tanh_val(float x) {
+    return tanhf(x);
+}
+
+// Kernel for a single GRU step: output_t = gru_step(input_t, h_prev)
+// Assumes input_size, hidden_size are known at compile time or passed via args.
+// To support dynamic sizes, we pass dimensions.
+__global__ void gru_step_kernel(
+    const float* x,       // (batch, input_size)
+    const float* h_prev,  // (batch, hidden_size)
+    const float* w_ih,    // (3*hidden_size, input_size)
+    const float* b_ih,    // (3*hidden_size)
+    const float* w_hh,    // (3*hidden_size, hidden_size)
+    const float* b_hh,    // (3*hidden_size)
+    float* r_out,         // (batch, hidden_size) - reset gate input pre-activation? No, we compute gates.
+    float* z_out,         // (batch, hidden_size) - update gate input pre-activation?
+    float* n_out,         // (batch, hidden_size) - new gate input pre-activation?
+    float* h_new          // (batch, hidden_size) - final output
+) {
+    int batch_idx = blockIdx.x;
+    int hid_idx = threadIdx.x + blockDim.x * threadIdx.y;
+    
+    if (hid_idx >= hidden_size) return;
+
+    int input_size_val = input_size;
+    int hidden_size_val = hidden_size;
+
+    // Calculate indices for W_ih and W_hh
+    // W_ih is [3*hidden, input]. 
+    // We need to compute:
+    // rz_n = x @ W_ih^T + b_ih  -> shape (3*hidden)
+    // r_h_z_h_n_h = h_prev @ W_hh^T + b_hh -> shape (3*hidden)
+    
+    // Let's compute the three gates: reset (r), update (z), new (n)
+    // Indices in weight matrices:
+    // 0..hidden-1: Reset gate weights
+    // hidden..2*hidden-1: Update gate weights
+    // 2*hidden..3*hidden-1: New gate weights
+    
+    float x_val = 0.0f;
+    for (int i = 0; i < input_size_val; ++i) {
+        x_val += x[batch_idx * input_size_val + i] * w_ih[hid_idx * input_size_val + i];
+    }
+    
+    float h_val = 0.0f;
+    for (int j = 0; j < hidden_size_val; ++j) {
+        h_val += h_prev[batch_idx * hidden_size_val + j] * w_hh[hid_idx * hidden_size_val + j];
+    }
+
+    float pre_act = x_val + h_val + b_ih[hid_idx]; // Assuming b_ih and b_hh are fused or b_hh is 0? 
+    // Standard GRU: W_ih @ x + b_ih + W_hh @ h + b_hh.
+    // In PyTorch nn.GRU, b_ih and b_hh are separate. 
+    // Let's assume the caller passes combined bias or we handle it. 
+    // For simplicity in this inline kernel, let's assume b_ih contains both biases concatenated or just one.
+    // Actually, standard GRU: 
+    // r = sigmoid(W_ir @ x + b_ir + W_hr @ h + b_hr)
+    // z = sigmoid(W_iz @ x + b_iz + W_hz @ h + b_hz)
+    // n = tanh(W_in @ x + b_in + W_hn @ (r * h) + b_n)
+    
+    // To make this generic and correct with PyTorch's default bias=True:
+    // We need to split the weights. 
+    // Let's redefine the kernel signature to be more explicit about the 3 gates.
+}
+
+// Better approach: Compute all 3 gates in parallel threads per batch element? 
+// Or one thread per hidden unit per batch.
+// Given memory bandwidth is often the bottleneck, we want to minimize global memory reads/writes.
+
+__global__ void gru_layer_kernel(
+    const float* x,       // (seq_len, batch, input_size) if batch_first=False
+    const float* h_prev,  // (batch, hidden_size)
+    const float* w_ih,    // (3*hidden, input)
+    const float* b_ih,    // (3*hidden)
+    const float* w_hh,    // (3*hidden, hidden)
+    const float* b_hh,    // (3*hidden)
+    float* h_new,         // (batch, hidden_size)
+    int seq_len,
+    int batch_size,
+    int input_size,
+    int hidden_size
+) {
+    // This kernel processes one time step for all batches.
+    // We will launch this kernel seq_len times from host or fuse the loop.
+    // Fusing the loop is better. Let's make a kernel that processes the whole sequence.
+}
+
+__global__ void gru_full_sequence_kernel(
+    const float* x,       // (seq_len, batch, input_size)
+    const float* h_init,  // (num_layers, batch, hidden_size) - for single layer case
+    const float* w_ih,    // (3*hidden, input)
+    const float* b_ih,    // (3*hidden)
+    const float* w_hh,    // (3*hidden, hidden)
+    const float* b_hh,    // (3*hidden)
+    float* h_out,         // (batch, hidden_size) - final hidden state
+    int seq_len,
+    int batch_size,
+    int input_size,
+    int hidden_size
+) {
+    int batch_idx = blockIdx.x;
+    if (batch_idx >= batch_size) return;
+
+    float* h_current = &h_init[batch_idx * hidden_size]; // This is wrong, h_init is passed as const. We need a mutable copy or register storage.
+    // Since hidden_size can be large, we can't store entire h in registers easily if it's huge, but 256 floats is small (1KB). 
+    // Let's use shared memory or just registers if possible. For simplicity and correctness with variable sizes, 
+    // we will load h into a local array if hidden_size is small enough, or assume it fits in registers/shared.
+    // Given hidden_size=256, 256 floats = 1024 bytes. This fits in shared memory per block if we process multiple batches? 
+    // No, one thread block per batch is inefficient for large batch sizes.
+    // Better: One thread per hidden unit. Each thread handles one hidden dimension for all batches? 
+    // Or one thread per (batch, hidden_unit).
+    
+    // Let's stick to the standard grid-stride loop or 1D grid where each thread handles one element of the output sequence?
+    // No, GRU is sequential in time. We must process time steps sequentially for each batch.
+    
+    // Optimized Strategy:
+    // Launch kernel with (batch_size, hidden_size) threads? No, that's too many threads if seq_len is large.
+    // Actually, the computation per time step is O(batch * hidden * input + batch * hidden^2).
+    // We can fuse the matmul and the gate logic.
+    
+    // Let's use a 1D grid of blocks where each block handles one batch element.
+    // Inside the block, we use threads to handle the hidden dimension.
+    
+    extern __shared__ float shared_h[];
+    float* h_reg = shared_h; // Copy h_prev into shared memory for fast access
+    
+    int hid_idx = threadIdx.x;
+    if (hid_idx >= hidden_size) return;
+
+    // Load initial hidden state into shared memory/register
+    // Note: h_init is const. We need to copy it.
+    // Since we are processing one batch at a time, we can load the whole h vector into registers if hidden_size is small.
+    // If hidden_size is large, we might need shared memory. Let's assume hidden_size <= 512 for register usage or use shared mem.
+    
+    // For this implementation, let's use a simple approach: 
+    // Each thread block processes one batch item.
+    // Threads within the block iterate over hidden units? No, that serializes it.
+    // Each thread handles one hidden unit for all time steps? That would require storing h in registers.
+    
+    // Let's try: 1 Thread per (Batch, HiddenUnit).
+    // Grid: (batch_size * hidden_size) threads? No, max threads per block is 1024.
+    // If batch=10, hidden=256, total threads = 2560. We need multiple blocks.
+    
+    // Let's use a 2D grid: blockIdx.x = batch_idx, blockIdx.y = time_step? No, time is sequential.
+    
+    // Correct Parallelization for GRU:
+    // The bottleneck is the matrix multiplication W_hh @ h_t-1 and W_ih @ x_t.
+    // These are dense linear algebra operations. 
+    // cuBLAS is highly optimized for this. Writing a custom kernel for matmul is rarely faster than cuBLAS unless we fuse activations.
+    // However, the prompt asks to replace operators. Fusing MatMul + Sigmoid/Tanh is the key.
+    
+    // Let's implement a fused kernel that does:
+    // 1. Load x_t and h_{t-1}
+    // 2. Compute rz_n = W_ih @ x_t + b_ih (3*hidden)
+    // 3. Compute r_h_z_h_n_h = W_hh @ h_{t-1} + b_hh (3*hidden)
+    // 4. Combine to get r, z, n gates.
+    // 5. Compute h_t.
+    
+    // We will launch this kernel for each time step? Or fuse the time loop?
+    // Fusing the time loop means we keep h in registers/shared memory.
+    
+    // Let's assume hidden_size is small enough to fit in registers per thread if we use 1 thread per batch? No.
+    // Let's use 1 block per batch. Threads = hidden_size.
+    // If hidden_size > 1024, this fails. We can split hidden units across blocks.
+    
+    // Simplified Kernel: One thread per hidden unit. Grid covers (batch * hidden).
+    // But we need to synchronize across time steps? No, each thread handles its own hidden unit's history.
+    // Wait, h_t depends on h_{t-1}. So a thread handling hid_idx must process t=0..seq_len sequentially.
+    
+    int batch_idx = blockIdx.x;
+    int hid_idx = threadIdx.x + blockDim.x * blockIdx.y; // This indexing is tricky for 2D grid
+    
+    // Let's use a simpler mapping:
+    // blockIdx.x = batch_idx
+    // blockIdx.y = hidden_unit_index / warp_size? No.
+    
+    // Let's just launch 1 block per batch, and if hidden_size > 1024, we can't do it in one block.
+    // We'll assume hidden_size <= 1024 for this custom kernel to be simple, or use a grid-stride loop over hidden units within blocks that handle batches?
+    // No, standard cuBLAS is better for the matmul part. The fusion benefit is small if we just call cuBLAS inside.
+    
+    // Alternative: Use torch::cuda::cublas::gemm inside the kernel? Not allowed in inline CUDA easily without context.
+    
+    // Let's write a kernel that performs the GRU step for ONE time step, and call it seq_len times from Python.
+    // This is still faster if we fuse the matmul+activation.
+    
+    // Actually, let's just replace the GRU with a custom implementation using standard PyTorch ops but fused?
+    // No, "custom CUDA operators".
+    
+    // Let's provide a kernel that computes one step of GRU for all batches in parallel.
+}
+
+// We will define a Python function that calls this kernel seq_len times.
+// To make it efficient, we'll use a single kernel launch per time step.
+
+__global__ void gru_step_kernel_fused(
+    const float* x,       // (batch, input_size)
+    const float* h_prev,  // (batch, hidden_size)
+    const float* w_ih,    // (3*hidden, input)
+    const float* b_ih,    // (3*hidden)
+    const float* w_hh,    // (3*hidden, hidden)
+    const float* b_hh,    // (3*hidden)
+    float* h_new,         // (batch, hidden_size)
+    int batch_size,
+    int input_size,
+    int hidden_size
+) {
+    int batch_idx = blockIdx.x;
+    if (batch_idx >= batch_size) return;
+
+    int hid_idx = threadIdx.x + blockDim.x * blockIdx.y;
+    if (hid_idx >= hidden_size) return;
+
+    // We need to compute the 3 gates for this specific hidden unit.
+    // The weights are split into 3 parts: Reset, Update, New.
+    // Let's assume w_ih is laid out as [W_ir, W_iz, W_in] where each is (hidden, input).
+    // And b_ih is [b_ir, b_iz, b_in].
+    
+    int r_start = 0;
+    int z_start = hidden_size;
+    int n_start = 2 * hidden_size;
+
+    // Compute Reset Gate Input: r_in = W_ir @ x + b_ir + W_hr @ h_prev + b_hr
+    float r_val = 0.0f;
+    for (int i = 0; i < input_size; ++i) {
+        r_val += x[batch_idx * input_size + i] * w_ih[r_start * input_size + i];
+    }
+    for (int j = 0; j < hidden_size; ++j) {
+        r_val += h_prev[batch_idx * hidden_size + j] * w_hh[r_start * hidden_size + j];
+    }
+    r_val += b_ih[r_start + hid_idx]; // Assuming b_ih and b_hh are combined or passed separately? 
+    // In PyTorch, b_ih and b_hh are separate. Let's assume the caller passes combined bias for simplicity in this kernel signature, 
+    // or we pass b_ih and b_hh separately.
+    // Let's pass b_ih (3*hidden) and b_hh (3*hidden).
+    
+    // Correction: The kernel above only takes one bias array. Let's fix the signature.
+}
+
+// Revised Kernel Signature
+__global__ void gru_step_kernel_fused_v2(
+    const float* x,       // (batch, input_size)
+    const float* h_prev,  // (batch, hidden_size)
+    const float* w_ih,    // (3*hidden, input)
+    const float* b_ih,    // (3*hidden)
+    const float* w_hh,    // (3*hidden, hidden)
+    const float* b_hh,    // (3*hidden)
+    float* h_new,         // (batch, hidden_size)
+    int batch_size,
+    int input_size,
+    int hidden_size
+) {
+    int batch_idx = blockIdx.x;
+    if (batch_idx >= batch_size) return;
+
+    int hid_idx = threadIdx.x + blockDim.x * blockIdx.y;
+    if (hid_idx >= hidden_size) return;
+
+    // Indices for the 3 gates
+    int r_hid = hid_idx;
+    int z_hid = hid_idx + hidden_size;
+    int n_hid = hid_idx + 2 * hidden_size;
+
+    // Compute Reset Gate
+    float r_pre = 0.0f;
+    for (int i = 0; i < input_size; ++i) {
+        r_pre += x[batch_idx * input_size + i] * w_ih[r_hid * input_size + i];
+    }
+    for (int j = 0; j < hidden_size; ++j) {
+        r_pre += h_prev[batch_idx * hidden_size + j] * w_hh[r_hid * hidden_size + j];
+    }
+    r_pre += b_ih[r_hid] + b_hh[r_hid];
+    float r = sigmoid(r_pre);
+
+    // Compute Update Gate
+    float z_pre = 0.0f;
+    for (int i = 0; i < input_size; ++i) {
+        z_pre += x[batch_idx * input_size + i] * w_ih[z_hid * input_size + i];
+    }
+    for (int j = 0; j < hidden_size; ++j) {
+        z_pre += h_prev[batch_idx * hidden_size + j] * w_hh[z_hid * hidden_size + j];
+    }
+    z_pre += b_ih[z_hid] + b_hh[z_hid];
+    float z = sigmoid(z_pre);
+
+    // Compute New Gate
+    // n = tanh(W_in @ x + b_in + W_hn @ (r * h_prev) + b_n)
+    float n_pre = 0.0f;
+    for (int i = 0; i < input_size; ++i) {
+        n_pre += x[batch_idx * input_size + i] * w_ih[n_hid * input_size + i];
+    }
+    for (int j = 0; j < hidden_size; ++j) {
+        // r * h_prev: we need the reset gate value for each hidden unit.
+        // We only computed r for hid_idx. We need r for all j.
+        // This is a problem: one thread computes one output, but needs inputs from other threads' gates?
+        // No, r_j is the reset gate for hidden unit j.
+        // So we need to compute all r gates first? Or compute them on the fly?
+        // Computing all r gates requires reading W_ir and x and h_prev.
+        // This creates a dependency: to compute n_hid, we need r_j for all j.
+        // To compute r_j, we need its own thread.
+        
+        // Solution: Use shared memory to store the reset gate vector.
+    }
+}
+
+// Shared Memory Approach
+__global__ void gru_step_kernel_shared(
+    const float* x,       // (batch, input_size)
+    const float* h_prev,  // (batch, hidden_size)
+    const float* w_ih,    // (3*hidden, input)
+    const float* b_ih,    // (3*hidden)
+    const float* w_hh,    // (3*hidden, hidden)
+    const float* b_hh,    // (3*hidden)
+    float* h_new,         // (batch, hidden_size)
+    int batch_size,
+    int input_size,
+    int hidden_size
+) {
+    extern __shared__ float shared_mem[];
+    
+    int batch_idx = blockIdx.x;
+    if (batch_idx >= batch_size) return;
+
+    int hid_idx = threadIdx.x + blockDim.x * blockIdx.y;
+    if (hid_idx >= hidden_size) return;
+
+    // Shared memory layout:
+    // [0 .. hidden_size-1]: r gates
+    // [hidden_size .. 2*hidden_size-1]: z gates
+    // [2*hidden_size .. 3*hidden_size-1]: n_pre (or just compute n on fly)
+    
+    float* r_shared = shared_mem;
+    float* z_shared = shared_mem + hidden_size;
+    float* h_prev_shared = shared_mem + 2 * hidden_size; // Copy h_prev to shared for fast access?
+
+    // Load h_prev into shared memory
+    h_prev_shared[hid_idx] = h_prev[batch_idx * hidden_size + hid_idx];
+    __syncthreads();
+
+    // Compute Reset Gate
+    float r_pre = 0.0f;
+    int r_hid = hid_idx;
+    for (int i = 0; i < input_size; ++i) {
+        r_pre += x[batch_idx * input_size + i] * w_ih[r_hid * input_size + i];
+    }
+    for (int j = 0; j < hidden_size; ++j) {
+        r_pre += h_prev_shared[j] * w_hh[r_hid * hidden_size + j];
+    }
+    r_pre += b_ih[r_hid] + b_hh[r_hid];
+    r_shared[hid_idx] = sigmoid(r_pre);
+
+    // Compute Update Gate
+    float z_pre = 0.0f;
+    int z_hid = hid_idx + hidden_size;
+    for (int i = 0; i < input_size; ++i) {
+        z_pre += x[batch_idx * input_size + i] * w_ih[z_hid * input_size + i];
+    }
+    for (int j = 0; j < hidden_size; ++j) {
+        z_pre += h_prev_shared[j] * w_hh[z_hid * hidden_size + j];
+    }
+    z_pre += b_ih[z_hid] + b_hh[z_hid];
+    z_shared[hid_idx] = sigmoid(z_pre);
+
+    __syncthreads();
+
+    // Compute New Gate and Final Output
+    float n_pre = 0.0f;
+    int n_hid = hid_idx + 2 * hidden_size;
+    
+    // W_in @ x
+    for (int i = 0; i < input_size; ++i) {
+        n_pre += x[batch_idx * input_size + i] * w_ih[n_hid * input_size + i];
+    }
+    
+    // W_hn @ (r * h_prev)
+    for (int j = 0; j < hidden_size; ++j) {
+        float r_j = r_shared[j];
+        float h_j = h_prev_shared[j];
+        n_pre += r_j * h_j * w_hh[n_hid * hidden_size + j];
+    }
+    n_pre += b_ih[n_hid] + b_hh[n_hid];
+    
+    float n = tanh_val(n_pre);
+    
+    // h_new = (1 - z) * n + z * h_prev
+    float z_val = z_shared[hid_idx];
+    float h_prev_val = h_prev_shared[hid_idx];
+    h_new[batch_idx * hidden_size + hid_idx] = (1.0f - z_val) * n + z_val * h_prev_val;
+}
+
+// Host function to launch the kernel for each time step
+torch::Tensor gru_step_cuda(
+    torch::Tensor x,       // (batch, input_size)
+    torch::Tensor h_prev,  // (batch, hidden_size)
+    torch::Tensor w_ih,    // (3*hidden, input)
+    torch::Tensor b_ih,    // (3*hidden)
+    torch::Tensor w_hh,    // (3*hidden, hidden)
+    torch::Tensor b_hh     // (3*hidden)
+) {
+    auto batch_size = x.size(0);
+    auto input_size = x.size(1);
+    auto hidden_size = h_prev.size(1);
+
+    auto h_new = torch::zeros_like(h_prev);
+
+    const int block_size = 256; // Or 512, depending on hidden_size
+    // We need enough threads to cover hidden_size. 
+    // If hidden_size > block_size * grid_y, we might need more blocks.
+    // Let's use a 2D grid: blockIdx.x = batch, blockIdx.y = hid_idx / block_size
+    
+    const int num_blocks_x = batch_size;
+    const int num_blocks_y = (hidden_size + block_size - 1) / block_size;
+    
+    dim3 grid(num_blocks_x, num_blocks_y);
+    dim3 threads(block_size);
+    
+    size_t shared_mem_size = 3 * hidden_size * sizeof(float);
+
+    gru_step_kernel_shared<<<grid, threads, shared_mem_size>>>(
+        x.data_ptr<float>(),
+        h_prev.data_ptr<float>(),
+        w_ih.data_ptr<float>(),
+        b_ih.data_ptr<float>(),
+        w_hh.data_ptr<float>(),
+        b_hh.data_ptr<float>(),
+        h_new.data_ptr<float>(),
+        batch_size,
+        input_size,
+        hidden_size
+    );
+
+    return h_new;
+}
+
+torch::Tensor gru_forward_cuda(
+    torch::Tensor x,       // (seq_len, batch, input_size)
+    torch::Tensor h0,      // (1, batch, hidden_size) for single layer
+    torch::Tensor w_ih,    // (3*hidden, input)
+    torch::Tensor b_ih,    // (3*hidden)
+    torch::Tensor w_hh,    // (3*hidden, hidden)
+    torch::Tensor b_hh     // (3*hidden)
+) {
+    auto seq_len = x.size(0);
+    auto batch_size = x.size(1);
+    auto input_size = x.size(2);
+    auto hidden_size = h0.size(2);
+
+    auto h_current = h0;
+    torch::Tensor output = torch::zeros({seq_len, batch_size, hidden_size}, x.options());
+
+    for (int t = 0; t < seq_len; ++t) {
+        // Extract x_t: (batch, input_size)
+        auto x_t = x[t]; 
+        
+        h_current = gru_step_cuda(x_t, h_current, w_ih, b_ih, w_hh, b_hh);
+        
+        output[t] = h_current;
+    }
+
+    return output;
+}
+"""
+
+gru_cpp_source = (
+    "torch::Tensor gru_forward_cuda(torch::Tensor x, torch::Tensor h0, torch::Tensor w_ih, torch::Tensor b_ih, torch::Tensor w_hh, torch::Tensor b_hh);"
+)
+
+# Compile the inline CUDA code
+gru_module = load_inline(
+    name="gru_custom",
+    cpp_sources=gru_cpp_source,
+    cuda_sources=gru_source,
+    functions=["gru_forward_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers=3, bias=True, batch_first=False):
+        """
+        Optimized GRU using custom CUDA operators.
+        Note: This implementation assumes num_layers=1 for the custom kernel. 
+        For multi-layer, we would need to stack calls or extend the kernel.
+        Given the complexity of multi-layer fusion in a single inline kernel, 
+        this example implements a single-layer fused GRU cell and loops over layers if needed,
+        or simply assumes num_layers=1 for the custom op demonstration.
+        
+        However, the prompt allows replacing operators. We can replace the entire nn.GRU.
+        If num_layers > 1, we can loop over layers in Python, calling the custom kernel for each layer.
+        """
+        super(ModelNew, self).__init__()
+        
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.bias = bias
+        self.batch_first = batch_first
+        
+        # Initialize weights manually to match PyTorch's GRU initialization
+        # We need w_ih, b_ih, w_hh, b_hh for each layer.
+        # For simplicity, we will store them as parameters or buffers.
+        # Since nn.GRU initializes these internally, we need to replicate that.
+        
+        self.w_ih = nn.ParameterList([nn.Parameter(torch.empty(3 * hidden_size, input_size)) for _ in range(num_layers)])
+        self.b_ih = nn.ParameterList([nn.Parameter(torch.empty(3 * hidden_size)) for _ in range(num_layers)])
+        self.w_hh = nn.ParameterList([nn.Parameter(torch.empty(3 * hidden_size, hidden_size)) for _ in range(num_layers)])
+        self.b_hh = nn.ParameterList([nn.Parameter(torch.empty(3 * hidden_size)) for _ in range(num_layers)])
+        
+        # Initialize weights similar to PyTorch's GRU
+        for layer in range(num_layers):
+            for weight in self._parameters():
+                if 'w_ih' in str(weight) or 'w_hh' in str(weight):
+                    nn.init.xavier_uniform_(weight)
+                else:
+                    nn.init.zeros_(weight)
+
+    def forward(self, x, h0):
+        """
+        :param x: (seq_len, batch, input_size)
+        :param h0: (num_layers, batch, hidden_size)
+        :return: output (seq_len, batch, hidden_size), h_n (num_layers, batch, hidden_size)
+        """
+        seq_len = x.size(0)
+        batch_size = x.size(1)
+        
+        h_n = []
+        output = torch.zeros(seq_len, batch_size, self.hidden_size, device=x.device, dtype=x.dtype)
+        
+        current_h = h0[0] # Start with the first layer's initial hidden state
+        
+        for layer in range(self.num_layers):
+            w_ih = self.w_ih[layer]
+            b_ih = self.b_ih[layer]
+            w_hh = self.w_hh[layer]
+            b_hh = self.b_hh[layer]
+            
+            # If it's not the first layer, input is the output of the previous layer
+            if layer > 0:
+                x = output
+            
+            # Call custom CUDA kernel for this layer
+            layer_output = gru_module.gru_forward_cuda(x, current_h, w_ih, b_ih, w_hh, b_hh)
+            
+            # Update h_n for this layer
+            h_n.append(layer_output[-1]) # Last time step
+            
+            # If not the last layer, prepare input for next layer
+            if layer < self.num_layers - 1:
+                x = layer_output
+            
+            output = layer_output
+        
+        h_n = torch.stack(h_n)
+        
+        return output, h_n
+
+# Note: The above ModelNew is a simplified version. 
+# In a real scenario, we would need to handle the weight initialization exactly as PyTorch does.
+# Also, the custom kernel assumes batch_first=False for x (seq_len, batch, input).
+# If batch_first=True, we would need to permute inputs/outputs.
+
+def get_inputs():
+    return [torch.rand(512, 10, 128), torch.rand((6, 10, 256))]
+
+def get_init_inputs():
+    return [128, 256, 6]
+```

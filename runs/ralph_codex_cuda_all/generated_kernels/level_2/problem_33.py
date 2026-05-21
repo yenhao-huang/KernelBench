@@ -1,0 +1,266 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+#define TILE 16
+
+__global__ void matmul_scale_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ bias,
+    const float* __restrict__ scale,
+    float* __restrict__ y,
+    int B, int K, int O
+) {
+    __shared__ float xs[TILE][TILE];
+    __shared__ float ws[TILE][TILE];
+
+    int row = blockIdx.y * TILE + threadIdx.y;
+    int col = blockIdx.x * TILE + threadIdx.x;
+
+    float acc = 0.0f;
+
+    for (int t = 0; t < K; t += TILE) {
+        int x_col = t + threadIdx.x;
+        int w_col = t + threadIdx.y;
+
+        xs[threadIdx.y][threadIdx.x] = (row < B && x_col < K) ? x[row * K + x_col] : 0.0f;
+        ws[threadIdx.y][threadIdx.x] = (col < O && w_col < K) ? w[col * K + w_col] : 0.0f;
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE; ++i) {
+            acc += xs[threadIdx.y][i] * ws[i][threadIdx.x];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < B && col < O) {
+        y[row * O + col] = (acc + bias[col]) * scale[col];
+    }
+}
+
+__global__ void mean_var_kernel(
+    const float* __restrict__ y,
+    float* __restrict__ mean,
+    float* __restrict__ invstd,
+    int B, int O,
+    float eps
+) {
+    int col = blockIdx.x;
+    int tid = threadIdx.x;
+
+    __shared__ float sum_buf[256];
+    __shared__ float sq_buf[256];
+
+    float sum = 0.0f;
+    float sq = 0.0f;
+
+    for (int r = tid; r < B; r += blockDim.x) {
+        float v = y[r * O + col];
+        sum += v;
+        sq += v * v;
+    }
+
+    sum_buf[tid] = sum;
+    sq_buf[tid] = sq;
+    __syncthreads();
+
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sum_buf[tid] += sum_buf[tid + stride];
+            sq_buf[tid] += sq_buf[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float m = sum_buf[0] / (float)B;
+        float var = sq_buf[0] / (float)B - m * m;
+        var = fmaxf(var, 0.0f);
+        mean[col] = m;
+        invstd[col] = rsqrtf(var + eps);
+    }
+}
+
+__global__ void bn_train_apply_kernel(
+    const float* __restrict__ y,
+    const float* __restrict__ mean,
+    const float* __restrict__ invstd,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    float* __restrict__ running_mean,
+    float* __restrict__ running_var,
+    float* __restrict__ out,
+    int total, int B, int O,
+    float momentum
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        int col = idx % O;
+        out[idx] = (y[idx] - mean[col]) * invstd[col] * gamma[col] + beta[col];
+    }
+
+    int col = idx;
+    if (col < O) {
+        float inv = invstd[col];
+        float var_biased = 1.0f / (inv * inv);
+        float var_unbiased = var_biased * ((float)B / (float)(B - 1));
+        running_mean[col] = (1.0f - momentum) * running_mean[col] + momentum * mean[col];
+        running_var[col] = (1.0f - momentum) * running_var[col] + momentum * var_unbiased;
+    }
+}
+
+__global__ void bn_eval_apply_kernel(
+    const float* __restrict__ y,
+    const float* __restrict__ running_mean,
+    const float* __restrict__ running_var,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    float* __restrict__ out,
+    int total, int O,
+    float eps
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        int col = idx % O;
+        float inv = rsqrtf(running_var[col] + eps);
+        out[idx] = (y[idx] - running_mean[col]) * inv * gamma[col] + beta[col];
+    }
+}
+
+torch::Tensor gemm_scale_bn_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor scale,
+    torch::Tensor bn_weight,
+    torch::Tensor bn_bias,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    bool training,
+    double momentum,
+    double eps
+) {
+    int B = x.size(0);
+    int K = x.size(1);
+    int O = weight.size(0);
+
+    auto y = torch::empty({B, O}, x.options());
+    auto out = torch::empty({B, O}, x.options());
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    dim3 block(TILE, TILE);
+    dim3 grid((O + TILE - 1) / TILE, (B + TILE - 1) / TILE);
+    matmul_scale_kernel<<<grid, block, 0, stream>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        scale.data_ptr<float>(),
+        y.data_ptr<float>(),
+        B, K, O
+    );
+
+    int total = B * O;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+
+    if (training) {
+        auto mean = torch::empty({O}, x.options());
+        auto invstd = torch::empty({O}, x.options());
+
+        mean_var_kernel<<<O, 256, 0, stream>>>(
+            y.data_ptr<float>(),
+            mean.data_ptr<float>(),
+            invstd.data_ptr<float>(),
+            B, O,
+            (float)eps
+        );
+
+        bn_train_apply_kernel<<<blocks, threads, 0, stream>>>(
+            y.data_ptr<float>(),
+            mean.data_ptr<float>(),
+            invstd.data_ptr<float>(),
+            bn_weight.data_ptr<float>(),
+            bn_bias.data_ptr<float>(),
+            running_mean.data_ptr<float>(),
+            running_var.data_ptr<float>(),
+            out.data_ptr<float>(),
+            total, B, O,
+            (float)momentum
+        );
+    } else {
+        bn_eval_apply_kernel<<<blocks, threads, 0, stream>>>(
+            y.data_ptr<float>(),
+            running_mean.data_ptr<float>(),
+            running_var.data_ptr<float>(),
+            bn_weight.data_ptr<float>(),
+            bn_bias.data_ptr<float>(),
+            out.data_ptr<float>(),
+            total, O,
+            (float)eps
+        );
+    }
+
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor gemm_scale_bn_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor scale,
+    torch::Tensor bn_weight,
+    torch::Tensor bn_bias,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    bool training,
+    double momentum,
+    double eps
+);
+"""
+
+gemm_scale_bn = load_inline(
+    name="gemm_scale_bn_inline_kernelbench",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["gemm_scale_bn_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+    extra_cflags=["-O3"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, scale_shape, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        self.bn = nn.BatchNorm1d(out_features, eps=eps, momentum=momentum)
+        self.op = gemm_scale_bn
+
+    def forward(self, x):
+        return self.op.gemm_scale_bn_cuda(
+            x,
+            self.gemm.weight,
+            self.gemm.bias,
+            self.scale,
+            self.bn.weight,
+            self.bn.bias,
+            self.bn.running_mean,
+            self.bn.running_var,
+            self.training,
+            self.bn.momentum,
+            self.bn.eps,
+        )

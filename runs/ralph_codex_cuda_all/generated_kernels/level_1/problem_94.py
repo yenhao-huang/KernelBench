@@ -1,0 +1,90 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+mse_reduce_cpp_source = """
+torch::Tensor mse_reduce_cuda(torch::Tensor predictions, torch::Tensor targets);
+"""
+
+mse_reduce_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
+
+__global__ void mse_sum_kernel(const float* __restrict__ predictions,
+                               const float* __restrict__ targets,
+                               float* __restrict__ sum_out,
+                               long long n) {
+    __shared__ float shared[256];
+
+    int tid = threadIdx.x;
+    long long idx = (long long)blockIdx.x * blockDim.x + tid;
+    long long stride = (long long)blockDim.x * gridDim.x;
+
+    float local_sum = 0.0f;
+
+    for (long long i = idx; i < n; i += stride) {
+        float d = predictions[i] - targets[i];
+        local_sum += d * d;
+    }
+
+    shared[tid] = local_sum;
+    __syncthreads();
+
+    for (int offset = 128; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            shared[tid] += shared[tid + offset];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        atomicAdd(sum_out, shared[0]);
+    }
+}
+
+__global__ void mse_finalize_kernel(float* __restrict__ sum_out, float inv_n) {
+    sum_out[0] *= inv_n;
+}
+
+torch::Tensor mse_reduce_cuda(torch::Tensor predictions, torch::Tensor targets) {
+    auto out = torch::empty({}, predictions.options());
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaMemsetAsync(out.data_ptr<float>(), 0, sizeof(float), stream);
+
+    long long n = predictions.numel();
+    const int threads = 256;
+    int blocks = 4096;
+
+    mse_sum_kernel<<<blocks, threads, 0, stream>>>(
+        predictions.data_ptr<float>(),
+        targets.data_ptr<float>(),
+        out.data_ptr<float>(),
+        n
+    );
+
+    mse_finalize_kernel<<<1, 1, 0, stream>>>(out.data_ptr<float>(), 1.0f / (float)n);
+
+    return out;
+}
+"""
+
+mse_reduce = load_inline(
+    name="mse_reduce_inline_cuda",
+    cpp_sources=mse_reduce_cpp_source,
+    cuda_sources=mse_reduce_cuda_source,
+    functions=["mse_reduce_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.mse_reduce = mse_reduce
+
+    def forward(self, predictions, targets):
+        return self.mse_reduce.mse_reduce_cuda(predictions, targets)

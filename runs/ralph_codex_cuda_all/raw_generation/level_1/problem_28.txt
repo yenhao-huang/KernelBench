@@ -1,0 +1,101 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+hardsigmoid_cpp_source = """
+torch::Tensor hardsigmoid_cuda(torch::Tensor x);
+"""
+
+hardsigmoid_cuda_source = """
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <cuda_runtime.h>
+
+__device__ __forceinline__ float hs_f32(float v) {
+    v = v + 3.0f;
+    v = fminf(fmaxf(v, 0.0f), 6.0f);
+    return v * 0.16666666666666666f;
+}
+
+__global__ void hardsigmoid_vec4_kernel(const float4* __restrict__ x,
+                                        float4* __restrict__ y,
+                                        long long n4) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n4) {
+        float4 v = x[idx];
+        v.x = hs_f32(v.x);
+        v.y = hs_f32(v.y);
+        v.z = hs_f32(v.z);
+        v.w = hs_f32(v.w);
+        y[idx] = v;
+    }
+}
+
+__global__ void hardsigmoid_tail_kernel(const float* __restrict__ x,
+                                        float* __restrict__ y,
+                                        long long start,
+                                        long long n) {
+    long long idx = start + (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        y[idx] = hs_f32(x[idx]);
+    }
+}
+
+torch::Tensor hardsigmoid_cuda(torch::Tensor x) {
+    const c10::cuda::CUDAGuard device_guard(x.device());
+    auto y = torch::empty_like(x);
+
+    long long n = x.numel();
+    if (n == 0) {
+        return y;
+    }
+
+    const int threads = 256;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    long long n4 = n >> 2;
+    if (n4 > 0) {
+        int blocks4 = (int)((n4 + threads - 1) / threads);
+        hardsigmoid_vec4_kernel<<<blocks4, threads, 0, stream>>>(
+            reinterpret_cast<const float4*>(x.data_ptr<float>()),
+            reinterpret_cast<float4*>(y.data_ptr<float>()),
+            n4
+        );
+    }
+
+    long long tail_start = n4 << 2;
+    if (tail_start < n) {
+        int blocks = (int)(((n - tail_start) + threads - 1) / threads);
+        hardsigmoid_tail_kernel<<<blocks, threads, 0, stream>>>(
+            x.data_ptr<float>(),
+            y.data_ptr<float>(),
+            tail_start,
+            n
+        );
+    }
+
+    return y;
+}
+"""
+
+_hardsigmoid_ext = load_inline(
+    name="custom_hardsigmoid_fp32_ext",
+    cpp_sources=hardsigmoid_cpp_source,
+    cuda_sources=hardsigmoid_cuda_source,
+    functions=["hardsigmoid_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.hardsigmoid = _hardsigmoid_ext
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.hardsigmoid.hardsigmoid_cuda(x)
+```

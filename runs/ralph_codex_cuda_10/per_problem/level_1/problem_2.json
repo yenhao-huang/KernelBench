@@ -1,0 +1,19 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 29.708,
+  "generated_kernel_path": "runs/ralph_codex_cuda_10/generated_kernels/level_1/problem_2.py",
+  "level": 1,
+  "model_name": "codex-gpt-5.5",
+  "precision": "fp32",
+  "problem_id": 2,
+  "problem_name": "2_Standard_matrix_multiplication_.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_codex_cuda_10/raw_generation/level_1/problem_2.txt",
+  "static_errors": [
+    "Missing __global__ kernel definition"
+  ],
+  "static_warnings": [
+    "Uses torch computation op: torch.matmul"
+  ],
+  "status": "static_failed"
+}

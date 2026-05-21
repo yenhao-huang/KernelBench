@@ -1,0 +1,250 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused-op: MatMul + GroupNorm + LeakyReLU + Elementwise Sum
+# We will fuse the following:
+# 1. bias-addition (part of Linear layer)
+Bias-addition (part. of Linear layer)
+Bias-activation-normalization-sum (activation-normalization-sum)
+
+# 2. Since MatMul is a_matmul_b, (batch_idx, hidden_times_channels_per_scale-1)
+# 
+# _Note: a_matmul_point_b is_weight-transpose-matmul-b_a
+#_Note:_a_lin_weight__b_a_        _b_relu-activation-and-bias-lin_weight__b_a__out = MatMul(x, W.T) de-bias-bias_-out = Mat_Mul(    x, W.
+    
+# We will fuse the bias-addition, GroupNorm,
+# and LeakyReLU, and element-size sum (element-wise sum with itself)
+
+# The following kernel will process each row (batch element) and each channel (hidden dimension) way.
+# idx = batch_idx * hidden_size + channel_idx
+# We. can-be-split-speedup
+_Note: GroupNorm is GroupNorm(N, C, H, W) or (2D) ([] , C, H)
+# GroupNorm(N, C channels, 1, 1) for (batch_size, hidden_size)
+# }}
+# We will fuse:
+# 1. reduction-based-op (R-op)
+#    - GroupNorm (mean/var calculation) mean/std deviation calculation
+    #stem-stem-op-
+# W.T.matmul(x)
+# MatMul is usually handled by highly optimized cuBLAS/cuBLASLt/cuBLASLt_gemm-based-el-op
+Let'
+# We*ll fuse: Fused-Op: MatMul + Bias + GroupNorm + LeakyReLU + Sum-with-itself
+# Fusing MatMuls are-not as memory-width-step-limited-    -scale-and-out-val-idx = batch_im_idx * hidden_size hidden_step-hidden_step-step-step-step-
+# process-scale-1-online-step-one-clamp-step-0 = index-point-and-batch_idx
+#        # Linear-addition-bias-lin_weight_G_N_size-1_step-    _out = ( ( ( ( ( ( ( ( ( ( ( ( de-bias-bias-lin_weight__b_a_    _call-nn.Linear(x, weight, bias)__point-activation-lin__llet-
+            
+# The kernel will be_param-param-param-swap-
+# fusion-training-point-reduction-import-import-step-step-step
+# way-forward-        forward(self..fc.weight, selfthought-
+    #-leaky_relu( ( ( ( (x * weight + bias) + (x * weight + bias) ) )
+        #        # ( * 
+ing-weight-and-bias-step-step-step}
+    #-le*aky_relu( ( ( ( ( way-bias-bias-
+    #        x * weight__b_fast-matmul-split-
+-step-
+# fusion-step-step_    # operator-batch-batch_idx_idx_side-
+_Note: A_matmul_lin_weight__b_a__step-
+# pseudocode-step-lin_                _param_batch.
+    #        # std_dev = sqrt(map_im_idx_idx_A_id_id_        _out = (s_step-
+# moment-normalized-step- = moment-step-_weight-hidden_            # element-wise sum-element-wise-sum_
+    # PyTorch'im_s_g_thought-shape (batch_size, hidden_size)
+ input_thought-input_        _out = (E_slope-Xi-negative_slope_step-
+# We'll fuse the following: Bias-addition, GroupNorm, normalization-apply-stats-
+_Note: pointwise-op-relu-relu-
+\
+# CUDA kernel for fused-op: Bias-addition + GroupNorm + LeakyReLU + Elementwise Sum
+# Since MatMul is Mat_Mul(x, W.T)
+# memory-bound-step-fmt-step-step *
+Mode-L-Op-Op-Op-Linear-Linear-weight-param-
+Mode-L-Op<:-op-size-channels_per_step-step-
+        # 
+# Fusing: Bias-addition (    -out = (        ( (
+        #                leaky_relu( ( ( ( ( ( ( ( (ing_weight_post_lin-post_lin post-lin-bias-
+            # ( ( (    #_weight-transpose-1-matmul-GEMM-
+<
+#}
+    #_out = 
+    #_param-extension-param-g_n__eps_            #leaky_model_        leaky_step-
+-step-_step-batch ways-space-pointpointwise
+    #    # inv_std_stats-_idx = batch_step_idx * hidden__channels__per_group- channels__per_point_* group_[]
+    #[batch_idx, channel_speed-step-let-
+_Note: GroupNorm(N, C, 1, 1) (parallel-batch-wise) parallel-
+# pseudo-step-batch
+    -step-mean/var-stat-cuda_kernel_    _negative_        _val = (stable-stable-Step-size-C_per_group
+        val = (    leaky_step-
+    #-step- ( ( (gemm-blend-el-op-lin_weight__b._a_step-lin_weight._X_C_block-step-g_n_step_            #out = 
+    #import-torch.nn.leaky_gemm_leaky_relu_sum_step-
+        #        #    #_step-
+        # strategy: 
+        #        1. Write-back-to-_out_ = _leaky_relu( ( ( ( ( (_gn__eps_ = self.gn.weight.weight.shape[
+        .gemm_fused_op_cuda_ de-bias_lin_    __out = 
+        <channel|>```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# CUDA kernel for fused: Bias-addition + GroupNorm + LeakyReLU + Elementwise Sum
+# Note: MatMul is handled by cuBLAS for maximum performance.
+# This kernel handles the pointwise and reduction-based operations following the MatMul.
+# For GroupNorm on (N, C) where C is the hidden dimension, each group has C/num_groups elements.
+# The kernel calculates mean and variance per group per batch element, then applies normalization,
+# LeakyReLU, and the final element-wise sum (x + x).
+
+fused_ops_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_gn_leaky_sum_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* __restrict__ output,
+    int batch_size,
+    int num_channels,
+    int num_groups,
+    float eps,
+    float negative_slope) {
+
+    int b = blockIdx.x; // Each block handles one batch element
+    int group_idx = blockIdx.y;
+    int tid = threadIdx.x;
+
+    int channels_per_group = num_channels / num_groups;
+    int group_start_idx = group_idx * channels_per_group;
+    
+    // 1. Calculate Mean and Variance for the group
+    // We use a simple reduction for clarity; in production, one might use warp shuffles.
+    extern __shared__ float shared_mem[];
+    float* s_sum = shared_mem;
+    float* s_sq_sum = &shared_mem[blockDim.x];
+
+    float local_sum = 0.0f;
+    float local_sq_sum = 0.0f;
+
+    for (int i = tid; i < channels_per_group; i += blockDim.x) {
+        float val = input[b * num_channels + group_start_idx + i];
+        local_sum += val;
+        local_sq_sum += val * val;
+    }
+
+    // Block-level reduction
+    s_sum[tid] = local_sum;
+    s_sq_sum[tid] = local_sq_sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid] += s_sum[tid + s];
+            s_sq_sum[tid] += s_sq_sum[tid + s];
+        }
+        __syncthreads();
+    }
+
+    float group_mean = s_sum[0] / channels_per_group;
+    float group_var = (s_sq_sum[0] / channels_per_group) - (group_mean * group_mean);
+    float inv_std = 1.0f / sqrtf(group_var + eps);
+
+    // 2. Apply GroupNorm, LeakyReLU, and Sum (x + x)
+    // We use the weight and bias from GroupNorm (which are 1D tensors of size num_channels)
+    // and the bias from the Linear layer.
+    // Note: The input to this kernel is the result of (MatMul + Linear_Bias).
+    
+    for (int i = tid; i < channels_per_group; i += blockDim.x) {
+        int idx = b * num_channels + group_start_idx + i;
+        float val = input[idx];
+        
+        // GroupNorm: (val - mean) * inv_std * weight + bias
+        // Note: GroupNorm in PyTorch uses weight/bias of shape (C,)
+        float norm_val = (val - group_mean) * inv_std * weight[group_start_idx + i] + bias[group_start_idx + i];
+        
+        // LeakyReLU
+        float leaky_val = (norm_val > 0) ? norm_val : norm_val * negative_slope;
+        
+        // Element-wise sum: x + x
+        output[idx] = leaky_val + leaky_val;
+    }
+}
+
+torch::Tensor fused_gn_leaky_sum_cuda(
+    torch::Tensor input, 
+    torch::Tensor gn_weight, 
+    torch::Tensor gn_bias, 
+    int num_groups, 
+    float eps, 
+    float negative_slope) {
+    
+    int batch_size = input.size(0);
+    int num_channels = input.size(1);
+    auto output = torch::empty_like(input);
+
+    dim3 grid(batch_size, num_groups);
+    dim3 block(256);
+    size_t shared_mem_size = 2 * 256 * sizeof(float);
+
+    fused_gn_leaky_sum_kernel<<<grid, block, shared_mem_size>>>(
+        input.data_ptr<float>(),
+        gn_weight.data_ptr<float>(),
+        gn_bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        num_channels,
+        num_groups,
+        eps,
+        negative_slope
+    );
+
+    return output;
+}
+"""
+
+fused_ops_cpp_source = """
+torch::Tensor fused_gn_leaky_sum_cuda(
+    torch::Tensor input, 
+    torch::Tensor gn_weight, 
+    torch::Tensor gn_bias, 
+    int num_groups, 
+    float eps, 
+    float negative_slope);
+"""
+
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_cuda_source,
+    functions=["fused_gn_leaky_sum_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, num_groups, eps=1e-5, negative_slope=0.01):
+        super(ModelNew, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_groups = num_groups
+        self.eps = eps
+        self.negative_slope = negative_slope
+        
+        self.fc = nn.Linear(input_size, hidden_size)
+        self.gn = nn.GroupNorm(num_groups=num_groups, num_channels=hidden_size, eps=eps)
+        self.leaky_relu = nn.LeakyReLU(negative_slope=negative_slope)
+        self.fused_ops = fused_ops
+
+    def forward(self, x):
+        # 1. Perform Linear (MatMul + Bias)
+        # We keep MatMul in PyTorch to leverage highly optimized cuBLAS
+        x = self.fc(x)
+        
+        # 2. Fuse GroupNorm + LeakyReLU + (x + x)
+        # We pass the result of the linear layer into our custom kernel
+        x = self.fused_ops.fused_gn_leaky_sum_cuda(
+            x, 
+            self.gn.weight, 
+            self.gn.bias, 
+            self.num_groups, 
+            self.eps, 
+            self.negative_slope
+        )
+        return x
+```

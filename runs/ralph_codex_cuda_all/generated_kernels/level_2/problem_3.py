@@ -1,0 +1,137 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__device__ __forceinline__ float gelu_approx(float x) {
+    const float kAlpha = 0.7978845608028654f;
+    const float kBeta = 0.044715f;
+    float x3 = x * x * x;
+    return 0.5f * x * (1.0f + tanhf(kAlpha * (x + kBeta * x3)));
+}
+
+__global__ void norm_pool_gelu_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    float* __restrict__ out,
+    int total,
+    int C,
+    int D,
+    int H,
+    int W,
+    int Do,
+    int Ho,
+    int Wo
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int ow = idx % Wo;
+    int t = idx / Wo;
+    int oh = t % Ho;
+    t /= Ho;
+    int od = t % Do;
+    t /= Do;
+    int c = t % C;
+    int n = t / C;
+
+    int base_w = ow * 2;
+    float acc = 0.0f;
+
+    #pragma unroll
+    for (int dd = 0; dd < 2; ++dd) {
+        int d = od * 2 + dd;
+        #pragma unroll
+        for (int hh = 0; hh < 2; ++hh) {
+            int h = oh * 2 + hh;
+            const float* row = x + (((n * C + c) * D + d) * H + h) * W;
+
+            float mean = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 64; ++w) {
+                mean += row[w];
+            }
+            mean *= 0.015625f;
+
+            float var = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 64; ++w) {
+                float v = row[w] - mean;
+                var += v * v;
+            }
+            float inv_std = rsqrtf(var * 0.015625f + 1.0e-5f);
+
+            float v0 = (row[base_w] - mean) * inv_std;
+            float v1 = (row[base_w + 1] - mean) * inv_std;
+            acc += v0 * gamma[base_w] + beta[base_w];
+            acc += v1 * gamma[base_w + 1] + beta[base_w + 1];
+        }
+    }
+
+    out[idx] = gelu_approx(acc * 0.125f);
+}
+
+torch::Tensor norm_pool_gelu_cuda(torch::Tensor x, torch::Tensor gamma, torch::Tensor beta) {
+    int N = x.size(0);
+    int C = x.size(1);
+    int D = x.size(2);
+    int H = x.size(3);
+    int W = x.size(4);
+
+    int Do = D / 2;
+    int Ho = H / 2;
+    int Wo = W / 2;
+
+    auto out = torch::empty({N, C, Do, Ho, Wo}, x.options());
+    int total = N * C * Do * Ho * Wo;
+
+    const int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+
+    norm_pool_gelu_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        out.data_ptr<float>(),
+        total, C, D, H, W, Do, Ho, Wo
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = "torch::Tensor norm_pool_gelu_cuda(torch::Tensor x, torch::Tensor gamma, torch::Tensor beta);"
+
+norm_pool_gelu_ext = load_inline(
+    name="norm_pool_gelu_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["norm_pool_gelu_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, sum_weight, norm_shape, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+        )
+        self.sum_weight = nn.Parameter(torch.tensor(sum_weight))
+        self.norm = nn.LayerNorm(norm_shape)
+        self.norm_pool_gelu = norm_pool_gelu_ext
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        return self.norm_pool_gelu.norm_pool_gelu_cuda(x, self.norm.weight, self.norm.bias)

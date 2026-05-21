@@ -1,0 +1,17 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 58.603,
+  "generated_kernel_path": "runs/ralph_gemma4_cuda_all/generated_kernels/level_4/problem_2.py",
+  "level": 4,
+  "model_name": "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
+  "precision": "fp32",
+  "problem_id": 2,
+  "problem_name": "2_facebook-opt-1p3b_bs1_seq2047.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_gemma4_cuda_all/raw_generation/level_4/problem_2.txt",
+  "static_errors": [
+    "Missing __global__ kernel definition"
+  ],
+  "static_warnings": [],
+  "status": "static_failed"
+}

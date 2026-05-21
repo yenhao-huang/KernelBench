@@ -1,0 +1,163 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+conv_transpose2d_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void conv_transpose2d_3x7_s1p_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ y,
+    int N, int IC, int IH, int IW, int OC,
+    int OH, int OW, int pad_h, int pad_w,
+    int has_bias
+) {
+    int ow4 = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    int oh = blockIdx.y * blockDim.y + threadIdx.y;
+    int noc = blockIdx.z;
+    int n = noc / OC;
+    int oc = noc - n * OC;
+
+    if (n >= N || oh >= OH || ow4 >= OW) return;
+
+    float acc0 = has_bias ? b[oc] : 0.0f;
+    float acc1 = acc0;
+    float acc2 = acc0;
+    float acc3 = acc0;
+
+    #pragma unroll
+    for (int ic = 0; ic < 32; ++ic) {
+        if (ic >= IC) break;
+
+        #pragma unroll
+        for (int kh = 0; kh < 3; ++kh) {
+            int ih = oh + pad_h - kh;
+            if ((unsigned)ih >= (unsigned)IH) continue;
+
+            #pragma unroll
+            for (int kw = 0; kw < 7; ++kw) {
+                int iw0 = ow4 + pad_w - kw;
+                float ww = w[((ic * OC + oc) * 3 + kh) * 7 + kw];
+                const float* xp = x + ((n * IC + ic) * IH + ih) * IW;
+
+                if ((unsigned)iw0 < (unsigned)IW) acc0 += xp[iw0] * ww;
+                int iw1 = iw0 + 1;
+                if ((unsigned)iw1 < (unsigned)IW && ow4 + 1 < OW) acc1 += xp[iw1] * ww;
+                int iw2 = iw0 + 2;
+                if ((unsigned)iw2 < (unsigned)IW && ow4 + 2 < OW) acc2 += xp[iw2] * ww;
+                int iw3 = iw0 + 3;
+                if ((unsigned)iw3 < (unsigned)IW && ow4 + 3 < OW) acc3 += xp[iw3] * ww;
+            }
+        }
+    }
+
+    float* yp = y + ((n * OC + oc) * OH + oh) * OW + ow4;
+    yp[0] = acc0;
+    if (ow4 + 1 < OW) yp[1] = acc1;
+    if (ow4 + 2 < OW) yp[2] = acc2;
+    if (ow4 + 3 < OW) yp[3] = acc3;
+}
+
+torch::Tensor conv_transpose2d_3x7_s1p_cuda(
+    torch::Tensor x,
+    torch::Tensor w,
+    torch::Tensor bias,
+    int pad_h,
+    int pad_w,
+    bool has_bias
+) {
+    int N = x.size(0);
+    int IC = x.size(1);
+    int IH = x.size(2);
+    int IW = x.size(3);
+    int OC = w.size(1);
+    int KH = w.size(2);
+    int KW = w.size(3);
+    int OH = IH - 2 * pad_h + KH - 1;
+    int OW = IW - 2 * pad_w + KW - 1;
+
+    auto y = torch::empty({N, OC, OH, OW}, x.options());
+
+    dim3 block(32, 4);
+    dim3 grid((OW + 127) / 128, (OH + block.y - 1) / block.y, N * OC);
+
+    conv_transpose2d_3x7_s1p_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        w.data_ptr<float>(),
+        has_bias ? bias.data_ptr<float>() : nullptr,
+        y.data_ptr<float>(),
+        N, IC, IH, IW, OC, OH, OW, pad_h, pad_w,
+        has_bias ? 1 : 0
+    );
+
+    return y;
+}
+"""
+
+conv_transpose2d_cpp = """
+torch::Tensor conv_transpose2d_3x7_s1p_cuda(
+    torch::Tensor x,
+    torch::Tensor w,
+    torch::Tensor bias,
+    int pad_h,
+    int pad_w,
+    bool has_bias
+);
+"""
+
+conv_transpose2d_ext = load_inline(
+    name="conv_transpose2d_3x7_s1p_ext",
+    cpp_sources=conv_transpose2d_cpp,
+    cuda_sources=conv_transpose2d_source,
+    functions=["conv_transpose2d_3x7_s1p_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: tuple,
+        stride: tuple = (1, 1),
+        padding: tuple = (0, 0),
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(in_channels, out_channels, kernel_size[0], kernel_size[1]))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_channels))
+        else:
+            self.register_parameter("bias", None)
+        self.padding = padding
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        tmp = nn.ConvTranspose2d(
+            self.weight.shape[0],
+            self.weight.shape[1],
+            (self.weight.shape[2], self.weight.shape[3]),
+            stride=(1, 1),
+            padding=self.padding,
+            bias=self.bias is not None,
+        )
+        with torch.no_grad():
+            self.weight.copy_(tmp.weight)
+            if self.bias is not None:
+                self.bias.copy_(tmp.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bias = self.bias if self.bias is not None else torch.empty(0, device=x.device, dtype=x.dtype)
+        return conv_transpose2d_ext.conv_transpose2d_3x7_s1p_cuda(
+            x.contiguous(),
+            self.weight.contiguous(),
+            bias,
+            self.padding[0],
+            self.padding[1],
+            self.bias is not None,
+        )

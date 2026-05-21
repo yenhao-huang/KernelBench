@@ -1,0 +1,220 @@
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernels for fused operations:
+# 1. ConvTranspose3d + Scale + BatchNorm + GlobalAvgPool
+# We will implement a single fused kernel that performs the entire forward pass 
+# to minimize memory bandwidth overhead and launch overheads.
+# Note: Implementing a full generic ConvTranspose3d in inline CUDA is complex.
+# Instead, we will optimize the post-processing steps (Scale, BatchNorm, GAP) 
+# which are often bottlenecks or can be fused efficiently, while keeping the 
+# heavy conv transpose as PyTorch's optimized cuDNN implementation if possible, 
+# OR we can implement a simplified version if the kernel size is small.
+# However, for maximum speedup in this specific chain, fusing Scale, BatchNorm, and GAP 
+# into a single kernel after the ConvTranspose3d is a strong candidate.
+# Let's fuse: Element-wise Multiply (Scale), BatchNorm (Running Mean/Var), and Global Avg Pool.
+
+fused_post_conv_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper for atomic add if needed, but here we use reduction patterns
+__device__ float warpReduceSum(float val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+// Kernel to perform: 
+// 1. Scale: x = x * scale_factor
+// 2. BatchNorm (Inference mode): x = (x - running_mean) / sqrt(running_var + eps)
+// 3. Global Average Pooling over H, W, D dimensions for each channel and batch item.
+// Output shape: [B, C, 1, 1, 1]
+
+__global__ void fused_scale_bn_gap_kernel(
+    const float* input,      // [B, C, D, H, W]
+    const float* running_mean, // [C]
+    const float* running_var,  // [C]
+    const float* weight,       // [C] (gamma) - optional, if present in BN
+    const float* bias,         // [C] (beta) - optional, if present in BN
+    const float scale_factor,
+    const float eps,
+    float* output,             // [B, C, 1, 1, 1]
+    int B, int C, int D, int H, int W
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = B * C;
+
+    if (idx >= total_elements) return;
+
+    int b = idx / C;
+    int c = idx % C;
+
+    // Calculate the stride for each batch/channel block in input
+    // Input layout: [B, C, D, H, W] -> contiguous
+    // Element at (b, c, d, h, w) is at index: b*(C*D*H*W) + c*(D*H*W) + d*(H*W) + h*W + w
+    
+    float sum = 0.0f;
+    
+    // Iterate over spatial dimensions D, H, W to compute global average
+    int spatial_size = D * H * W;
+    for (int i = 0; i < spatial_size; ++i) {
+        // We can optimize this loop by mapping linear index to d,h,w if needed, 
+        // but simple iteration is fine for correctness.
+        // To avoid complex indexing math inside the kernel which might be slow,
+        // we assume contiguous memory access pattern.
+        // Index in input tensor for (b, c, i) where i is flattened spatial index
+        int input_idx = b * (C * spatial_size) + c * spatial_size + i;
+        sum += input[input_idx];
+    }
+
+    float mean = sum / static_cast<float>(spatial_size);
+
+    // Apply Batch Normalization: (x - mean) * gamma / sqrt(var + eps) + beta
+    // Note: The input 'input' here is the output of ConvTranspose3d.
+    // We need to apply scale_factor first? 
+    // The prompt says: conv -> scale -> bn -> gap.
+    // So we should scale the mean before BN, or scale the values before averaging.
+    // Scaling is linear: mean(x * s) = mean(x) * s.
+    
+    float scaled_mean = mean * scale_factor;
+
+    // Retrieve BN parameters
+    float gamma = (weight != nullptr) ? weight[c] : 1.0f;
+    float beta = (bias != nullptr) ? bias[c] : 0.0f;
+    float rstd = rsqrtf(running_var[c] + eps);
+
+    // The output of BN for the averaged value is:
+    // (scaled_mean - running_mean[c]) * gamma * rstd + beta
+    
+    float bn_out = (scaled_mean - running_mean[c]) * gamma * rstd + beta;
+
+    // Write to output [B, C, 1, 1, 1]
+    int out_idx = b * C + c;
+    output[out_idx] = bn_out;
+}
+
+torch::Tensor fused_scale_bn_gap_cuda(
+    torch::Tensor input,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    float scale_factor,
+    float eps
+) {
+    auto B = input.size(0);
+    auto C = input.size(1);
+    auto D = input.size(2);
+    auto H = input.size(3);
+    auto W = input.size(4);
+
+    auto output = torch::zeros({B, C, 1, 1, 1}, input.options());
+
+    const int block_size = 256;
+    const int total_elements = B * C;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    // Check if weight/bias are empty or None-like (empty tensors in PyTorch C++ API often have size 0)
+    float* w_ptr = (weight.numel() > 0) ? weight.data_ptr<float>() : nullptr;
+    float* b_ptr = (bias.numel() > 0) ? bias.data_ptr<float>() : nullptr;
+
+    fused_scale_bn_gap_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        running_mean.data_ptr<float>(),
+        running_var.data_ptr<float>(),
+        w_ptr,
+        b_ptr,
+        scale_factor,
+        eps,
+        output.data_ptr<float>(),
+        B, C, D, H, W
+    );
+
+    return output;
+}
+"""
+
+fused_post_conv_cpp_source = (
+    "torch::Tensor fused_scale_bn_gap_cuda("
+    "torch::Tensor input,"
+    "torch::Tensor running_mean,"
+    "torch::Tensor running_var,"
+    "torch::Tensor weight,"
+    "torch::Tensor bias,"
+    "float scale_factor,"
+    "float eps"
+    ");"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_scale_bn_gap",
+    cpp_sources=fused_post_conv_cpp_source,
+    cuda_sources=fused_post_conv_source,
+    functions=["fused_scale_bn_gap_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model using custom CUDA operator for the post-convolution steps:
+    Scale, BatchNorm (inference), and Global Average Pooling.
+    The ConvTranspose3d is left to PyTorch's optimized cuDNN implementation 
+    as writing a generic high-performance transposed conv in inline CUDA is 
+    extremely complex and error-prone without external libraries like CUTLASS.
+    However, fusing the subsequent element-wise and reduction operations 
+    saves significant memory bandwidth and kernel launch overheads.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, scale_factor, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        # Keep the original conv transpose layer
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size)
+        self.scale_factor = scale_factor
+        
+        # BatchNorm parameters are needed for the custom kernel
+        self.bn = nn.BatchNorm3d(out_channels, eps=eps, momentum=momentum)
+        
+        # We don't need the standard GAP layer anymore as it's fused into the CUDA kernel
+
+    def forward(self, x):
+        # 1. ConvTranspose3d (Optimized by cuDNN in PyTorch)
+        x = self.conv_transpose(x)
+        
+        # 2. Fused Scale, BatchNorm, and Global Average Pooling via Custom CUDA Kernel
+        # Get BN running stats and parameters
+        running_mean = self.bn.running_mean
+        running_var = self.bn.running_var
+        weight = self.bn.weight
+        bias = self.bn.bias
+        
+        # Call the custom fused kernel
+        x = fused_ops.fused_scale_bn_gap_cuda(
+            x,
+            running_mean,
+            running_var,
+            weight,
+            bias,
+            self.scale_factor,
+            self.bn.eps
+        )
+        
+        return x
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.rand(batch_size, in_channels, depth, height, width)
+    return [a]
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return [in_channels, out_channels, kernel_size, scale_factor]
+```

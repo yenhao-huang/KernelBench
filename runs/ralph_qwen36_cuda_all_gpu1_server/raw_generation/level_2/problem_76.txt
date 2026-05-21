@@ -1,0 +1,160 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for GEMM + Bias Add + ReLU fusion
+# This kernel performs: out = max(0, x @ W^T + b)
+# We assume x is (batch, in_features), W is (out_features, in_features), b is (out_features,)
+# Output is (batch, out_features)
+
+custom_kernel_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+__global__ void fused_gemm_bias_relu_kernel(
+    const float* __restrict__ x,      // [batch_size, in_features]
+    const float* __restrict__ w,      // [out_features, in_features]
+    const float* __restrict__ bias,   // [out_features]
+    float* __restrict__ out,          // [batch_size, out_features]
+    int batch_size,
+    int in_features,
+    int out_features) 
+{
+    // Each thread block handles one output element (one neuron for one sample)
+    // However, to optimize memory access and compute, we often use a 2D grid mapping.
+    // Let's map each thread to one output element: (batch_idx, out_idx)
+    
+    int batch_idx = blockIdx.y;
+    int out_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch_idx >= batch_size || out_idx >= out_features) {
+        return;
+    }
+
+    float sum = 0.0f;
+    
+    // Load weights and input, perform dot product
+    // x is row-major: x[batch_idx * in_features + i]
+    // w is row-major: w[out_idx * in_features + i]
+    for (int i = 0; i < in_features; ++i) {
+        sum += x[batch_idx * in_features + i] * w[out_idx * in_features + i];
+    }
+
+    // Add bias and apply ReLU
+    float val = sum + bias[out_idx];
+    if (val < 0.0f) {
+        val = 0.0f;
+    }
+    
+    out[batch_idx * out_features + out_idx] = val;
+}
+
+torch::Tensor fused_gemm_bias_relu_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor bias) {
+    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+    TORCH_CHECK(w.is_cuda(), "w must be a CUDA tensor");
+    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
+    
+    auto batch_size = x.size(0);
+    auto in_features = x.size(1);
+    auto out_features = w.size(0);
+
+    TORCH_CHECK(x.size(1) == w.size(1), "Input features mismatch");
+    TORCH_CHECK(bias.size(0) == out_features, "Bias size mismatch");
+
+    auto out = torch::zeros({batch_size, out_features}, x.options());
+
+    const int threads_per_block = 256;
+    const int blocks_x = (out_features + threads_per_block - 1) / threads_per_block;
+    const dim3 grid(blocks_x, batch_size);
+    const dim3 block(threads_per_block);
+
+    fused_gemm_bias_relu_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        w.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        in_features,
+        out_features
+    );
+
+    return out;
+}
+"""
+
+custom_kernel_cpp_source = (
+    "torch::Tensor fused_gemm_bias_relu_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor bias);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=custom_kernel_cpp_source,
+    cuda_sources=custom_kernel_source,
+    functions=["fused_gemm_bias_relu_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using a custom fused CUDA kernel for GEMM + Bias Add + ReLU.
+    """
+    def __init__(self, in_features, out_features, bias_shape):
+        super(ModelNew, self).__init__()
+        # We still need to store the weight and bias as parameters or buffers 
+        # so that gradients can be handled if needed, but for inference/speedup 
+        # we pass them directly to the kernel.
+        # Note: In a real training scenario with autograd, custom kernels require 
+        # implementing backward passes. Here we assume inference or pre-computed weights/biases 
+        # are passed, or we treat them as buffers that don't require grad for this specific 
+        # optimization demonstration focusing on the forward pass speedup via fusion.
+        # To make it compatible with the original interface which uses nn.Linear and nn.Parameter,
+        # we will store w and b as buffers (non-trainable) or just use them directly if 
+        # the caller manages gradients outside this module's forward.
+        # However, to strictly match the "replace operators" instruction while keeping 
+        # the model structure similar, we can store the weight and bias as buffers.
+        
+        self.register_buffer('weight', torch.empty(out_features, in_features))
+        self.register_buffer('bias', torch.empty(bias_shape))
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor with shape (batch_size, in_features).
+        Returns:
+            torch.Tensor: Output tensor with shape (batch_size, out_features).
+        """
+        # The custom kernel expects the weight matrix W such that output = x @ W^T + bias.
+        # In nn.Linear, weight is stored as (out_features, in_features), so x @ w.T is correct.
+        # Our kernel implementation above assumes w is [out_features, in_features] and computes:
+        # sum(x[batch, i] * w[out_idx, i]) which is equivalent to (x @ w^T)[batch, out_idx].
+        
+        return fused_ops.fused_gemm_bias_relu_cuda(x, self.weight, self.bias)
+
+def get_inputs():
+    return [torch.rand(1024, 8192).cuda()]
+
+def get_init_inputs():
+    in_features = 8192
+    out_features = 8192
+    bias_shape = (out_features,)
+    
+    # Initialize the buffers with random values similar to the original model's initialization
+    weight = torch.randn(out_features, in_features).cuda()
+    bias = torch.randn(bias_shape).cuda()
+    
+    return [in_features, out_features, bias_shape, weight, bias]
+
+# Helper to initialize ModelNew properly if called directly with init inputs
+def create_model_new():
+    in_features, out_features, bias_shape, weight, bias = get_init_inputs()
+    model = ModelNew(in_features, out_features, bias_shape)
+    model.weight.copy_(weight)
+    model.bias.copy_(bias)
+    return model
+```

@@ -1,0 +1,170 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA implementation for Cross Entropy Loss
+# This kernel computes:
+# 1. LogSoftmax (online) to avoid overflow/underflow issues with exp(max)
+# 2. Negative log likelihood loss
+# It fuses the reduction steps for better performance on large batches.
+
+cross_entropy_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper to get max value in a row
+__device__ float atomicMaxFloat(float* address, float val) {
+    int* address_as_int = (int*)address;
+    int old = *address_as_int, assumed;
+    do {
+        assumed = old;
+        if (val <= __int_as_float(assumed)) return __float_as_int(assumed);
+        old = atomicCAS(address_as_int, assumed, __float_as_int(fmaxf(val, __int_as_float(assumed))));
+    } while (old != assumed);
+    return __int_as_float(old);
+}
+
+// Kernel to compute Cross Entropy Loss
+// predictions: [N, C]
+// targets: [N] containing class indices in [0, C-1]
+// output: scalar loss value
+__global__ void cross_entropy_loss_kernel(
+    const float* __restrict__ predictions, 
+    const int* __restrict__ targets, 
+    float* __restrict__ loss_out,
+    int N, 
+    int C) 
+{
+    // Each block handles one sample (row)
+    // We use a grid-stride loop or just 1 thread per row for simplicity given the structure
+    // However, for better occupancy, we can have multiple threads per row if needed.
+    // Given N=32768 and C=4096, let's assign one block per sample to maximize parallelism across samples.
+    
+    int idx = blockIdx.x;
+    if (idx >= N) return;
+
+    const float* pred_row = predictions + idx * C;
+    int target_class = targets[idx];
+
+    // Step 1: Find max for numerical stability
+    float max_val = -FLT_MAX;
+    for (int i = 0; i < C; ++i) {
+        if (pred_row[i] > max_val) {
+            max_val = pred_row[i];
+        }
+    }
+
+    // Step 2: Compute sum(exp(x - max)) and the specific log term
+    float sum_exp = 0.0f;
+    float log_prob_target = 0.0f;
+
+    for (int i = 0; i < C; ++i) {
+        float shifted_val = pred_row[i] - max_val;
+        float exp_val = expf(shifted_val);
+        sum_exp += exp_val;
+        
+        if (i == target_class) {
+            log_prob_target = pred_row[i] - max_val - logf(sum_exp); // This is wrong, need to separate sum_exp calculation
+        }
+    }
+    
+    // Correct approach: 
+    // 1. Find max
+    // 2. Compute sum(exp(x - max))
+    // 3. Compute loss = -(x_target - max) + log(sum(exp(x - max)))
+    
+    // Let's rewrite the loop properly inside the kernel for correctness and speed
+    // Since C is large (4096), a single thread per row is fine, but we can optimize with shared memory if needed.
+    // For simplicity and robustness in inline code, we stick to global memory access but ensure coalescing isn't an issue 
+    // (predictions are row-major, so accessing pred_row[i] is sequential).
+
+    float sum_exp_correct = 0.0f;
+    for (int i = 0; i < C; ++i) {
+        sum_exp_correct += expf(pred_row[i] - max_val);
+    }
+
+    float log_sum_exp = logf(sum_exp_correct);
+    float loss = -(pred_row[target_class] - max_val - log_sum_exp);
+
+    // Atomic add to global output buffer (which is just one element, but we might want to sum up later or return directly)
+    // Since the final output is a scalar, we can use atomicAdd on a single float in global memory.
+    atomicAdd(loss_out, loss);
+}
+
+torch::Tensor cross_entropy_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {
+    auto N = predictions.size(0);
+    auto C = predictions.size(1);
+    
+    // Output tensor for the scalar loss
+    auto loss_tensor = torch::zeros({}, predictions.options());
+    float* loss_ptr = loss_tensor.data_ptr<float>();
+    
+    // Initialize to 0.0f just in case, though zeros_like does it.
+    cudaMemsetAsync(loss_ptr, 0, sizeof(float));
+
+    const int block_size = 1;
+    const int num_blocks = N;
+
+    cross_entropy_loss_kernel<<<num_blocks, block_size>>>(
+        predictions.data_ptr<float>(), 
+        targets.data_ptr<int>(), 
+        loss_ptr, 
+        N, 
+        C
+    );
+
+    return loss_tensor;
+}
+"""
+
+cross_entropy_cpp_source = (
+    "torch::Tensor cross_entropy_loss_cuda(torch::Tensor predictions, torch::Tensor targets);"
+)
+
+# Compile the inline CUDA code
+cross_entropy_module = load_inline(
+    name="cross_entropy_custom",
+    cpp_sources=cross_entropy_cpp_source,
+    cuda_sources=cross_entropy_source,
+    functions=["cross_entropy_loss_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using custom CUDA operator for Cross Entropy Loss.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.cross_entropy_op = cross_entropy_module.cross_entropy_loss_cuda
+
+    def forward(self, predictions, targets):
+        # Ensure inputs are on the correct device and types
+        # The custom kernel expects float32 predictions and int64/int32 targets.
+        # PyTorch's cross_entropy usually takes float32/float64 and long/int64.
+        
+        if predictions.dtype != torch.float32:
+            predictions = predictions.float()
+            
+        if targets.dtype != torch.int64:
+            targets = targets.long()
+
+        return self.cross_entropy_op(predictions, targets)
+
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    batch_size = 32768
+    num_classes = 4096
+    predictions = torch.rand(batch_size, num_classes).cuda()
+    targets = torch.randint(0, num_classes, (batch_size,)).cuda()
+    return [predictions, targets]
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return []
+```

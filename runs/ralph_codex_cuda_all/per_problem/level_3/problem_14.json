@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 107.315,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "0.202602",
+        "0.202580",
+        "0.202578",
+        "0.202582",
+        "0.202562"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "2.026483",
+        "2.022132",
+        "1.893462",
+        "2.086012",
+        "1.970079"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_codex_cuda_all/generated_kernels/level_3/problem_14.py",
+  "level": 3,
+  "model_name": "codex-gpt-5.5",
+  "precision": "fp32",
+  "problem_id": 14,
+  "problem_name": "14_DenseNet121DenseBlock.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_codex_cuda_all/raw_generation/level_3/problem_14.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

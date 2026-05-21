@@ -1,0 +1,160 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void convt3d_fused_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ conv_bias,
+    const float* __restrict__ add_bias,
+    float* __restrict__ out,
+    int total,
+    int N, int IC, int ID, int IH, int IW,
+    int OC, int OD, int OH, int OW,
+    int KD, int KH, int KW,
+    int stride, int padding
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int t = idx;
+    int ow = t % OW; t /= OW;
+    int oh = t % OH; t /= OH;
+    int od = t % OD; t /= OD;
+    int oc = t % OC; t /= OC;
+    int n = t;
+
+    float acc = conv_bias ? conv_bias[oc] : 0.0f;
+
+    #pragma unroll
+    for (int ic = 0; ic < IC; ++ic) {
+        for (int kd = 0; kd < KD; ++kd) {
+            int id_num = od + padding - kd;
+            if (id_num < 0 || id_num % stride != 0) continue;
+            int id = id_num / stride;
+            if (id < 0 || id >= ID) continue;
+
+            for (int kh = 0; kh < KH; ++kh) {
+                int ih_num = oh + padding - kh;
+                if (ih_num < 0 || ih_num % stride != 0) continue;
+                int ih = ih_num / stride;
+                if (ih < 0 || ih >= IH) continue;
+
+                for (int kw = 0; kw < KW; ++kw) {
+                    int iw_num = ow + padding - kw;
+                    if (iw_num < 0 || iw_num % stride != 0) continue;
+                    int iw = iw_num / stride;
+                    if (iw < 0 || iw >= IW) continue;
+
+                    int x_idx = (((n * IC + ic) * ID + id) * IH + ih) * IW + iw;
+                    int w_idx = (((ic * OC + oc) * KD + kd) * KH + kh) * KW + kw;
+                    acc += x[x_idx] * w[w_idx];
+                }
+            }
+        }
+    }
+
+    float b = add_bias[oc];
+    out[idx] = 2.0f * acc * acc + (b + 1.0f) * acc;
+}
+
+torch::Tensor convt3d_fused_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor conv_bias,
+    torch::Tensor add_bias,
+    int stride,
+    int padding,
+    int output_padding
+) {
+    int N = x.size(0);
+    int IC = x.size(1);
+    int ID = x.size(2);
+    int IH = x.size(3);
+    int IW = x.size(4);
+
+    int OC = weight.size(1);
+    int KD = weight.size(2);
+    int KH = weight.size(3);
+    int KW = weight.size(4);
+
+    int OD = (ID - 1) * stride - 2 * padding + KD + output_padding;
+    int OH = (IH - 1) * stride - 2 * padding + KH + output_padding;
+    int OW = (IW - 1) * stride - 2 * padding + KW + output_padding;
+
+    auto out = torch::empty({N, OC, OD, OH, OW}, x.options());
+    int total = N * OC * OD * OH * OW;
+
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+
+    convt3d_fused_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        conv_bias.numel() ? conv_bias.data_ptr<float>() : nullptr,
+        add_bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        total,
+        N, IC, ID, IH, IW,
+        OC, OD, OH, OW,
+        KD, KH, KW,
+        stride, padding
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor convt3d_fused_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor conv_bias,
+    torch::Tensor add_bias,
+    int stride,
+    int padding,
+    int output_padding
+);
+"""
+
+_convt3d_fused = load_inline(
+    name="convt3d_fused_kernelbench",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["convt3d_fused_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+        )
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.stride = stride if isinstance(stride, int) else stride[0]
+        self.padding = padding if isinstance(padding, int) else padding[0]
+        self.output_padding = output_padding if isinstance(output_padding, int) else output_padding[0]
+        self._op = _convt3d_fused
+
+    def forward(self, x):
+        return self._op.convt3d_fused_cuda(
+            x,
+            self.conv_transpose.weight,
+            self.conv_transpose.bias,
+            self.bias,
+            self.stride,
+            self.padding,
+            self.output_padding,
+        )

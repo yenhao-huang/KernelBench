@@ -1,0 +1,329 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void conv2d_patch_kernel(const float* x, const float* w, const float* bias, float* out,
+                                    int B, int C, int H, int W, int OC, int P, int OH, int OW) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * OC * OH * OW;
+    if (idx >= total) return;
+
+    int ow = idx % OW;
+    int oh = (idx / OW) % OH;
+    int oc = (idx / (OW * OH)) % OC;
+    int b = idx / (OW * OH * OC);
+
+    float acc = bias ? bias[oc] : 0.0f;
+    int base_h = oh * P;
+    int base_w = ow * P;
+
+    for (int c = 0; c < C; ++c) {
+        for (int kh = 0; kh < P; ++kh) {
+            for (int kw = 0; kw < P; ++kw) {
+                float xv = x[((b * C + c) * H + base_h + kh) * W + base_w + kw];
+                float wv = w[((oc * C + c) * P + kh) * P + kw];
+                acc += xv * wv;
+            }
+        }
+    }
+    out[idx] = acc;
+}
+
+__global__ void linear2d_kernel(const float* x, const float* w, const float* bias, float* out,
+                                int R, int K, int O) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = R * O;
+    if (idx >= total) return;
+
+    int o = idx % O;
+    int r = idx / O;
+    float acc = bias ? bias[o] : 0.0f;
+    const float* xr = x + r * K;
+    const float* wr = w + o * K;
+
+    for (int k = 0; k < K; ++k) {
+        acc += xr[k] * wr[k];
+    }
+    out[idx] = acc;
+}
+
+__global__ void linear3d_kernel(const float* x, const float* w, const float* bias, float* out,
+                                int B, int N, int K, int O) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * N * O;
+    if (idx >= total) return;
+
+    int o = idx % O;
+    int row = idx / O;
+    float acc = bias ? bias[o] : 0.0f;
+    const float* xr = x + row * K;
+    const float* wr = w + o * K;
+
+    for (int k = 0; k < K; ++k) {
+        acc += xr[k] * wr[k];
+    }
+    out[idx] = acc;
+}
+
+__global__ void token_concat_kernel(const float* cls, const float* proj, float* out, int B, int E) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * 2 * E;
+    if (idx >= total) return;
+
+    int e = idx % E;
+    int n = (idx / E) % 2;
+    int b = idx / (2 * E);
+    out[idx] = (n == 0) ? cls[e] : proj[b * E + e];
+}
+
+__global__ void attn2_kernel(const float* qkv, float* out, int B, int E, int HN) {
+    int bh = blockIdx.x;
+    int b = bh / HN;
+    int h = bh % HN;
+    int D = E / HN;
+    int off = b * 2 * 3 * E;
+    int hbase = h * D;
+    float scale = rsqrtf((float)D);
+
+    for (int d = 0; d < D; ++d) {
+        float scores[4];
+
+        for (int qi = 0; qi < 2; ++qi) {
+            for (int kj = 0; kj < 2; ++kj) {
+                float s = 0.0f;
+                for (int t = 0; t < D; ++t) {
+                    float q = qkv[off + qi * 3 * E + hbase + t];
+                    float k = qkv[off + kj * 3 * E + E + hbase + t];
+                    s += q * k;
+                }
+                scores[qi * 2 + kj] = s * scale;
+            }
+        }
+
+        for (int qi = 0; qi < 2; ++qi) {
+            float s0 = scores[qi * 2];
+            float s1 = scores[qi * 2 + 1];
+            float m = s0 > s1 ? s0 : s1;
+            float e0 = expf(s0 - m);
+            float e1 = expf(s1 - m);
+            float inv = 1.0f / (e0 + e1);
+            float a0 = e0 * inv;
+            float a1 = e1 * inv;
+            float v0 = qkv[off + 0 * 3 * E + 2 * E + hbase + d];
+            float v1 = qkv[off + 1 * 3 * E + 2 * E + hbase + d];
+            out[(b * 2 + qi) * E + hbase + d] = a0 * v0 + a1 * v1;
+        }
+    }
+}
+
+__global__ void relu_kernel(float* x, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total && x[idx] < 0.0f) x[idx] = 0.0f;
+}
+
+__global__ void add_layernorm_kernel(const float* a, const float* b, const float* gamma, const float* beta,
+                                     float* out, int rows, int E, float eps) {
+    extern __shared__ float smem[];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    float sum = 0.0f;
+    for (int e = tid; e < E; e += blockDim.x) {
+        sum += a[row * E + e] + b[row * E + e];
+    }
+    smem[tid] = sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) smem[tid] += smem[tid + stride];
+        __syncthreads();
+    }
+    float mean = smem[0] / (float)E;
+
+    float vsum = 0.0f;
+    for (int e = tid; e < E; e += blockDim.x) {
+        float v = a[row * E + e] + b[row * E + e] - mean;
+        vsum += v * v;
+    }
+    smem[tid] = vsum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) smem[tid] += smem[tid + stride];
+        __syncthreads();
+    }
+    float inv_std = rsqrtf(smem[0] / (float)E + eps);
+
+    for (int e = tid; e < E; e += blockDim.x) {
+        float v = a[row * E + e] + b[row * E + e];
+        out[row * E + e] = (v - mean) * inv_std * gamma[e] + beta[e];
+    }
+}
+
+__global__ void fc_cls_kernel(const float* x, const float* w, const float* bias, float* out,
+                              int B, int E, int O) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * O;
+    if (idx >= total) return;
+
+    int o = idx % O;
+    int b = idx / O;
+    const float* xr = x + b * 2 * E;
+    const float* wr = w + o * E;
+    float acc = bias ? bias[o] : 0.0f;
+
+    for (int e = 0; e < E; ++e) {
+        acc += xr[e] * wr[e];
+    }
+    out[idx] = acc;
+}
+
+torch::Tensor conv2d_patch_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor bias, int64_t patch) {
+    int B = x.size(0), C = x.size(1), H = x.size(2), W = x.size(3);
+    int OC = w.size(0), P = (int)patch, OH = H / P, OW = W / P;
+    auto out = torch::empty({B, OC, OH, OW}, x.options());
+    int total = B * OC * OH * OW;
+    conv2d_patch_kernel<<<(total + 255) / 256, 256>>>(x.data_ptr<float>(), w.data_ptr<float>(), bias.data_ptr<float>(),
+                                                       out.data_ptr<float>(), B, C, H, W, OC, P, OH, OW);
+    return out;
+}
+
+torch::Tensor linear2d_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor bias) {
+    int R = x.size(0), K = x.size(1), O = w.size(0);
+    auto out = torch::empty({R, O}, x.options());
+    int total = R * O;
+    linear2d_kernel<<<(total + 255) / 256, 256>>>(x.data_ptr<float>(), w.data_ptr<float>(), bias.data_ptr<float>(),
+                                                  out.data_ptr<float>(), R, K, O);
+    return out;
+}
+
+torch::Tensor linear3d_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor bias) {
+    int B = x.size(0), N = x.size(1), K = x.size(2), O = w.size(0);
+    auto out = torch::empty({B, N, O}, x.options());
+    int total = B * N * O;
+    linear3d_kernel<<<(total + 255) / 256, 256>>>(x.data_ptr<float>(), w.data_ptr<float>(), bias.data_ptr<float>(),
+                                                  out.data_ptr<float>(), B, N, K, O);
+    return out;
+}
+
+torch::Tensor token_concat_cuda(torch::Tensor cls, torch::Tensor proj) {
+    int B = proj.size(0), E = proj.size(1);
+    auto out = torch::empty({B, 2, E}, proj.options());
+    int total = B * 2 * E;
+    token_concat_kernel<<<(total + 255) / 256, 256>>>(cls.data_ptr<float>(), proj.data_ptr<float>(), out.data_ptr<float>(), B, E);
+    return out;
+}
+
+torch::Tensor attn2_cuda(torch::Tensor qkv, int64_t heads) {
+    int B = qkv.size(0), E = qkv.size(2) / 3, HN = (int)heads;
+    auto out = torch::empty({B, 2, E}, qkv.options());
+    attn2_kernel<<<B * HN, 1>>>(qkv.data_ptr<float>(), out.data_ptr<float>(), B, E, HN);
+    return out;
+}
+
+torch::Tensor relu_cuda(torch::Tensor x) {
+    int total = x.numel();
+    relu_kernel<<<(total + 255) / 256, 256>>>(x.data_ptr<float>(), total);
+    return x;
+}
+
+torch::Tensor add_layernorm_cuda(torch::Tensor a, torch::Tensor b, torch::Tensor gamma, torch::Tensor beta, double eps) {
+    int rows = a.size(0) * a.size(1), E = a.size(2);
+    auto out = torch::empty_like(a);
+    add_layernorm_kernel<<<rows, 256, 256 * sizeof(float)>>>(a.data_ptr<float>(), b.data_ptr<float>(),
+                                                             gamma.data_ptr<float>(), beta.data_ptr<float>(),
+                                                             out.data_ptr<float>(), rows, E, (float)eps);
+    return out;
+}
+
+torch::Tensor fc_cls_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor bias) {
+    int B = x.size(0), E = x.size(2), O = w.size(0);
+    auto out = torch::empty({B, O}, x.options());
+    int total = B * O;
+    fc_cls_kernel<<<(total + 255) / 256, 256>>>(x.data_ptr<float>(), w.data_ptr<float>(), bias.data_ptr<float>(),
+                                                out.data_ptr<float>(), B, E, O);
+    return out;
+}
+"""
+
+cpp_sources = """
+torch::Tensor conv2d_patch_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor bias, int64_t patch);
+torch::Tensor linear2d_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor bias);
+torch::Tensor linear3d_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor bias);
+torch::Tensor token_concat_cuda(torch::Tensor cls, torch::Tensor proj);
+torch::Tensor attn2_cuda(torch::Tensor qkv, int64_t heads);
+torch::Tensor relu_cuda(torch::Tensor x);
+torch::Tensor add_layernorm_cuda(torch::Tensor a, torch::Tensor b, torch::Tensor gamma, torch::Tensor beta, double eps);
+torch::Tensor fc_cls_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor bias);
+"""
+
+_kb_cvit_ops = load_inline(
+    name="kb_cvit_ops_inline",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=[
+        "conv2d_patch_cuda",
+        "linear2d_cuda",
+        "linear3d_cuda",
+        "token_concat_cuda",
+        "attn2_cuda",
+        "relu_cuda",
+        "add_layernorm_cuda",
+        "fc_cls_cuda",
+    ],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes, embed_dim=512, num_heads=8, num_layers=6,
+                 mlp_ratio=4.0, patch_size=4, in_channels=3, image_size=32):
+        super(ModelNew, self).__init__()
+        self.patch_size = patch_size
+        self.image_size = image_size
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+
+        self.conv1 = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+        num_patches = (image_size // patch_size) ** 2
+        self.linear_proj = nn.Linear(embed_dim * num_patches, embed_dim)
+
+        self.transformer_layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=embed_dim,
+                nhead=num_heads,
+                dim_feedforward=int(embed_dim * mlp_ratio),
+                dropout=0.0,
+                batch_first=True
+            ) for _ in range(num_layers)
+        ])
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.fc_out = nn.Linear(embed_dim, num_classes)
+        self.ops = _kb_cvit_ops
+
+    def forward(self, x):
+        B = x.size(0)
+        x = self.ops.conv2d_patch_cuda(x, self.conv1.weight, self.conv1.bias, self.patch_size)
+        x = self.ops.linear2d_cuda(x.view(B, -1), self.linear_proj.weight, self.linear_proj.bias)
+        x = self.ops.token_concat_cuda(self.cls_token, x)
+
+        for layer in self.transformer_layers:
+            qkv = self.ops.linear3d_cuda(x, layer.self_attn.in_proj_weight, layer.self_attn.in_proj_bias)
+            attn = self.ops.attn2_cuda(qkv, self.num_heads)
+            attn = self.ops.linear3d_cuda(attn, layer.self_attn.out_proj.weight, layer.self_attn.out_proj.bias)
+            x = self.ops.add_layernorm_cuda(x, attn, layer.norm1.weight, layer.norm1.bias, layer.norm1.eps)
+
+            ff = self.ops.linear3d_cuda(x, layer.linear1.weight, layer.linear1.bias)
+            ff = self.ops.relu_cuda(ff)
+            ff = self.ops.linear3d_cuda(ff, layer.linear2.weight, layer.linear2.bias)
+            x = self.ops.add_layernorm_cuda(x, ff, layer.norm2.weight, layer.norm2.bias, layer.norm2.eps)
+
+        return self.ops.fc_cls_cuda(x, self.fc_out.weight, self.fc_out.bias)
+```

@@ -1,0 +1,97 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void colsum_kernel(const float* __restrict__ w, float* __restrict__ colsum, int hidden, int input) {
+    int col = blockIdx.x;
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+
+    for (int h = tid; h < hidden; h += blockDim.x) {
+        sum += w[h * input + col];
+    }
+
+    __shared__ float smem[256];
+    smem[tid] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] += smem[tid + s];
+        __syncthreads();
+    }
+
+    if (tid == 0) colsum[col] = smem[0];
+}
+
+__global__ void dot_scale_kernel(const float* __restrict__ x,
+                                 const float* __restrict__ colsum,
+                                 float* __restrict__ out,
+                                 int batch,
+                                 int input,
+                                 float factor) {
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+
+    const float* xb = x + b * input;
+    for (int i = tid; i < input; i += blockDim.x) {
+        sum += xb[i] * colsum[i];
+    }
+
+    __shared__ float smem[256];
+    smem[tid] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] += smem[tid + s];
+        __syncthreads();
+    }
+
+    if (tid == 0) out[b] = smem[0] * factor;
+}
+
+torch::Tensor fused_forward_cuda(torch::Tensor x, torch::Tensor weight, double scaling_factor) {
+    int batch = x.size(0);
+    int input = x.size(1);
+    int hidden = weight.size(0);
+
+    auto colsum = torch::empty({input}, x.options());
+    auto out = torch::empty({batch, 1}, x.options());
+
+    const int threads = 256;
+    colsum_kernel<<<input, threads>>>(weight.data_ptr<float>(), colsum.data_ptr<float>(), hidden, input);
+    dot_scale_kernel<<<batch, threads>>>(x.data_ptr<float>(), colsum.data_ptr<float>(), out.data_ptr<float>(), batch, input, (float)(scaling_factor * 0.5));
+
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor fused_forward_cuda(torch::Tensor x, torch::Tensor weight, double scaling_factor);
+"""
+
+fused_ext = load_inline(
+    name="kernelbench_fused_matmul_sum_scale",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["fused_forward_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.weight = nn.Parameter(torch.randn(hidden_size, input_size))
+        self.scaling_factor = scaling_factor
+        self.fused_ext = fused_ext
+
+    def forward(self, x):
+        return self.fused_ext.fused_forward_cuda(x, self.weight, float(self.scaling_factor))
+```

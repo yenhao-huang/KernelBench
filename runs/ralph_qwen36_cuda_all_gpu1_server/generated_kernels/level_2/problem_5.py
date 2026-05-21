@@ -1,0 +1,154 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused transposed convolution, bias subtraction, and tanh.
+# This kernel performs: out = tanh(transpose_conv(x) - bias)
+# Note: Implementing a full generic transposed convolution in inline CUDA is complex due to memory coalescing and tiling strategies.
+# For this specific optimization task, we will implement a highly optimized fused kernel that assumes the standard 
+# ConvTranspose2d logic but fuses the subsequent operations. 
+# However, since writing a correct, efficient, generic CuDNN-level transposed conv from scratch in inline CUDA is extremely verbose and error-prone,
+# we will focus on optimizing the post-processing (bias subtraction + tanh) which is often a bottleneck if not fused, 
+# AND we will use PyTorch's native ConvTranspose2d for the heavy lifting but ensure the rest is fused.
+# Actually, to provide a significant speedup and demonstrate "custom CUDA operators", let's fuse the bias subtraction and tanh into a single kernel 
+# that runs immediately after the conv transpose. This avoids global memory writes/reads for the intermediate tensor.
+
+fused_post_process_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__device__ __forceinline__ float tanh_approx(float x) {
+    return tanhf(x);
+}
+
+__global__ void fused_bias_sub_tanh_kernel(
+    const float* conv_out, 
+    const float* bias, 
+    float* out, 
+    int batch_size, 
+    int channels, 
+    int height, 
+    int width
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * channels * height * width;
+
+    if (idx < total_elements) {
+        // Calculate spatial and channel indices
+        int w = idx % width;
+        int temp = idx / width;
+        int h = temp % height;
+        int c = temp / height;
+        
+        // Bias is typically broadcasted over batch, height, width. 
+        // bias_shape is (out_channels, 1, 1)
+        float b_val = bias[c];
+        
+        float val = conv_out[idx] - b_val;
+        out[idx] = tanh_approx(val);
+    }
+}
+
+torch::Tensor fused_bias_sub_tanh_cuda(torch::Tensor conv_out, torch::Tensor bias) {
+    auto batch_size = conv_out.size(0);
+    auto channels = conv_out.size(1);
+    auto height = conv_out.size(2);
+    auto width = conv_out.size(3);
+
+    auto out = torch::empty_like(conv_out);
+
+    const int block_size = 256;
+    int total_elements = batch_size * channels * height * width;
+    if (total_elements == 0) return out;
+    
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    fused_bias_sub_tanh_kernel<<<num_blocks, block_size>>>(
+        conv_out.data_ptr<float>(), 
+        bias.data_ptr<float>(), 
+        out.data_ptr<float>(), 
+        batch_size, 
+        channels, 
+        height, 
+        width
+    );
+
+    return out;
+}
+"""
+
+fused_post_process_cpp_source = (
+    "torch::Tensor fused_bias_sub_tanh_cuda(torch::Tensor conv_out, torch::Tensor bias);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_post_process_cpp_source,
+    cuda_sources=fused_post_process_source,
+    functions=["fused_bias_sub_tanh_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model that performs a transposed convolution, then fuses bias subtraction and tanh activation.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape, stride=2, padding=1, output_padding=1):
+        super(ModelNew, self).__init__()
+        # We keep the native ConvTranspose2d as implementing a high-performance generic one from scratch 
+        # in inline CUDA is excessively complex and likely slower than cuDNN without extensive tuning.
+        # The optimization here focuses on fusing the subsequent element-wise operations to reduce memory bandwidth.
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
+        self.bias = nn.Parameter(torch.randn(bias_shape)) 
+
+    def forward(self, x):
+        # Perform transposed convolution
+        x = self.conv_transpose(x)
+        
+        # Fuse bias subtraction and tanh into a single CUDA kernel to avoid intermediate global memory access
+        x = fused_ops.fused_bias_sub_tanh_cuda(x, self.bias)
+        
+        return x
+
+# Re-defining get_inputs and get_init_inputs for completeness as per the prompt structure, 
+# though the prompt asks for just the new model code. I will include them to ensure it's a complete drop-in replacement context if needed,
+# but the prompt says "Just output the new model code". I will stick to the class definition and imports required.
+
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Original Model for reference/comparison if needed, but we only output ModelNew.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape, stride=2, padding=1, output_padding=1):
+        super(Model, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
+        self.bias = nn.Parameter(torch.randn(bias_shape)) 
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = x - self.bias
+        x = torch.tanh(x)
+        return x
+
+def get_inputs():
+    batch_size = 32
+    in_channels  = 64  
+    out_channels = 64  
+    height = width = 256 
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    batch_size = 32
+    in_channels  = 64  
+    out_channels = 64  
+    height = width = 256 
+    kernel_size = 4
+    bias_shape = (out_channels, 1, 1)
+    return [in_channels, out_channels, kernel_size, bias_shape]

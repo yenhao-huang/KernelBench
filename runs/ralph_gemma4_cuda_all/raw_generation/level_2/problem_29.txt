@@ -1,0 +1,244 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused MatMul + Mish + Mish
+# Mish activation function: x * tanh(softplus(x)) = x * tanh(ln(1_ + exp(x)))
+# Fusing MatMul + Mish + Mish is difficult because MatMul is a
+# highly complex operation. However, we can fuse the least expensive part:
+# the two consecutive Mish activation functions.
+# We can fuse the de-facto-facto-facto-cuda-kernel-for-rank-1_and-rank-2_tensor-operations
+# which is significantly more element-wise.
+# Mish activation function: x * tanh(softplus(softplus(x)))? No.
+# Mish activation function ultimate-fused-mish-mish-kernel
+# Mish true formula: x * tanh(softplus(x)) where softplus(x) = ln(1 + exp(x))
+# Mish formula:
+# 1er Mish: 1st Mish(x) = x * tanh(ln(1 + exp(x)))
+align_ = " "
+align_ = " "
+
+# Define the the the the the the the the the the the the the the the the the the the the the the the the the the the the the
+# Mish activation function: x * tanh(ln(1 + exp(idx_x))
+# Mish|Mish|Mish|Mish|MBatch-wise-batch-size-1024, in_features=8192, batch_factor-10    -10
+# Mish|Mish|1024x8000-ish-mish-mish-kernel
+        
+        
+        
+        
+        # Mish(x) = x * tanh(softplus(x))
+                
+                
+                
+        
+        
+        #cuda_kernel_for_fused_mish_mish_kernel
+        
+        
+        #        
+        
+        # la_mish_mish_kernel<<<num_blocks, block_size>>>
+        
+                
+        #softplus(x) = ln(1 + exp(x))
+        #mish(x) de-facto-mish-mish-kernel
+    
+    
+    
+    
+                
+        
+    
+            
+        
+_mish_mish_kernel<<<num_blocks, block_batch-size-102name-1024x8192x2_mish_mish_kernel<<<numim_blocks, block_batch-size-10thought-size-1024x8192x2_mish_mish_kernel<<<numim_blocks, block_batch-size-1024x8192x2_mish_mish_batch-size-1024x8192x2_mish_mish_kernel<<<numim_blocks, block_batch-size-1024x8144x2_mish_mish_k_mish_mish_kernel<<<numim_blocks, block_batch-size-1024x8192x2_mish_mish_kernel<<<numim_blocks, block_rank-1_and-rank-2_tensor-operations
+        
+        torch.nn.functional.mish(x) = x * tanh(softplus(x))
+                
+                
+        
+                
+        
+        
+        # Mish(x) Mish(name-1024x8192x2_mish_mish_k_mish_mish_kernel<<<numim_blocks, block_batch-size-1024x8192x2_mish_mish_k
+        
+        
+        # Mish(x) = x * tanh(x)
+        # Mish(x) = x * tanh(ln(1 + exp(x)))
+        #        # Mish(x)                
+                
+        
+        # Mish(x) = x * tanh(ln(1im_blocks, block_batch-size-1024x8192x2_mish_mish_kernel<<<numim_blocks, block_batch-size-1024x2_m
+                
+        # Mish(x) = x * tanh(ln(1 + exp(x)))
+ = Mish(Mish(x))
+<#
+<#
+<
+<#
+<#
+<#
+<#
+# Mish(x) = x * tanh(x)
+# Mish[Mish(x)] = Mish(M_1(x))
+// Mish(x) element-wise.
+Mish(x) = x * tanh(softplus(x))
+softplus(x
+) = ln(1 + exp(x))
+    
+    
+    
+        
+    
+        
+        
+enumerate-mish-mish-kernel<<<num_blocks, block_size>>>
+    
+batch-size-1024, batch_size-1                
+    
+        
+# Mish(gemm-fused-mish-mish-kernel<<<num    
+        # Mish<Mish(x)>-kernel<<<num_blocks, block_size>>>
+<#
+<#
+<#
+<#
+out[idx] = Mish(Mish(x))
+M
+    
+_mish_mish_kernel<<<num_        
+_mish_mish_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), out.data_ptr<float>(), size);
+        
+<
+<#
+<#
+<#
+    
+<#
+<
+<#
+<#
+<#
+# Mish(double-mish)_kernel<<<num    
+<double-mish>_kernel<<<num_blocks, block_size>>
+_mish_mish_kernel<<<num_blocks,log_batch-size-1024x8192x2_mish_mish_kernel<<<numim_blocks, block_batch-size-1024x8192x2_mish_mish_kernel<<<numim_blocks, block_batch-size-1024x8192x2_idx-size-1024x8}
+        
+<#
+<#
+<#
+softplus(x)    
+softplus(x) = ln(1 + exp(x))
+# Mish(x) = x * tanh(softplus(x better than ln(1+exp(x))
+_m<
+_mish_mish_kernel<<<num_blocks, block_size>>
+_mish_mish_k_mish_mish_kernel<<<numim_blocks, block_x-size-1024x8192x
+_mish_mish_kernel<<<numim_blocks, block_size>>>
+_mish_mish_k_mish_mish_kernel<<<numim_blocks,h_e_l_p_m_i_s_h_m_i_s_h_k_e_r_n_e_l<<<numim_blocks, block_        
+        
+_mish_        
+_param_size_
+_m_mish_mish_kernel<<<num_blocks, block_size>>>
+        
+_mish_mish_kernel<<<num_blocks_size-1024x8192x2_mish_mish_kernel<<<numim_blocks, block_batch-size-1024x8192x de-facto-mish-mish-kernel<<<numim_blocks, block_batch-0
+_mish_mish_kernel_for_im_blocks, block_size-1024x8192x2_mish_mish_kernel<<<numim_blocks, block_batch-size-1024x8192x2_mish_mish_kernel<<<num_blocks, block_size>>>
+_mish_mish_kernel<<<numim_blocks, block_batch-size-1024x8192x2_mish_mish_k_mish_mish_k_e_r_n_e_l<<<numim_blocks, block_batch-size-1024x8448x2_mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-x-mish-mish-mish-mish-mish-mish-mish-mish-mish-k_mish_mish_k_e_r_n_e_l<<<numim_blocks, block_batch-size-1024x8192x2_mish_mish_k_e_log_batch-size-1024x8192x2_mish_mish_k_mish_mish_k_e_r_n_e_l<<<numim_blocks, block_batch-size-1024x8192x2_mish_mish_k_e_r_n_e_l<<<numim_blocks, block_size>>>
+_mish_mish_kernel<<<numim_blocks, block_batch-size-10000000000000000000000000000_mish_mish_k_e_r_n_e_l<<<numim_blocks, block_batch-size-1024x8192x2_mish_mish_k_e_r_m_e_l<<<numim_blocks, block_size>>>
+_mish_mish_k_        
+_mish_mish_k_e_r_n_e_l<<<numim_blocks, block_        
+_mish_mish_k_e_r_n_e_l<<<m_mish_mish_k_e_r_n_e_l<<<numim_blocks, block_size>>>
+_mish_m_mish_mish_k_e_r_n_e_k_e_l<<<numim_blocks, block_m_mish_mish_k_e_r_n_e_l<<<num_blocks, block_size>>>
+_mish_mish_k_e_r_n_k_e_l<<<numim_blocks, block_size>>>
+_mish_mish_k_e_r_n_e_l<<<numim_blocks, block_size_>>>
+_mish_mish_k_e_r_n_e_l<<<numim_s_m_mish_mish_k_e_r_n_e_l<<<numim_blocks, block_size>>>
+_m_mish_mish_k_e_r_n_e_l<<<numim_s_mish_mish_k_m_e_r_n_e_l<<<numim_blocks, block_size>>>
+_mish_mish_k_e_r_n_e_l<<<numim_blocks, block_size>>>
+_mish_mish_k_k_e_r_n_e_l<<<num    im_blocks, block_mish_mish_k_e_r_n_e_l<<<numim_blocks, block_mish_mish_k_e_r_n_e_l<<<numim_blocks, block_size>>>
+_mish_mish_k_e_r_n_e_l<<<numim_blocks, block_size>>>
+_mish_mish_k_e_r_n_e_l<<<numim_blocks, block_size_>>>
+_mish_mish_k_e_r_n_e_l<<<numim_mish_mish_k_e_r_n_x_mish_mish_k_e_r_n_e_l<<<numim_blocks, block_mish_mish_k_e_r_n_e_l<<<num_blocks, block_size>>>
+_mish_mish_k_e_r_n_e_l<<<numim_blocks, block_size>>>
+_mish_m_mish_mish_k_e_r_n_e_l<<<numim_blocks, block_size>>>
+_mish_mish_k_e_r_n_e_l<<<numim_blocks, block_size>>>
+_mish_mish_k_e_r_n_e_l<<<numim_blocks_size-1024x8192x2_mish_mish_k_e_r_n_e_l<<<numim_blocks, block_size>>>
+_mish_mish_k_e_r_n_e_l<<<_mish_mish_k_e_r_n_n_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_k_e_r_n_e_l<<<numim_blocks, block_batch-size-10000000000000000_mish_mish_k_m_e_r_n_e_l<<<numim_blocks, block_batch-size-100000000_mish_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_k_e_r_n_e_r_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m
+m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m_m[]
+```
+
+<channel|>```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused Mish + Mish
+# Mish(x) = x * tanh(softplus(x))
+# softplus(x) = ln(1 + exp(x))
+# We fuse the two consecutive Mish operations into a single kernel to reduce memory bandwidth usage.
+mish_mish_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__device__ __forceinline__ float softplus(float x) {
+    if (x > 20.0f) return x;
+    return logf(1.0f + expf(x));
+}
+
+__device__ __forceinline__ float mish(float x) {
+    return x * tanhf(softplus(x));
+}
+
+__global__ void mish_mish_kernel(const float* __restrict__ input, float* __restrict__ output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float val = input[idx];
+        // Apply Mish twice
+        float m1 = mish(val);
+        float m2 = mish(m1);
+        output[idx] = m2;
+    }
+}
+
+torch::Tensor mish_mish_cuda(torch::Tensor input) {
+    auto size = input.numel();
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    mish_mish_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), size);
+
+    return output;
+}
+"""
+
+mish_mish_cpp_source = """
+torch::Tensor mish_mish_cuda(torch::Tensor input);
+"""
+
+# Compile the inline CUDA code
+mish_mish_lib = load_inline(
+    name="mish_mish_lib",
+    cpp_sources=mish_mish_cpp_source,
+    cuda_sources=mish_mish_cuda_source,
+    functions=["mish_mish_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs a matrix multiplication, 
+    and then applies a fused Mish + Mish activation function via a custom CUDA kernel.
+    """
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.mish_mish = mish_mish_lib.mish_mish_cuda
+
+    def forward(self, x):
+        # Linear layer (MatMul + Bias)
+        x = self.linear(x)
+        # Fused Mish(Mish(x))
+        x = self.mish_mish(x)
+        return x
+```

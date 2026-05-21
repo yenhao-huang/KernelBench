@@ -1,0 +1,219 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for 3D Average Pooling
+avg_pool3d_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void avg_pool3d_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int batch_size, int channels, int depth, int height, int width,
+    int k_d, int k_h, int k_w,
+    int stride_d, int stride_h, int stride_w,
+    int pad_d, int pad_h, int pad_w,
+    int out_d, int out_h, int out_w
+) {
+    // Calculate the output index
+    int out_idx = blockIdx.x * blockDim.x + threadIdx.x;
+            
+    if (out_idx >= batch_size * channels * out_d * out_h * out_w) {
+                return;
+            }
+
+            // Decompose the output index into import 
+            // Decompose the decompose-
+
+            // Decompose the decompose-
+            // cube-
+    
+            int w_out = out_idx % out_w;
+                int out_c = (out_idx / out_w) % channels;
+idx = out_idx / (out_w * channels) // (depth * height * width) // (batch_size)
+    // ... (rest of the code)
+    """
+```
+
+<|channel>Implications: The user wants a custom CUDA implementation for `nn.AvgPool3d`. The provided snippet is incomplete and contains errors. I need to write a complete, working CUDA kernel for 3D Average Pooling.
+
+Plan:
+1. Write a robust CUDA kernel for 3D Average Pooling.
+2. The kernel will map each output element to a window in the input.
+3. It will handle padding by checking bounds.
+4. It will handle stride and kernel size.
+5. Use `load_inline` to compile it.
+6. Implement `ModelNew`.
+
+Kernel details:
+- Input shape: $(N, C, D, H, W)$
+- Output shape: $(N, C, D_{out}, H_{out}, W_{out})$
+- $D_{out} = \lfloor \frac{D + 2 \times pad_d - k_d}{stride_d} \rfloor + 1$ (standard PyTorch formula)
+- For each output voxel $(n, c, d_{out}, h_{out}, w_{out})$:
+  - Find the corresponding window in input:
+    - $d_{start} = d_{out} \times stride_d - pad_d$
+    - $h_{start} = h_{out} \times stride_h - pad_h$
+    - $w_{start} = w_{out} \times stride_w - pad_w$
+  - Sum elements in $[d_{start}, d_{start}+k_d)$, $[h_{start}, h_{start}+k_h)$, $[w_{start}, w_{start}+k_w)$ that are within bounds.
+  - Divide by the number of elements in the window (Note: PyTorch `AvgPool3d` divides by the kernel size $k_d \times k_h \times k_w$, not just the valid elements, unless specified otherwise. Actually, `nn.AvgPool3d` divides by the product of kernel dimensions).
+
+Wait, let's check PyTorch `AvgPool3d` behavior:
+`nn.AvgPool3d` divides by the product of kernel sizes. If there is padding, the padded values are treated as 0 but they *do* contribute to the denominator (the kernel size).
+Actually, looking at PyTorch docs: "The pooling window is averaged over the kernel size."
+So the denominator is always $k_d \times k_h \times k_w$.
+
+Let's refine the kernel:
+- Each thread handles one output element.
+- Calculate $n, c, d, h, w$ for the output.
+- Loop through the kernel window.
+- Check if input indices are within $[0, D), [0, H), [0, W)$.
+- Accumulate.
+- Divide by $k_d \times k_h \times k_w$.
+
+Wait, for performance, a simple kernel might be slow. But for a custom operator replacement, a single-pass kernel is a good start.
+
+Let's write the code.<channel|>```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for 3D Average Pooling
+avg_pool3d_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void avg_pool3d_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int batch_size, int channels, int in_d, int in_h, int in_w,
+    int out_d, int out_h, int out_w,
+    int k_d, int k_h, int k_w,
+    int stride_d, int stride_h, int stride_w,
+    int pad_d, int pad_h, int pad_w
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * channels * out_d * out_h * out_w;
+
+    if (idx < total_elements) {
+        // Decompose idx into output coordinates
+        int w_out = idx % out_w;
+        int rem = idx / out_w;
+        int h_out = rem % out_h;
+        rem /= out_h;
+        int d_out = rem % out_d;
+        rem /= out_d;
+        int c = rem % channels;
+        int n = rem / channels;
+
+        // Calculate start positions in input
+        int d_start = d_out * stride_d - pad_d;
+        int h_start = h_out * stride_h - pad_h;
+        int w_start = w_out * stride_w - pad_w;
+
+        float sum = 0.0f;
+
+        for (int kd = 0; kd < k_d; ++kd) {
+            int d_in = d_start + kd;
+            if (d_in >= 0 && d_in < in_d) {
+                for (int kh = 0; kh < k_h; ++kh) {
+                    int h_in = h_start + kh;
+                    if (h_in >= 0 && h_in < in_h) {
+                        for (int kw = 0; kw < k_w; ++kw) {
+                            int w_in = w_start + kw;
+                            if (w_in >= 0 && w_in < in_w) {
+                                int input_idx = n * (channels * in_d * in_h * in_w) +
+                                                c * (in_d * in_h * in_w) +
+                                                d_in * (in_h * in_w) +
+                                                h_in * (in_w) +
+                                                w_in;
+                                sum += input[input_idx];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // PyTorch AvgPool3d divides by the product of kernel dimensions
+        output[idx] = sum / (float)(k_d * k_h * k_w);
+    }
+}
+
+torch::Tensor avg_pool3d_cuda_forward(
+    torch::Tensor input,
+    int k_d, int k_h, int k_w,
+    int stride_d, int stride_h, int stride_w,
+    int pad_d, int pad_h, int pad_w
+) {
+    const int batch_size = input.size(0);
+    const int channels = input.size(1);
+    const int in_d = input.size(2);
+    const int in_h = input.size(3);
+    const int in_w = input.size(4);
+
+    // Calculate output dimensions
+    int out_d = (in_d + 2 * pad_d - k_d) / stride_d + 1;
+    int out_h = (in_h + 2 * pad_h - k_h) / stride_h + 1;
+    int out_w = (in_w + 2 * pad_w - k_w) / stride_w + 1;
+
+    auto output = torch::empty({batch_size, channels, out_d, out_h, out_w}, input.options());
+
+    int total_output_elements = output.numel();
+    const int block_size = 256;
+    const int num_blocks = (total_output_elements + block_size - 1) / block_size;
+
+    avg_pool3d_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size, channels, in_d, in_h, in_w,
+        out_d, out_h, out_w,
+        k_d, k_h, k_w,
+        stride_d, stride_h, stride_w,
+        pad_d, pad_h, pad_w
+    );
+
+    return output;
+}
+"""
+
+avg_pool3d_cpp_source = """
+torch::Tensor avg_pool3d_cuda_forward(
+    torch::Tensor input,
+    int k_d, int k_h, int k_w,
+    int stride_d, int stride_h, int stride_w,
+    int pad_d, int pad_h, int pad_w
+);
+"""
+
+# Compile the inline CUDA code
+avg_pool3d_lib = load_inline(
+    name="avg_pool3d_lib",
+    cpp_sources=avg_pool3d_cpp_source,
+    cuda_sources=avg_pool3d_cuda_source,
+    functions=["avg_pool3d_cuda_forward"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs 3D Average Pooling using a custom CUDA kernel.
+    """
+    def __init__(self, kernel_size: int, stride: int = None, padding: int = 0):
+        super(ModelNew, self).__init__()
+        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size, kernel_size, kernel_size)
+        self.stride = stride if isinstance(stride, tuple) else (stride if stride is not None else self.kernel_size)
+        self.padding = padding if isinstance(padding, tuple) else (padding, padding, padding)
+        self.avg_pool_lib = avg_pool3d_lib
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure input is contiguous for the CUDA kernel
+        x = x.contiguous()
+        
+        return self.avg_pool_lib.avg_pool3d_cuda_forward(
+            x,
+            self.kernel_size[0], self.kernel_size[1], self.kernel_size[2],
+            self.stride[0], self.stride[1], self.stride[2],
+            self.padding[0], self.padding[1], self.padding[2]
+        )
+```

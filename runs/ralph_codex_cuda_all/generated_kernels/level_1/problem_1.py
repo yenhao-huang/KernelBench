@@ -1,0 +1,134 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+matmul_cpp_source = """
+torch::Tensor matmul_cuda(torch::Tensor A, torch::Tensor B);
+"""
+
+matmul_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+#define BM 64
+#define BN 64
+#define BK 16
+#define TM 4
+#define TN 4
+
+__global__ void matmul_kernel(const float* __restrict__ A,
+                              const float* __restrict__ B,
+                              float* __restrict__ C,
+                              int N) {
+    __shared__ float As[BM][BK + 1];
+    __shared__ float Bs[BK][BN + 1];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int tid = ty * blockDim.x + tx;
+
+    const int block_row = blockIdx.y * BM;
+    const int block_col = blockIdx.x * BN;
+
+    float acc[TM][TN];
+
+    #pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        #pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            acc[i][j] = 0.0f;
+        }
+    }
+
+    for (int k0 = 0; k0 < N; k0 += BK) {
+        for (int idx = tid; idx < BM * BK; idx += 256) {
+            int r = idx / BK;
+            int c = idx - r * BK;
+            int gr = block_row + r;
+            int gc = k0 + c;
+            As[r][c] = (gr < N && gc < N) ? A[gr * N + gc] : 0.0f;
+        }
+
+        for (int idx = tid; idx < BK * BN; idx += 256) {
+            int r = idx / BN;
+            int c = idx - r * BN;
+            int gr = k0 + r;
+            int gc = block_col + c;
+            Bs[r][c] = (gr < N && gc < N) ? B[gr * N + gc] : 0.0f;
+        }
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int k = 0; k < BK; ++k) {
+            float a_frag[TM];
+            float b_frag[TN];
+
+            #pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                a_frag[i] = As[ty * TM + i][k];
+            }
+
+            #pragma unroll
+            for (int j = 0; j < TN; ++j) {
+                b_frag[j] = Bs[k][tx * TN + j];
+            }
+
+            #pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                #pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    acc[i][j] += a_frag[i] * b_frag[j];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        int row = block_row + ty * TM + i;
+        if (row < N) {
+            #pragma unroll
+            for (int j = 0; j < TN; ++j) {
+                int col = block_col + tx * TN + j;
+                if (col < N) {
+                    C[row * N + col] = acc[i][j];
+                }
+            }
+        }
+    }
+}
+
+torch::Tensor matmul_cuda(torch::Tensor A, torch::Tensor B) {
+    const int N = (int)A.size(0);
+    auto C = torch::empty({N, N}, A.options());
+
+    dim3 block(16, 16);
+    dim3 grid((N + BN - 1) / BN, (N + BM - 1) / BM);
+
+    matmul_kernel<<<grid, block>>>(A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), N);
+
+    return C;
+}
+"""
+
+matmul_ext = load_inline(
+    name="kb_square_matmul_64x64x16",
+    cpp_sources=matmul_cpp_source,
+    cuda_sources=matmul_cuda_source,
+    functions=["matmul_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.matmul_ext = matmul_ext
+
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        return self.matmul_ext.matmul_cuda(A, B)

@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 49.824,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "2.076146",
+        "2.075937",
+        "2.075971",
+        "2.076020",
+        "2.075875"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "13.505871",
+        "13.240394",
+        "13.057022",
+        "13.641625",
+        "13.351061"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_1/problem_85.py",
+  "level": 1,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 85,
+  "problem_name": "85_conv_depthwise_2D_asymmetric_input_asymmetric_kernel.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_1/problem_85.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 107.564,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "0.000024",
+        "0.000024",
+        "0.000024",
+        "0.000024",
+        "0.000024"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "0.000849",
+        "0.000780",
+        "0.000768",
+        "0.000782",
+        "0.000804"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_codex_cuda_all/generated_kernels/level_2/problem_54.py",
+  "level": 2,
+  "model_name": "codex-gpt-5.5",
+  "precision": "fp32",
+  "problem_id": 54,
+  "problem_name": "54_Conv2d_Multiply_LeakyReLU_GELU.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_codex_cuda_all/raw_generation/level_2/problem_54.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

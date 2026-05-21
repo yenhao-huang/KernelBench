@@ -1,0 +1,125 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernel to fuse: x * scaling_factor -> tanh -> x * bias -> sigmoid
+# This avoids multiple global memory reads/writes for the element-wise operations.
+fused_ops_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_elementwise_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ scaling_factor,
+    const float* __restrict__ bias,
+    float* __restrict__ out,
+    int N, int C, int D, int H, int W,
+    int scaling_size, // size of scaling_factor tensor
+    int bias_size    // size of bias tensor
+) {
+    // We assume scaling_factor and bias are broadcastable to (C, D, H, W) or (C, 1, 1, 1)
+    // For simplicity in this specific architecture, bias_shape is (out_channels, 1, 1, 1)
+    // and scaling_factor is also (out_channels, 1, 1, 1).
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C * D * H * W;
+
+    if (idx < total_elements) {
+        // Calculate indices for broadcasting
+        // x is [N, C, D, H, W]
+        int w = idx % W;
+        int h = (idx / W) % H;
+        int d = (idx / (W * H)) % D;
+        int c = (idx / (W * H * D)) % C;
+        int n = idx / (W * H * D * C);
+
+        // Since scaling_factor and bias are (C, 1, 1, 1), we index them by C
+        // We assume they are stored in a way that C is the first dimension after N is removed.
+        // However, in PyTorch, the tensor is [C, 1, 1, 1]. 
+        // To handle the broadcast correctly:
+        float s = scaling_factor[c]; 
+        float b = bias[c];
+
+        float val = x[idx];
+        
+        // x = x * scaling_factor
+        val = val * s;
+        // x = tanh(x)
+        val = tanhf(val);
+        // x = x * bias
+        val = val * b;
+        // x = sigmoid(x)
+        val = 1.0f / (1.0f + expf(-val));
+
+        out[idx] = val;
+    }
+}
+
+torch::Tensor fused_elementwise_cuda(
+    torch::Tensor x, 
+    torch::Tensor scaling_factor, 
+    torch::Tensor bias
+) {
+    auto N = x.size(0);
+    auto C = x.size(1);
+    auto D = x.size(2);
+    auto H = x.size(3);
+    auto W = x.size(4);
+    int total_elements = x.numel();
+
+    auto out = torch::empty_like(x);
+
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    fused_elementwise_kernel<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(),
+        scaling_factor.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C, D, H, W,
+        scaling_factor.numel(),
+        bias.numel()
+    );
+
+    return out;
+}
+"""
+
+fused_ops_cpp_source = """
+torch::Tensor fused_elementwise_cuda(torch::Tensor x, torch::Tensor scaling_factor, torch::Tensor bias);
+"""
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_cuda_source,
+    functions=["fused_elementwise_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model using a fused CUDA kernel for the element-wise operations following Conv3d.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, scaling_factor, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        # Register parameters to ensure they are moved to GPU with the model
+        self.scaling_factor = nn.Parameter(torch.randn(bias_shape))
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.fused_ops = fused_ops
+
+    def forward(self, x):
+        # Step 1: Standard Conv3d (highly optimized in cuDNN)
+        x = self.conv(x)
+        
+        # Step 2: Fused element-wise operations
+        # The kernel handles: (x * scaling_factor) -> tanh -> (x * bias) -> sigmoid
+        # We pass the tensors directly. The kernel assumes scaling_factor and bias 
+        # are broadcastable to the shape of x.
+        x = self.fused_ops.fused_elementwise_cuda(x, self.scaling_factor, self.bias)
+        
+        return x

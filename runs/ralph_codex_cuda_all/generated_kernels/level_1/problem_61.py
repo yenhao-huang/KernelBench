@@ -1,0 +1,184 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+conv_transpose3d_cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void conv_transpose3d_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ bias,
+    float* __restrict__ y,
+    int N, int Cin, int Din, int Hin, int Win,
+    int Cout, int Dout, int Hout, int Wout,
+    int K, int stride, int padding, int groups,
+    int has_bias,
+    long total
+) {
+    long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int ow = idx % Wout;
+    int t = idx / Wout;
+    int oh = t % Hout;
+    t /= Hout;
+    int od = t % Dout;
+    t /= Dout;
+    int oc = t % Cout;
+    int n = t / Cout;
+
+    int cin_per_group = Cin / groups;
+    int cout_per_group = Cout / groups;
+    int g = oc / cout_per_group;
+    int cin_start = g * cin_per_group;
+    int cin_end = cin_start + cin_per_group;
+    int ocg = oc - g * cout_per_group;
+
+    float acc = has_bias ? bias[oc] : 0.0f;
+
+    for (int ic = cin_start; ic < cin_end; ++ic) {
+        for (int kd = 0; kd < K; ++kd) {
+            int id_num = od + padding - kd;
+            if (id_num < 0 || id_num % stride != 0) continue;
+            int id = id_num / stride;
+            if (id < 0 || id >= Din) continue;
+
+            for (int kh = 0; kh < K; ++kh) {
+                int ih_num = oh + padding - kh;
+                if (ih_num < 0 || ih_num % stride != 0) continue;
+                int ih = ih_num / stride;
+                if (ih < 0 || ih >= Hin) continue;
+
+                for (int kw = 0; kw < K; ++kw) {
+                    int iw_num = ow + padding - kw;
+                    if (iw_num < 0 || iw_num % stride != 0) continue;
+                    int iw = iw_num / stride;
+                    if (iw < 0 || iw >= Win) continue;
+
+                    long x_idx = (((long)n * Cin + ic) * Din + id) * Hin * Win + (long)ih * Win + iw;
+                    long w_idx = ((((long)ic * cout_per_group + ocg) * K + kd) * K + kh) * K + kw;
+                    acc += x[x_idx] * w[w_idx];
+                }
+            }
+        }
+    }
+
+    y[idx] = acc;
+}
+
+torch::Tensor conv_transpose3d_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int stride,
+    int padding,
+    int output_padding,
+    int groups,
+    int has_bias
+) {
+    int N = x.size(0);
+    int Cin = x.size(1);
+    int Din = x.size(2);
+    int Hin = x.size(3);
+    int Win = x.size(4);
+    int K = weight.size(2);
+    int Cout = weight.size(1) * groups;
+
+    int Dout = (Din - 1) * stride - 2 * padding + K + output_padding;
+    int Hout = (Hin - 1) * stride - 2 * padding + K + output_padding;
+    int Wout = (Win - 1) * stride - 2 * padding + K + output_padding;
+
+    auto y = torch::empty({N, Cout, Dout, Hout, Wout}, x.options());
+    long total = y.numel();
+
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+
+    const float* bias_ptr = has_bias ? bias.data_ptr<float>() : nullptr;
+
+    conv_transpose3d_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias_ptr,
+        y.data_ptr<float>(),
+        N, Cin, Din, Hin, Win,
+        Cout, Dout, Hout, Wout,
+        K, stride, padding, groups,
+        has_bias,
+        total
+    );
+
+    return y;
+}
+"""
+
+conv_transpose3d_cpp_source = """
+torch::Tensor conv_transpose3d_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int stride,
+    int padding,
+    int output_padding,
+    int groups,
+    int has_bias
+);
+"""
+
+conv_transpose3d_ext = load_inline(
+    name="kb_conv_transpose3d_fp32_ext",
+    cpp_sources=conv_transpose3d_cpp_source,
+    cuda_sources=conv_transpose3d_cuda_source,
+    functions=["conv_transpose3d_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        output_padding: int = 0,
+        groups: int = 1,
+        bias: bool = False,
+    ):
+        super(ModelNew, self).__init__()
+        self.conv_transpose3d = nn.ConvTranspose3d(
+            in_channels,
+            out_channels,
+            kernel_size=(kernel_size, kernel_size, kernel_size),
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+            groups=groups,
+            bias=bias,
+        )
+        self.stride = stride
+        self.padding = padding
+        self.output_padding = output_padding
+        self.groups = groups
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b = self.conv_transpose3d.bias
+        if b is None:
+            b = self.conv_transpose3d.weight
+            has_bias = 0
+        else:
+            has_bias = 1
+        return conv_transpose3d_ext.conv_transpose3d_cuda(
+            x,
+            self.conv_transpose3d.weight,
+            b,
+            self.stride,
+            self.padding,
+            self.output_padding,
+            self.groups,
+            has_bias,
+        )

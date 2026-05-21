@@ -1,0 +1,77 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+l2norm_cpp_source = """
+torch::Tensor l2norm_cuda(torch::Tensor x);
+"""
+
+l2norm_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void l2norm_kernel(const float* __restrict__ x, float* __restrict__ out, int rows, int cols) {
+    extern __shared__ float sdata[];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int base = row * cols;
+
+    float sum = 0.0f;
+    for (int c = tid; c < cols; c += blockDim.x) {
+        float v = x[base + c];
+        sum += v * v;
+    }
+
+    sdata[tid] = sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sdata[tid] += sdata[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    float inv_norm = rsqrtf(sdata[0]);
+
+    for (int c = tid; c < cols; c += blockDim.x) {
+        out[base + c] = x[base + c] * inv_norm;
+    }
+}
+
+torch::Tensor l2norm_cuda(torch::Tensor x) {
+    auto out = torch::empty_like(x);
+    int rows = x.size(0);
+    int cols = x.size(1);
+
+    const int threads = 256;
+    dim3 blocks(rows);
+    size_t shared = threads * sizeof(float);
+
+    l2norm_kernel<<<blocks, threads, shared>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        rows,
+        cols
+    );
+
+    return out;
+}
+"""
+
+l2norm_ext = load_inline(
+    name="l2norm_ext",
+    cpp_sources=l2norm_cpp_source,
+    cuda_sources=l2norm_cuda_source,
+    functions=["l2norm_cuda"],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.l2norm_ext = l2norm_ext
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.l2norm_ext.l2norm_cuda(x)

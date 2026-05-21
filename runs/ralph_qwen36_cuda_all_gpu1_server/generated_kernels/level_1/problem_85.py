@@ -1,0 +1,242 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for depthwise 2D convolution
+# This implementation handles asymmetric kernels, strides, paddings, and dilations.
+# It is optimized for FP32 precision.
+depthwise_conv2d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper to calculate global index
+#define GET_INDEX(batch, channel, h, w, in_c, in_h, in_w) \
+    ((batch) * (in_c) * (in_h) * (in_w) + (channel) * (in_h) * (in_w) + (h) * (in_w) + (w))
+
+__global__ void depthwise_conv2d_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    float* __restrict__ output,
+    int batch_size,
+    int in_channels,
+    int in_height,
+    int in_width,
+    int out_height,
+    int out_width,
+    int kernel_h,
+    int kernel_w,
+    int stride_h,
+    int stride_w,
+    int padding_h,
+    int padding_w,
+    int dilation_h,
+    int dilation_w,
+    bool has_bias,
+    const float* __restrict__ bias) 
+{
+    // Each thread handles one output element (batch, channel, out_h, out_w)
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    int total_elements = batch_size * in_channels * out_height * out_width;
+    
+    if (idx >= total_elements) return;
+
+    // Decode linear index to coordinates
+    int w_idx = idx % out_width;
+    int temp = idx / out_width;
+    int h_idx = temp % out_height;
+    temp = temp / out_height;
+    int c_idx = temp % in_channels;
+    int b_idx = temp / in_channels;
+
+    // Calculate the starting position in the input image for this output pixel
+    int start_h = h_idx * stride_h - padding_h;
+    int start_w = w_idx * stride_w - padding_w;
+
+    float sum = 0.0f;
+
+    // Iterate over kernel height and width
+    for (int ky = 0; ky < kernel_h; ++ky) {
+        int ih = start_h + ky * dilation_h;
+        // Check bounds for input height
+        if (ih < 0 || ih >= in_height) continue;
+
+        for (int kx = 0; kx < kernel_w; ++kx) {
+            int iw = start_w + kx * dilation_w;
+            // Check bounds for input width
+            if (iw < 0 || iw >= in_width) continue;
+
+            // Fetch weight and input
+            // Weight shape: [in_channels, kernel_h, kernel_w]
+            // Input shape: [batch_size, in_channels, in_height, in_width]
+            
+            int w_idx_local = c_idx * (kernel_h * kernel_w) + ky * kernel_w + kx;
+            float w_val = weight[w_idx_local];
+
+            int i_idx = GET_INDEX(b_idx, c_idx, ih, iw, in_channels, in_height, in_width);
+            float x_val = input[i_idx];
+
+            sum += w_val * x_val;
+        }
+    }
+
+    if (has_bias) {
+        sum += bias[c_idx];
+    }
+
+    // Write to output
+    int o_idx = GET_INDEX(b_idx, c_idx, h_idx, w_idx, in_channels, out_height, out_width);
+    output[o_idx] = sum;
+}
+
+torch::Tensor depthwise_conv2d_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    int kernel_h,
+    int kernel_w,
+    int stride_h,
+    int stride_w,
+    int padding_h,
+    int padding_w,
+    int dilation_h,
+    int dilation_w,
+    bool has_bias,
+    torch::Tensor bias) 
+{
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(weight.is_cuda(), "Weight must be a CUDA tensor");
+    TORCH_CHECK(input.dim() == 4, "Input must be 4D (N, C, H, W)");
+    
+    int batch_size = input.size(0);
+    int in_channels = input.size(1);
+    int in_height = input.size(2);
+    int in_width = input.size(3);
+
+    // Calculate output dimensions
+    int out_height = (in_height + 2 * padding_h - dilation_h * (kernel_h - 1) - 1) / stride_h + 1;
+    int out_width = (in_width + 2 * padding_w - dilation_w * (kernel_w - 1) - 1) / stride_w + 1;
+
+    auto output = torch::zeros({batch_size, in_channels, out_height, out_width}, input.options());
+
+    const int block_size = 256;
+    int total_elements = batch_size * in_channels * out_height * out_width;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    // If bias is provided but empty or not passed correctly, handle it
+    const float* bias_ptr = nullptr;
+    if (has_bias && bias.numel() > 0) {
+        bias_ptr = bias.data_ptr<float>();
+    } else {
+        has_bias = false;
+    }
+
+    depthwise_conv2d_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        in_channels,
+        in_height,
+        in_width,
+        out_height,
+        out_width,
+        kernel_h,
+        kernel_w,
+        stride_h,
+        stride_w,
+        padding_h,
+        padding_w,
+        dilation_h,
+        dilation_w,
+        has_bias,
+        bias_ptr
+    );
+
+    return output;
+}
+"""
+
+depthwise_conv2d_cpp_source = (
+    "torch::Tensor depthwise_conv2d_cuda("
+    "torch::Tensor input,"
+    "torch::Tensor weight,"
+    "int kernel_h,"
+    "int kernel_w,"
+    "int stride_h,"
+    "int stride_w,"
+    "int padding_h,"
+    "int padding_w,"
+    "int dilation_h,"
+    "int dilation_w,"
+    "bool has_bias,"
+    "torch::Tensor bias"
+    ");"
+)
+
+# Compile the inline CUDA code
+depthwise_conv2d = load_inline(
+    name="depthwise_conv2d",
+    cpp_sources=depthwise_conv2d_cpp_source,
+    cuda_sources=depthwise_conv2d_source,
+    functions=["depthwise_conv2d_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Performs a depthwise 2D convolution with asymmetric input and asymmetric kernel
+    using a custom optimized CUDA operator.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size_h: int, kernel_size_w: int, stride_h: int = 1, stride_w: int = 1, padding_h: int = 0, padding_w: int = 0, dilation_h: int = 1, dilation_w: int = 1, groups: int = 1, bias: bool = False):
+        super(ModelNew, self).__init__()
+        
+        # Store parameters for the forward pass
+        self.in_channels = in_channels
+        self.kernel_size_h = kernel_size_h
+        self.kernel_size_w = kernel_size_w
+        self.stride_h = stride_h
+        self.stride_w = stride_w
+        self.padding_h = padding_h
+        self.padding_w = padding_w
+        self.dilation_h = dilation_h
+        self.dilation_w = dilation_w
+        self.has_bias = bias
+        
+        # Initialize weights and bias as buffers so they are part of the module state
+        # Shape for Conv2d weight: [out_channels, in_channels/groups, kernel_h, kernel_w]
+        # Since groups=in_channels, out_channels must equal in_channels for depthwise.
+        self.register_buffer('weight', torch.randn(out_channels, in_channels // groups, kernel_size_h, kernel_size_w))
+        
+        if bias:
+            self.register_buffer('bias', torch.zeros(out_channels))
+        else:
+            self.bias = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the depthwise 2D convolution using the custom CUDA operator.
+        """
+        # Extract weight tensor from buffer
+        w = self.weight
+        
+        # Extract bias if it exists
+        b = self.bias if self.has_bias else torch.empty(0, device=x.device)
+
+        return depthwise_conv2d.depthwise_conv2d_cuda(
+            x,
+            w,
+            self.kernel_size_h,
+            self.kernel_size_w,
+            self.stride_h,
+            self.stride_w,
+            self.padding_h,
+            self.padding_w,
+            self.dilation_h,
+            self.dilation_w,
+            self.has_bias,
+            b
+        )

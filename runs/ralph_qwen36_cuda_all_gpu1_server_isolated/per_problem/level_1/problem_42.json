@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 50.662,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "0.057321",
+        "0.057323",
+        "0.057336",
+        "0.057324",
+        "0.057311"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "0.871749",
+        "0.866238",
+        "0.910525",
+        "0.866132",
+        "0.789268"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_1/problem_42.py",
+  "level": 1,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 42,
+  "problem_name": "42_Max_Pooling_2D.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_1/problem_42.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

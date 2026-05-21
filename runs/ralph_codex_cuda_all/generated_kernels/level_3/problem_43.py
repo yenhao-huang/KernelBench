@@ -1,0 +1,195 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+#define MAX_T 1024
+
+__global__ void linear_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ out,
+    int N,
+    int IN,
+    int OUT
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * OUT;
+    if (idx >= total) return;
+
+    int o = idx % OUT;
+    int n = idx / OUT;
+
+    const float* xp = x + n * IN;
+    const float* wp = w + o * IN;
+
+    float acc = b[o];
+    for (int i = 0; i < IN; ++i) {
+        acc += xp[i] * wp[i];
+    }
+    out[idx] = acc;
+}
+
+__global__ void causal_attn_kernel(
+    const float* __restrict__ qkv,
+    float* __restrict__ y,
+    int B,
+    int T,
+    int C,
+    int H,
+    int HS,
+    float scale
+) {
+    int row = blockIdx.x;
+    int h = blockIdx.y;
+    int b = blockIdx.z;
+    int tid = threadIdx.x;
+
+    __shared__ float red[128];
+    __shared__ float scores[MAX_T];
+
+    const int q_base = ((b * T + row) * (3 * C)) + h * HS;
+    float m = -3.402823466e38f;
+
+    for (int col = 0; col <= row; ++col) {
+        const int k_base = ((b * T + col) * (3 * C)) + C + h * HS;
+        float part = 0.0f;
+
+        for (int d = tid; d < HS; d += blockDim.x) {
+            part += qkv[q_base + d] * qkv[k_base + d];
+        }
+
+        red[tid] = part;
+        __syncthreads();
+
+        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            float sc = red[0] * scale;
+            scores[col] = sc;
+            if (sc > m) m = sc;
+        }
+        __syncthreads();
+    }
+
+    __shared__ float maxv;
+    if (tid == 0) maxv = m;
+    __syncthreads();
+
+    float sum_part = 0.0f;
+    for (int col = tid; col <= row; col += blockDim.x) {
+        float e = expf(scores[col] - maxv);
+        scores[col] = e;
+        sum_part += e;
+    }
+
+    red[tid] = sum_part;
+    __syncthreads();
+
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        __syncthreads();
+    }
+
+    __shared__ float inv_sum;
+    if (tid == 0) inv_sum = 1.0f / red[0];
+    __syncthreads();
+
+    for (int d = tid; d < HS; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int col = 0; col <= row; ++col) {
+            const int v_base = ((b * T + col) * (3 * C)) + 2 * C + h * HS;
+            acc += scores[col] * inv_sum * qkv[v_base + d];
+        }
+        y[(b * T + row) * C + h * HS + d] = acc;
+    }
+}
+
+torch::Tensor linear_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor b) {
+    int N = x.numel() / x.size(-1);
+    int IN = x.size(-1);
+    int OUT = w.size(0);
+
+    auto out = torch::empty({N, OUT}, x.options());
+    int threads = 256;
+    int blocks = (N * OUT + threads - 1) / threads;
+
+    linear_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        w.data_ptr<float>(),
+        b.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N,
+        IN,
+        OUT
+    );
+
+    return out;
+}
+
+torch::Tensor causal_attn_cuda(torch::Tensor qkv, int H) {
+    int B = qkv.size(0);
+    int T = qkv.size(1);
+    int C3 = qkv.size(2);
+    int C = C3 / 3;
+    int HS = C / H;
+
+    auto y = torch::empty({B, T, C}, qkv.options());
+    dim3 grid(T, H, B);
+    dim3 block(128);
+    float scale = rsqrtf((float)HS);
+
+    causal_attn_kernel<<<grid, block>>>(
+        qkv.data_ptr<float>(),
+        y.data_ptr<float>(),
+        B,
+        T,
+        C,
+        H,
+        HS,
+        scale
+    );
+
+    return y;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor linear_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor b);
+torch::Tensor causal_attn_cuda(torch::Tensor qkv, int H);
+"""
+
+attn_ext = load_inline(
+    name="kb_mingpt_attn_fp32",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["linear_cuda", "causal_attn_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen):
+        super().__init__()
+        assert n_embd % n_head == 0
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd)
+        self.c_proj = nn.Linear(n_embd, n_embd)
+        self.n_head = n_head
+        self.n_embd = n_embd
+
+    def forward(self, x):
+        B, T, C = x.shape
+        qkv2 = attn_ext.linear_cuda(x.contiguous(), self.c_attn.weight, self.c_attn.bias)
+        qkv = qkv2.view(B, T, 3 * C)
+        y = attn_ext.causal_attn_cuda(qkv, self.n_head)
+        out2 = attn_ext.linear_cuda(y, self.c_proj.weight, self.c_proj.bias)
+        return out2.view(B, T, C)

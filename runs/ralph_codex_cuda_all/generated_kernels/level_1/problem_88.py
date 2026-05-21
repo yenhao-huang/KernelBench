@@ -1,0 +1,83 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+gelu_cuda_source = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+
+__device__ __forceinline__ float gelu_tanh_f32(float x) {
+    const float kAlpha = 0.7978845608028654f;
+    const float kBeta = 0.044715f;
+    float x3 = x * x * x;
+    float u = kAlpha * (x + kBeta * x3);
+    return 0.5f * x * (1.0f + tanhf(u));
+}
+
+__global__ void gelu_scalar_kernel(const float* __restrict__ x, float* __restrict__ y, int64_t n) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        y[idx] = gelu_tanh_f32(x[idx]);
+    }
+}
+
+__global__ void gelu_vec4_kernel(const float4* __restrict__ x, float4* __restrict__ y, int64_t n4) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n4) {
+        float4 v = x[idx];
+        v.x = gelu_tanh_f32(v.x);
+        v.y = gelu_tanh_f32(v.y);
+        v.z = gelu_tanh_f32(v.z);
+        v.w = gelu_tanh_f32(v.w);
+        y[idx] = v;
+    }
+}
+
+torch::Tensor gelu_cuda(torch::Tensor x) {
+    auto y = torch::empty_like(x);
+    const int64_t n = x.numel();
+    const int threads = 256;
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    uintptr_t xp = reinterpret_cast<uintptr_t>(x.data_ptr<float>());
+    uintptr_t yp = reinterpret_cast<uintptr_t>(y.data_ptr<float>());
+
+    if ((n % 4 == 0) && ((xp & 15) == 0) && ((yp & 15) == 0)) {
+        int64_t n4 = n / 4;
+        int blocks = (int)((n4 + threads - 1) / threads);
+        gelu_vec4_kernel<<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<const float4*>(x.data_ptr<float>()),
+            reinterpret_cast<float4*>(y.data_ptr<float>()),
+            n4
+        );
+    } else {
+        int blocks = (int)((n + threads - 1) / threads);
+        gelu_scalar_kernel<<<blocks, threads, 0, stream>>>(x.data_ptr<float>(), y.data_ptr<float>(), n);
+    }
+
+    return y;
+}
+"""
+
+gelu_cpp_source = """
+torch::Tensor gelu_cuda(torch::Tensor x);
+"""
+
+gelu_ext = load_inline(
+    name="gelu_tanh_inline_ext",
+    cpp_sources=gelu_cpp_source,
+    cuda_sources=gelu_cuda_source,
+    functions=["gelu_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.gelu_ext = gelu_ext
+
+    def forward(self, x):
+        return self.gelu_ext.gelu_cuda(x)

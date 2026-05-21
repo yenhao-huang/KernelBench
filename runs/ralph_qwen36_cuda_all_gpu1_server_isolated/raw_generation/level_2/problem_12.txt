@@ -1,0 +1,162 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused GEMM + Scale + LeakyReLU
+# This kernel performs: out = leaky_relu(x * W^T * input + b) * multiplier
+# Note: The original model does: x = Linear(x); x = x * multiplier; x = LeakyReLU(x)
+# So the operation is: LeakyReLU( (x @ W.T + b) * multiplier )
+
+fused_gemm_scale_leaky_relu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+__global__ void fused_gemm_scale_leaky_relu_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* __restrict__ output,
+    int batch_size,
+    int in_features,
+    int out_features,
+    float multiplier,
+    float negative_slope
+) {
+    // Each thread handles one element of the output matrix (batch, out_features)
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < batch_size * out_features) {
+        int b = idx / out_features;
+        int o = idx % out_features;
+        
+        // Compute dot product for this output element
+        float sum = 0.0f;
+        const float* input_row = input + b * in_features;
+        const float* weight_col = weight + o * in_features; // Weight is stored as [out, in] in nn.Linear
+        
+        #pragma unroll
+        for (int i = 0; i < in_features; ++i) {
+            sum += input_row[i] * weight_col[i];
+        }
+        
+        // Add bias
+        if (bias != nullptr) {
+            sum += bias[o];
+        }
+        
+        // Scale
+        sum *= multiplier;
+        
+        // LeakyReLU
+        if (sum > 0.0f) {
+            output[idx] = sum;
+        } else {
+            output[idx] = sum * negative_slope;
+        }
+    }
+}
+
+torch::Tensor fused_gemm_scale_leaky_relu_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    float multiplier,
+    float negative_slope
+) {
+    auto batch_size = input.size(0);
+    auto in_features = input.size(1);
+    auto out_features = weight.size(0);
+    
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(weight.is_cuda(), "Weight must be a CUDA tensor");
+    TORCH_CHECK(bias.is_cuda(), "Bias must be a CUDA tensor");
+    TORCH_CHECK(input.dim() == 2, "Input must be 2D");
+    TORCH_CHECK(weight.dim() == 2, "Weight must be 2D");
+    TORCH_CHECK(bias.dim() == 1, "Bias must be 1D");
+    TORCH_CHECK(input.size(1) == weight.size(1), "Input features must match weight input features");
+    
+    auto output = torch::empty({batch_size, out_features}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    
+    const int block_size = 256;
+    const int total_elements = batch_size * out_features;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    fused_gemm_scale_leaky_relu_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        in_features,
+        out_features,
+        multiplier,
+        negative_slope
+    );
+    
+    return output;
+}
+"""
+
+fused_gemm_scale_leaky_relu_cpp_source = (
+    "torch::Tensor fused_gemm_scale_leaky_relu_cuda("
+    "torch::Tensor input,"
+    "torch::Tensor weight,"
+    "torch::Tensor bias,"
+    "float multiplier,"
+    "float negative_slope"
+    ");"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_gemm_scale_leaky_relu",
+    cpp_sources=fused_gemm_scale_leaky_relu_cpp_source,
+    cuda_sources=fused_gemm_scale_leaky_relu_source,
+    functions=["fused_gemm_scale_leaky_relu_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs a fused GEMM + Scale + LeakyReLU operation.
+    """
+    def __init__(self, in_features, out_features, multiplier, negative_slope):
+        super(ModelNew, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.multiplier = multiplier
+        self.negative_slope = negative_slope
+        
+        # Initialize weights and biases manually to match nn.Linear behavior
+        # nn.Linear uses Kaiming uniform initialization by default for weight, zeros for bias
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.zeros(out_features))
+        
+        # Initialize parameters similar to nn.Linear
+        nn.init.kaiming_uniform_(self.weight, a=0.1)
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / (fan_in ** 0.5) if fan_in > 0 else 0
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        # Use the custom fused CUDA operator
+        return fused_ops.fused_gemm_scale_leaky_relu_cuda(
+            x, 
+            self.weight, 
+            self.bias, 
+            self.multiplier, 
+            self.negative_slope
+        )
+
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, multiplier, negative_slope]
+```

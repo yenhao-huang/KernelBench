@@ -1,0 +1,200 @@
+```python
+import torch
+import torch.nn as nn
+import math
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void layernorm_kernel(const float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ b, float* __restrict__ y, int rows, int C) {
+    extern __shared__ float smem[];
+    float* ssum = smem;
+    float* ssq = smem + blockDim.x;
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= rows) return;
+
+    const float* xr = x + row * C;
+    float sum = 0.0f, sq = 0.0f;
+    for (int i = tid; i < C; i += blockDim.x) {
+        float v = xr[i];
+        sum += v;
+        sq += v * v;
+    }
+    ssum[tid] = sum;
+    ssq[tid] = sq;
+    __syncthreads();
+
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            ssum[tid] += ssum[tid + s];
+            ssq[tid] += ssq[tid + s];
+        }
+        __syncthreads();
+    }
+
+    float mean = ssum[0] / C;
+    float var = ssq[0] / C - mean * mean;
+    float inv = rsqrtf(var + 1e-5f);
+    float* yr = y + row * C;
+    for (int i = tid; i < C; i += blockDim.x) {
+        yr[i] = (xr[i] - mean) * inv * w[i] + b[i];
+    }
+}
+
+__global__ void gelu_kernel(const float* __restrict__ x, float* __restrict__ y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = x[i];
+        y[i] = 0.5f * v * (1.0f + tanhf(0.7978845608028654f * (v + 0.044715f * v * v * v)));
+    }
+}
+
+__global__ void add_kernel(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = a[i] + b[i];
+}
+
+__global__ void causal_attention_kernel(const float* __restrict__ qkv, float* __restrict__ out, int B, int T, int C, int H) {
+    extern __shared__ float smem[];
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int D = C / H;
+    int t = row % T;
+    int h = (row / T) % H;
+    int b = row / (T * H);
+    float scale = rsqrtf((float)D);
+
+    const float* qbase = qkv + (b * T + t) * (3 * C) + h * D;
+    float local_max = -3.402823466e38f;
+
+    for (int j = tid; j <= t; j += blockDim.x) {
+        const float* kbase = qkv + (b * T + j) * (3 * C) + C + h * D;
+        float dot = 0.0f;
+        for (int d = 0; d < D; ++d) dot += qbase[d] * kbase[d];
+        dot *= scale;
+        local_max = fmaxf(local_max, dot);
+    }
+
+    smem[tid] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] = fmaxf(smem[tid], smem[tid + s]);
+        __syncthreads();
+    }
+    float m = smem[0];
+
+    float local_sum = 0.0f;
+    for (int j = tid; j <= t; j += blockDim.x) {
+        const float* kbase = qkv + (b * T + j) * (3 * C) + C + h * D;
+        float dot = 0.0f;
+        for (int d = 0; d < D; ++d) dot += qbase[d] * kbase[d];
+        local_sum += expf(dot * scale - m);
+    }
+
+    smem[tid] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] += smem[tid + s];
+        __syncthreads();
+    }
+    float denom = smem[0];
+
+    for (int d = tid; d < D; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int j = 0; j <= t; ++j) {
+            const float* kbase = qkv + (b * T + j) * (3 * C) + C + h * D;
+            const float* vbase = qkv + (b * T + j) * (3 * C) + 2 * C + h * D;
+            float dot = 0.0f;
+            for (int kk = 0; kk < D; ++kk) dot += qbase[kk] * kbase[kk];
+            float p = expf(dot * scale - m) / denom;
+            acc += p * vbase[d];
+        }
+        out[(b * T + t) * C + h * D + d] = acc;
+    }
+}
+
+torch::Tensor layernorm_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor b) {
+    auto y = torch::empty_like(x);
+    int C = x.size(-1);
+    int rows = x.numel() / C;
+    layernorm_kernel<<<rows, 256, 512 * sizeof(float)>>>(x.data_ptr<float>(), w.data_ptr<float>(), b.data_ptr<float>(), y.data_ptr<float>(), rows, C);
+    return y;
+}
+
+torch::Tensor gelu_cuda(torch::Tensor x) {
+    auto y = torch::empty_like(x);
+    int n = x.numel();
+    gelu_kernel<<<(n + 255) / 256, 256>>>(x.data_ptr<float>(), y.data_ptr<float>(), n);
+    return y;
+}
+
+torch::Tensor add_cuda(torch::Tensor a, torch::Tensor b) {
+    auto y = torch::empty_like(a);
+    int n = a.numel();
+    add_kernel<<<(n + 255) / 256, 256>>>(a.data_ptr<float>(), b.data_ptr<float>(), y.data_ptr<float>(), n);
+    return y;
+}
+
+torch::Tensor causal_attention_cuda(torch::Tensor qkv, int H) {
+    int B = qkv.size(0);
+    int T = qkv.size(1);
+    int C3 = qkv.size(2);
+    int C = C3 / 3;
+    auto out = torch::empty({B, T, C}, qkv.options());
+    causal_attention_kernel<<<B * H * T, 128, 128 * sizeof(float)>>>(qkv.data_ptr<float>(), out.data_ptr<float>(), B, T, C, H);
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor layernorm_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor b);
+torch::Tensor gelu_cuda(torch::Tensor x);
+torch::Tensor add_cuda(torch::Tensor a, torch::Tensor b);
+torch::Tensor causal_attention_cuda(torch::Tensor qkv, int H);
+"""
+
+kb_ops = load_inline(
+    name="kb_transformer_block_ops",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["layernorm_cuda", "gelu_cuda", "add_cuda", "causal_attention_cuda"],
+    verbose=False,
+)
+
+class CausalSelfAttentionNew(nn.Module):
+    def __init__(self, n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen):
+        super().__init__()
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd)
+        self.c_proj = nn.Linear(n_embd, n_embd)
+        self.n_head = n_head
+        self.n_embd = n_embd
+
+    def forward(self, x):
+        qkv = self.c_attn(x).contiguous()
+        y = kb_ops.causal_attention_cuda(qkv, self.n_head)
+        return self.c_proj(y)
+
+class ModelNew(nn.Module):
+    def __init__(self, n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(n_embd)
+        self.attn = CausalSelfAttentionNew(n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen)
+        self.ln_2 = nn.LayerNorm(n_embd)
+        self.c_fc = nn.Linear(n_embd, 4 * n_embd)
+        self.c_proj = nn.Linear(4 * n_embd, n_embd)
+
+    def forward(self, x):
+        a = kb_ops.layernorm_cuda(x.contiguous(), self.ln_1.weight, self.ln_1.bias)
+        a = self.attn(a)
+        x = kb_ops.add_cuda(x, a)
+        m = kb_ops.layernorm_cuda(x.contiguous(), self.ln_2.weight, self.ln_2.bias)
+        m = self.c_fc(m)
+        m = kb_ops.gelu_cuda(m)
+        m = self.c_proj(m)
+        x = kb_ops.add_cuda(x, m)
+        return x
+```

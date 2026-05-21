@@ -1,0 +1,20 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 84.512,
+  "error": "Isolated KernelBench evaluator failed.",
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_2/problem_33.py",
+  "isolated_eval": {
+    "error": "isolated evaluator exited -11 without writing a result. Output: [1/3] c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=fused_ops -DTORCH_API_INCLUDE_EXTENSION_H -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/include -isystem /home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -fPIC -std=c++17 -O2 -c /home/howard/.cache/torch_extensions/py310_cu128/fused_ops/main.cpp -o main.o \n[2/3] /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=fused_ops -DTORCH_API_INCLUDE_EXTENSION_H -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/include -isystem /home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 --compiler-options '-fPIC' -std=c++17 -c /home/howard/.cache/torch_extensions/py310_cu128/fused_ops/cuda.cu -o cuda.cuda.o \n[3/3] c++ main.o cuda.cuda.o -shared  -L/workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/lib -lcudart -o fused_ops.so\n",
+    "error_type": "subprocess.NoResult",
+    "ok": false
+  },
+  "level": 2,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 33,
+  "problem_name": "33_Gemm_Scale_BatchNorm.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_2/problem_33.txt",
+  "static_warnings": [],
+  "status": "evaluation_error"
+}

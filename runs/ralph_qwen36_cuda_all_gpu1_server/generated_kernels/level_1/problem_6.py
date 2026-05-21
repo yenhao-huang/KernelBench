@@ -1,0 +1,162 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication
+# We use a tiled approach to optimize memory access patterns and utilize shared memory.
+# Given K is very large (524288) and M, N are small (256), we can optimize by processing
+# blocks of rows from A and columns from B efficiently.
+
+matmul_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Block dimensions for tiling
+#define TILE_M 32
+#define TILE_N 32
+#define TILE_K 8 // Number of elements from K dimension per thread block iteration
+
+__global__ void matmul_kernel(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int M, int N, int K) {
+    // Each block computes a TILE_M x TILE_N tile of the output matrix C
+    // blockIdx.x corresponds to row tiles (M dimension)
+    // blockIdx.y corresponds to column tiles (N dimension)
+
+    int row_start = blockIdx.x * TILE_M;
+    int col_start = blockIdx.y * TILE_N;
+
+    // Shared memory for tiling A and B
+    __shared__ float shared_A[TILE_M][TILE_K];
+    __shared__ float shared_B[TILE_K][TILE_N];
+
+    // Register cache for the partial sum of the tile
+    float reg_cache[TILE_M][TILE_N] = {0.0f};
+
+    int global_k_start = 0;
+    
+    // Loop over K dimension in tiles
+    while (global_k_start < K) {
+        // Load tile from A into shared memory
+        // Each thread loads one element from A and one from B
+        // Thread index within block: threadIdx.x (0..31), threadIdx.y (0..31)
+        
+        int tid_x = threadIdx.x;
+        int tid_y = threadIdx.y;
+
+        // Load A[row_start + tid_y][global_k_start + tid_x] if within bounds
+        int a_row = row_start + tid_y;
+        int a_col = global_k_start + tid_x;
+        
+        if (a_row < M && a_col < K) {
+            shared_A[tid_y][tid_x] = A[a_row * K + a_col];
+        } else {
+            shared_A[tid_y][tid_x] = 0.0f;
+        }
+
+        // Load B[global_k_start + tid_x][col_start + tid_y] if within bounds
+        int b_row = global_k_start + tid_x;
+        int b_col = col_start + tid_y;
+
+        if (b_row < K && b_col < N) {
+            shared_B[tid_x][tid_y] = B[b_row * N + b_col];
+        } else {
+            shared_B[tid_x][tid_y] = 0.0f;
+        }
+
+        // Synchronize to ensure all data is loaded into shared memory
+        __syncthreads();
+
+        // Compute partial dot product for the current tile of K
+        // Each thread computes contributions for its assigned output elements
+        // Thread (tid_y, tid_x) contributes to reg_cache[tid_y][tid_x] and potentially others?
+        // Standard tiling: Thread (i, j) computes C[i][j] += A[i][k]*B[k][j] for k in 0..TILE_K-1
+        
+        for (int k = 0; k < TILE_K; ++k) {
+            float a_val = shared_A[tid_y][k];
+            // Unroll or loop over B's column part handled by thread mapping?
+            // Actually, in this setup, Thread (tid_y, tid_x) is responsible for C[row_start + tid_y][col_start + tid_x]
+            // It needs to sum A[row_start + tid_y][global_k_start + k] * B[global_k_start + k][col_start + tid_x]
+            
+            float b_val = shared_B[k][tid_x];
+            
+            reg_cache[tid_y][tid_x] += a_val * b_val;
+        }
+
+        // Synchronize before loading next tile
+        __syncthreads();
+
+        global_k_start += TILE_K;
+    }
+
+    // Write results back to global memory
+    int out_row = row_start + tid_y;
+    int out_col = col_start + tid_x;
+
+    if (out_row < M && out_col < N) {
+        C[out_row * N + out_col] = reg_cache[tid_y][tid_x];
+    }
+}
+
+torch::Tensor matmul_cuda(torch::Tensor A, torch::Tensor B) {
+    auto M = A.size(0);
+    auto K = A.size(1);
+    auto N = B.size(1);
+
+    // Ensure inputs are contiguous and on CUDA
+    if (!A.is_contiguous()) A = A.contiguous();
+    if (!B.is_contiguous()) B = B.contiguous();
+
+    auto C = torch::zeros({M, N}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+
+    const int block_size_x = TILE_M; // Threads along M dimension in block
+    const int block_size_y = TILE_N; // Threads along N dimension in block
+    
+    dim3 block(block_size_x, block_size_y);
+    
+    // Grid dimensions: number of tiles
+    int grid_x = (M + TILE_M - 1) / TILE_M;
+    int grid_y = (N + TILE_N - 1) / TILE_N;
+    dim3 grid(grid_x, grid_y);
+
+    matmul_kernel<<<grid, block>>>(A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), M, N, K);
+
+    return C;
+}
+"""
+
+matmul_cpp_source = (
+    "torch::Tensor matmul_cuda(torch::Tensor A, torch::Tensor B);"
+)
+
+# Compile the inline CUDA code for matrix multiplication
+matmul_lib = load_inline(
+    name="matmul_custom",
+    cpp_sources=matmul_cpp_source,
+    cuda_sources=matmul_source,
+    functions=["matmul_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using custom CUDA matrix multiplication.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.matmul = matmul_lib
+
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """
+        Performs optimized matrix multiplication of A and B using custom CUDA kernel.
+
+        Args:
+            A: Input tensor of shape (M, K)
+            B: Input tensor of shape (K, N)
+
+        Returns:
+            Output tensor of shape (M, N)
+        """
+        return self.matmul.matmul_cuda(A, B)

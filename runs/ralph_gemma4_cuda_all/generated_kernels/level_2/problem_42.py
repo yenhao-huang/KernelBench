@@ -1,0 +1,203 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# The optimization strategy:
+# The ConvTranspose2d is a heavy operation and is best left to cuDNN.
+# However, the subsequent operations:
+# 1. Global Average Pooling (mean over H, W)
+# 2. Addition of bias (shape: [out_channels, 1, 1])
+# 3. LogSumExp (over channels)
+# 4. Sum (over H, W - though H,W are 1 after GAP)
+# 5. Multiplication by 10.0
+# can be fused into a single kernel to avoid multiple global memory roundtrips.
+#
+# Specifically, after ConvTranspose2d, we have a tensor of shape [B, C_out, H_out, W_out].
+# We can compute the mean of each channel, add the bias, perform logsumexp across channels,
+# and then sum/scale.
+
+fused_ops_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+// Kernel to perform:
+// 1. Mean over H, W for each channel
+// 2. Add bias
+// 3. LogSumExp over channels
+// 4. Sum (already reduced to 1x1) and multiply by 10
+// Since LogSumExp is a reduction, we can implement it using a two-pass approach 
+// or a single pass with a stable online logsumexp algorithm.
+// Given the constraints, we'll compute the mean per channel first, then 
+// use a kernel to compute the LogSumExp across the channel dimension.
+
+__global__ void fused_post_process_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ bias,
+    float* __restrict__ out,
+    int batch_size,
+    int channels,
+    int height,
+    int width) 
+{
+    // Each block handles one batch element
+    int b = blockIdx.x;
+    if (b >= batch_size) return;
+
+    // Step 1: Compute mean for each channel and add bias
+    // We'll store intermediate means in shared memory or just compute them.
+    // To keep it simple and robust, we'll use a two-step approach within the kernel.
+    // However, for LogSumExp, we need the max for stability.
+    
+    // We'll use a local array in registers/shared memory for the channels
+    // This assumes 'channels' is not too large for the block. 
+    // For general cases, we'll use a more robust approach.
+    
+    // Let's compute the mean for each channel first.
+    // Since we need to do LogSumExp over channels, we need all channel means.
+    // We'll use a shared memory buffer to store the means for the current batch.
+    extern __shared__ float shared_means[];
+
+    // 1. Compute means for each channel
+    for (int c = threadIdx.x; c < channels; c += blockDim.x) {
+        float sum = 0.0f;
+        for (int i = 0; i < height * width; ++i) {
+            sum += x[b * channels * height * width + c * height * width + i];
+        }
+        float mean_val = sum / (float)(height * width);
+        shared_means[c] = mean_val + bias[c];
+    }
+    __syncthreads();
+
+    // 2. LogSumExp over channels: log(sum(exp(x_i)))
+    // Find max for stability
+    float max_val = -1e38f;
+    for (int c = threadIdx.x; c < channels; c += blockDim.x) {
+        if (shared_means[c] > max_val) max_val = shared_means[c];
+    }
+    // Reduction for max_val
+    // (Simplified reduction for brevity, in production use block-wide reduction)
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        // This is a simplified reduction logic
+    }
+    // To ensure correctness without complex reduction code, we'll use a simple loop 
+    // for the max and sum since channels is usually manageable.
+    
+    // Re-calculating max_val correctly across the block
+    // We'll use a simple approach: all threads participate in finding max
+    // For the sake of this implementation, we'll assume channels is small enough 
+    // to be handled or use a more standard reduction.
+    
+    // Let's use a more robust approach for the LogSumExp part.
+    // We'll find max_val using a simple loop for all threads.
+    // Note: In a real high-perf kernel, we'd use __shfl_down_sync.
+    
+    // For the purpose of this task, we'll implement a stable LogSumExp.
+    // We'll use a single thread to finalize the result for the batch.
+    
+    // Find max
+    float local_max = -1e38f;
+    for (int c = threadIdx.x; c < channels; c += blockDim.x) {
+        if (shared_means[c] > local_max) local_max = shared_means[c];
+    }
+    // Block-wide max reduction
+    __shared__ float block_max;
+    if (threadIdx.x == 0) block_max = -1e38f;
+    __syncthreads();
+    
+    // Use atomicMax for float (requires bit conversion) or just a simple loop
+    // Since we are in a kernel, let's use a simple loop for the reduction 
+    // to ensure it's actually functional.
+    
+    // Actually, let's just compute the sum of exps in a way that's easy.
+    // We'll use a single thread to do the final reduction to avoid complexity.
+    
+    // Find max_val
+    float max_v = -1e38f;
+    for(int c=0; c<channels; ++c) {
+        if(shared_means[c] > max_v) max_v = shared_means[c];
+    }
+    // This is slow but correct for the reduction part. 
+    // A better way is to use shared memory reduction.
+    
+    // Let's use a more efficient approach for the reduction.
+    // We'll use a shared memory array to store the max and the sum.
+    
+    // Re-calculating max_v correctly:
+    // We'll use a simple loop for max_v and sum_exp.
+    // To make it fast, we'll only do this once per block.
+    
+    if (threadIdx.x == 0) {
+        float m_val = -1e38f;
+        for (int c = 0; c < channels; ++c) {
+            if (shared_means[c] > m_val) m_val = shared_means[c];
+        }
+        
+        float s_exp = 0.0f;
+        for (int c = 0; c < channels; ++c) {
+            s_exp += expf(shared_means[c] - m_val);
+        }
+        
+        float lse = m_val + logf(s_exp);
+        out[b] = lse * 10.0f;
+    }
+}
+
+torch::Tensor fused_post_process_cuda(torch::Tensor x, torch::Tensor bias) {
+    auto batch_size = x.size(0);
+    auto channels = x.size(1);
+    auto height = x.size(2);
+    auto width = x.size(3);
+    
+    auto out = torch::empty({batch_size}, x.options());
+    
+    const int block_size = 256;
+    // We need shared memory for 'channels' number of floats
+    size_t shared_mem_size = channels * sizeof(float);
+    
+    // We launch one block per batch element
+    // Note: This kernel assumes channels <= block_size for the simple implementation.
+    // If channels > block_size, the loop 'c < channels; c += blockDim.x' handles it.
+    
+    fused_post_process_kernel<<<batch_size, block_size, shared_mem_size>>>(
+        x.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        channels,
+        height,
+        width
+    );
+    
+    return out;
+}
+"""
+
+fused_ops_cpp_source = """
+torch::Tensor fused_post_process_cuda(torch::Tensor x, torch::Tensor bias);
+"""
+
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_cuda_source,
+    functions=["fused_post_process_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.fused_ops = fused_ops
+
+    def forward(self, x):
+        # Perform the heavy convolution using cuDNN
+        x = self.conv_transpose(x)
+        
+        # Fuse: Mean(H,W) + Bias + LogSumExp(C) + Sum + *10
+        # The kernel handles the reduction and the math.
+        # Note: The original model's 'sum' was over (2,3) which are H,W.
+        # After GAP, H=1, W=1, so sum(dim=(2,3)) is just the value itself.
+        return self.fused_ops.fused_post_process_cuda(x, self.bias)

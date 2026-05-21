@@ -1,0 +1,63 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__device__ __forceinline__ float softplusf_stable(float x) {
+    if (x > 20.0f) return x;
+    if (x < -20.0f) return expf(x);
+    return log1pf(expf(x));
+}
+
+__device__ __forceinline__ float mishf(float x) {
+    return x * tanhf(softplusf_stable(x));
+}
+
+__global__ void mish_twice_kernel(const float* __restrict__ x, float* __restrict__ y, long n) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float v = x[idx];
+        v = mishf(v);
+        v = mishf(v);
+        y[idx] = v;
+    }
+}
+
+torch::Tensor mish_twice_cuda(torch::Tensor x) {
+    auto y = torch::empty_like(x);
+    long n = x.numel();
+    const int threads = 256;
+    const int blocks = (int)((n + threads - 1) / threads);
+    mish_twice_kernel<<<blocks, threads>>>(x.data_ptr<float>(), y.data_ptr<float>(), n);
+    return y;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor mish_twice_cuda(torch::Tensor x);
+"""
+
+mish_twice_ext = load_inline(
+    name="mish_twice_ext_kb",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["mish_twice_cuda"],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.mish_twice = mish_twice_ext
+
+    def forward(self, x):
+        x = self.conv(x)
+        return self.mish_twice.mish_twice_cuda(x)
+```

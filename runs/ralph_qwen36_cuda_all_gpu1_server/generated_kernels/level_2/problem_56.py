@@ -1,0 +1,275 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused Linear + Sigmoid + Sum
+# This kernel performs: out = sum(sigmoid(Wx + b), dim=1)
+fused_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Kernel to compute y = sigmoid(x) and accumulate sum along rows
+__global__ void fused_linear_sigmoid_sum_kernel(
+    const float* __restrict__ x,      // Input: (batch_size, input_size)
+    const float* __restrict__ w,      // Weights: (hidden_size, input_size) - Transposed for coalesced access if needed, but here we assume standard layout or handle indexing carefully. 
+                                      // Standard nn.Linear: out = x @ W.T + b. 
+                                      // If W is (hidden, input), then x (batch, input) @ W.T (input, hidden) -> (batch, hidden).
+                                      // Let's assume w is stored as (hidden_size, input_size) corresponding to nn.Linear weight.
+    const float* __restrict__ b,      // Bias: (hidden_size,)
+    float* __restrict__ out,          // Output: (batch_size, 1)
+    int batch_size,
+    int input_size,
+    int hidden_size
+) {
+    int batch_idx = blockIdx.x;
+    if (batch_idx >= batch_size) return;
+
+    // Each thread block handles one sample in the batch.
+    // We need to compute the dot product for each of the hidden_size outputs.
+    // To optimize, we can use shared memory or just direct global memory access with coalescing.
+    // Given input_size=32768, a single thread doing the full dot product is too slow due to latency.
+    // We should split the work across threads within the block.
+    
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    
+    // Shared memory for partial sums of the dot products? 
+    // Actually, since we have hidden_size outputs per sample, and input_size inputs,
+    // it's better to have each thread compute a portion of the dot product for ONE output neuron,
+    // OR have each thread compute one full output neuron if input_size is small.
+    // Here input_size is large (32768). 
+    // Strategy: Each block computes all hidden_size outputs for one batch item.
+    // We need to parallelize the dot product across threads.
+    
+    // Let's assign each thread to compute a subset of the input dimensions for ALL hidden neurons?
+    // No, that causes bank conflicts and complex indexing.
+    // Better: Each thread computes ONE output neuron (one row of W) fully? 
+    // 32768 ops per thread is too much latency.
+    // Best approach for large M,N in GEMM-like op: Tiled or vectorized access.
+    
+    // Let's use a simple parallel reduction over the input dimension for each output neuron.
+    // We will launch enough threads to cover the hidden_size * input_size work? No, that's too many threads.
+    // Standard approach: Grid-stride loop over the dot product accumulation.
+    
+    // Let's have each thread compute one element of the output vector (one sigmoid(sum)).
+    // But we need to sum 32768 floats first.
+    // We can use a parallel reduction within the block for each output neuron? 
+    // That requires shared memory and synchronization, which is complex for variable hidden_size.
+    
+    // Alternative: Use atomicAdd or just let one thread do it if we optimize memory access?
+    // No, 32k floats is too much for one thread to fetch sequentially without caching help.
+    
+    // Let's try a different mapping:
+    // Block size = 1024 (or max).
+    // Each thread computes a partial sum of the dot product for ONE specific output neuron?
+    // No, we have hidden_size output neurons.
+    
+    // Let's map threads to input indices.
+    // Thread t processes input index i = tid + k * blockDim.x.
+    // For each such input index, it contributes to ALL hidden_size outputs.
+    // This is bad for memory access pattern (strided writes).
+    
+    // Let's map threads to output neurons?
+    // If hidden_size <= num_threads_per_block, we can have one thread per output neuron.
+    // But hidden_size = 32768. We can't have 32k threads per block.
+    
+    // Hybrid approach:
+    // Use multiple blocks per batch item? No, overhead.
+    // Use a single block per batch item, but split the dot product reduction across threads using shared memory.
+    
+    // Shared memory layout:
+    // We need to store partial sums for each of the hidden_size neurons.
+    // 32768 floats in shared memory is ~128KB. Max shared mem is usually 48-96KB on older GPUs, 
+    // but modern GPUs (Ampere/Hopper) have plenty. Let's assume sufficient shared memory or use global memory with atomic adds?
+    // Atomic adds are slow.
+    
+    // Let's stick to a simpler, robust kernel that might be slightly less optimal but correct and fast enough:
+    // Use vectorized loads if possible, or just standard loop.
+    // Actually, for 32768, we can use a grid-stride loop over the input dimension for each output neuron.
+    // But we need to launch one thread per output neuron? No, that's 32k threads.
+    // We can launch a grid of blocks where each block handles a subset of output neurons.
+    
+    // Let's define:
+    // Each block handles 'block_hidden_size' output neurons.
+    // Within the block, threads iterate over the input dimension to compute the dot product for their assigned neurons.
+    
+    int start_neuron = blockIdx.y * blockDim.x; // Assuming 2D grid or just using blockIdx.x for neuron index if we launch enough blocks?
+    // Let's use a 1D grid where each thread computes one output neuron.
+    // Total threads = batch_size * hidden_size.
+    // This is 128 * 32768 = 4M threads. That's fine for modern GPUs.
+    
+    int global_thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_threads = gridDim.x * blockDim.x;
+    
+    // Each thread handles one (batch, neuron) pair.
+    // We need to map global_thread_idx to (batch_idx, neuron_idx).
+    // Total items = batch_size * hidden_size.
+    
+    for (int i = global_thread_idx; i < batch_size * hidden_size; i += total_threads) {
+        int b = i / hidden_size;
+        int n = i % hidden_size;
+        
+        float sum = 0.0f;
+        
+        // Compute dot product: x[b, :] . w[n, :]
+        // Access pattern: x is (batch, input), w is (hidden, input).
+        // For a fixed b and n, we iterate over k in [0, input_size).
+        // x[b * input_size + k] and w[n * input_size + k].
+        
+        // Vectorized load could help here. Let's assume float4 or just simple loop.
+        // Simple loop with unrolling might be best for simplicity and correctness.
+        
+        #pragma unroll
+        for (int k = 0; k < input_size; ++k) {
+            sum += x[b * input_size + k] * w[n * input_size + k];
+        }
+        
+        // Add bias
+        sum += b[n];
+        
+        // Sigmoid: 1 / (1 + exp(-sum))
+        float sig = 1.0f / (1.0f + expf(-sum));
+        
+        // Store result
+        out[b] = sig; // Wait, the output shape is (batch_size, 1). 
+                      // The problem says sum over dim=1. 
+                      // So we need to SUM the sigmoids of all hidden neurons for each batch item.
+    }
+}
+
+// The above kernel computes sigmoid(z) for each neuron. We still need to sum them.
+// Let's modify the kernel to accumulate the sum directly.
+
+__global__ void fused_linear_sigmoid_sum_kernel_v2(
+    const float* __restrict__ x,      // Input: (batch_size, input_size)
+    const float* __restrict__ w,      // Weights: (hidden_size, input_size)
+    const float* __restrict__ bias,   // Bias: (hidden_size,)
+    float* __restrict__ out,          // Output: (batch_size, 1)
+    int batch_size,
+    int input_size,
+    int hidden_size
+) {
+    // Each thread computes the final sum for one batch item.
+    // Total threads = batch_size.
+    
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batch_size) return;
+    
+    float total_sum = 0.0f;
+    
+    // Iterate over all hidden neurons
+    #pragma unroll
+    for (int n = 0; n < hidden_size; ++n) {
+        float neuron_sum = 0.0f;
+        
+        // Compute dot product for this neuron
+        const float* x_row = x + b * input_size;
+        const float* w_row = w + n * input_size;
+        
+        #pragma unroll
+        for (int k = 0; k < input_size; ++k) {
+            neuron_sum += x_row[k] * w_row[k];
+        }
+        
+        // Add bias
+        neuron_sum += bias[n];
+        
+        // Sigmoid
+        float sig = 1.0f / (1.0f + expf(-neuron_sum));
+        
+        total_sum += sig;
+    }
+    
+    out[b] = total_sum;
+}
+
+torch::Tensor fused_linear_sigmoid_sum_cuda(
+    torch::Tensor x,
+    torch::Tensor w,
+    torch::Tensor b
+) {
+    auto batch_size = x.size(0);
+    auto input_size = x.size(1);
+    auto hidden_size = w.size(0);
+    
+    auto out = torch::zeros({batch_size, 1}, x.options());
+    
+    const int block_size = 256;
+    const int num_blocks = (batch_size + block_size - 1) / block_size;
+    
+    fused_linear_sigmoid_sum_kernel_v2<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(),
+        w.data_ptr<float>(),
+        b.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        input_size,
+        hidden_size
+    );
+    
+    return out;
+}
+"""
+
+fused_ops_cpp_source = (
+    "torch::Tensor fused_linear_sigmoid_sum_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_source,
+    functions=["fused_linear_sigmoid_sum_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using custom CUDA operator for fused Linear + Sigmoid + Sum.
+    """
+    def __init__(self, input_size, hidden_size):
+        super(ModelNew, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        
+        # Initialize weights and biases manually to match nn.Linear behavior
+        # nn.Linear uses Kaiming uniform initialization by default in some contexts, 
+        # but standard torch.nn.Linear init is:
+        # weight: uniform(-sqrt(1/in_features), sqrt(1/in_features))
+        # bias: uniform(-sqrt(1/in_features), sqrt(1/in_features))
+        
+        self.register_buffer('weight', torch.empty(hidden_size, input_size))
+        self.register_buffer('bias', torch.empty(hidden_size))
+        
+        # Initialize weights similar to nn.Linear
+        bound = 1 / (input_size ** 0.5)
+        with torch.no_grad():
+            self.weight.uniform_(-bound, bound)
+            self.bias.uniform_(-bound, bound)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, input_size).
+
+        Returns:
+            Output tensor of shape (batch_size, 1).
+        """
+        # Transpose weight to match the kernel's expectation if necessary.
+        # The kernel expects w as (hidden_size, input_size).
+        # nn.Linear stores weight as (out_features, in_features) which is (hidden_size, input_size).
+        # So no transpose needed for the kernel logic: x @ W.T + b -> sum_i(x_i * W[j][i])
+        
+        return fused_ops.fused_linear_sigmoid_sum_cuda(x, self.weight, self.bias)
+
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size)]
+
+def get_init_inputs():
+    return [input_size, hidden_size]

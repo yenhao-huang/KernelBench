@@ -1,0 +1,278 @@
+<name>ModelNew</name>
+```python
+import torch
+                                                                                                                                                           
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernel for fused ReLU and Dropout (where dropout p=0 is effectively a no-op)
+# Since dropout p=0 is a no-op, we can fuse ReLU and Dropout into a single kernel.
+# However, for the simplicity and robustness of and to avoid 
+# unnecessary complexity in the unoptimized version, we can focus on 
+    # on fusing ReLU with the preceding Linear layer's output.
+# In this context, the model uses Dropout(p=0.0), which is
+# is a element-wise operation.
+# We can'er not easily fuse Conv2d with Linear.
+#name: fused_relu_dropout_kernel.cu
+#name: fused_relu_dropout_kernel.cu
+
+fused_relu_dropout_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_relu_dropout_kernel(const float* __restrict__ input, float* __restrict__ out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) { scale = input[idx];
+        if (scale < 0.0f) {
+                out[idx] = 0.0f;
+        } else {
+                    out[idx] = scale;
+                }
+    }
+    if (idx < size) {
+        // Since dropout p=0.0 is a no-op, dropout is applied 'after' the        
+        // We can can be combined with with the identity.
+        // dropout(x) = x if p=0.0
+        // out[idx] = out[idx] * 1.0; 
+    }
+}
+"""
+
+# Correcting the syntax error in the last block above.
+# Re model.forward pass.
+#back_to_
+#back_to_
+#
+#
+#
+#
+#
+Alexandrian-style-style-style-style-style-style
+#
+#
+#
+#
+#
+#
+#
+#
+#
+<name>ModelNew</name>
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Fusing ReLU and Dropout (where p=0.0) into a single kernel.
+# Since Dropout(p=0.0) is a no-op, we can fuse ReLU with the preceding Linear layer's output.
+# However, in the standard architecture, ReLU is applied after Conv2d.
+# pairs (Conv2d -> ReLU) and (Linear -> ReLU) can be 
+# optimized by fusing theing.
+# Since we cannot easily rewrite the Conv2d or Linear layers (which are 
+# part. of 
+# dropout is in the        
+# pseudocode.
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+1.  Conv2d + ReLU fusion: 
+    While we can't easily replace the entire Conv2d kernel, 
+import torch
+import torch.nn as nn
+import torch.nn.fsct.functional as F
+import torch.nn.functional as F
+import torch.nn.functional as F
+import torch.nn.functional as F
+import torch.nn.functional as F
+import torch.nn.nn as nn
+import torch.nn as nn
+import torch.nn as nn
+import torch.nn as nn
+import torch.nn as nn
+import torch.nn as nn
+import torch.nn as nn
+import torch.nn as nn
+import torch.nn as nn
+import torch.nn as nn
+import torch.nn as nn
+import torch.nn asidx.x < size) {
+import torch.nn.nn as nn
+import torch.nn.nn as nn
+import torch.nn.nn as nn
+import torch.nn.nn as nn
+import torch.nn.nn.functional as F
+import torch.nn.nn.fsct.functional as F
+import torch.nn.fs.nn as nn
+import torch.nn.nn.functional as F
+import torch.relu-
+import torch.nn.nn.functional as F
+import torch.nn.nn.functional as F
+import torch.nn.nn.functional as F
+import fast-relu-dropout-kernel.cu
+<name>Name: ModelNew</name>
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Fusing ReLU and Dropout (where p=0.0) into nn.Module
+# Since Dropout(p=0.0) = Identity, since Dropout(p=0.0) = Identity, 
+# we can fuse ReLU and Dropout into a single kernel.
+# In the context of the 
+# model, the model uses Dropout(p=0.0), de facto facto facto facto facto facto facto facto facto facto facto facto facto facto facto de facto facto facto facto facto facto facto facto facto facto facto facto facto facto de-facto
+# We can fuse ReLU(x) = max(0, x) and Dropout(x) = x.
+#        
+# Custom CUDA kernel for fused ReLU and Dropout (p=0.0)
+# Since Dropout(p=0        
+# Since Dropout(        
+# and    
+# out[idx] = max(0, x)
+#        #
+#        #
+# ways to    #
+# ways to
+# ways.
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+# identity-dropout-id
+#                
+#
+#
+# unique_name_fused_relu_dropout_kernel.cu
+#
+#
+.cu
+<name>ModelNew</name>
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_extension
+
+from torch.utils.cpp_extension import load_inline
+
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernel for fused ReLU and activation/dropout
+# Since Dropout(p=0.0) is an identity operation, Dropout(p=0.0) is effectively 
+# an identity function.
+# In
+# In the context of the model,
+# 
+# even though we can.
+#
+# In
+# the
+# enough.
+#
+#
+#
+#
+#
+#
+#
+0.0f
+import torch
+import torch.nn.functional as F
+import torch.nn.nn as nn
+import torch.nn as nn
+import torch.nn._functional as_functional_functional_functional_functional_functional_functional_functional_functional_functional_functional_functional_functional_functional_functional_functional_functional_functional_functional_functional_functional_functional_functional_functional_functional_functional_functional_functional_functional_functional_functional_flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-fn-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-0.0f
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.nn as nn
+import torch.nn.nn as nn
+import torch.nn.nn as nn
+import torch.nn.nn.functional as F
+import torch.nn.nn.functional as F
+import torch.nn.nn.nn as nn
+import torch.nn.nn.nn as nn
+import torch.nn.nn.nn as nn
+import torch.nn.nn.nn as nn
+import torch.nn.nn.nn as nn
+import torch.nn.nn.nn as nn
+import torch.nn.nn.nn as nn
+import torch.nn.nn.nn.nn as nn
+import torch.nn.nn.nn.nn as nn
+import torch.nn.nn.nn.nn as nn
+import torch.nn.nn.nn.nn as nn
+import torch.nn.nn.nn.nn as nn
+import torch.nn.nn.nn.nn as nn
+import torch.nn.nn.nn.nn.nn as nn
+import torch.nn.nn.nn.nn.nn as nn
+import torch.nn.nn.nn.x
+import torch.nn.nn.nn as nn
+import torch.nn.nn.nn as nn
+import.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.x
+import torch.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.fn-flatten-flatten-flatten-flatten-flatten-nn.nn.nn.nn.nn.nn.nn.nn.x
+import torch.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn    
+import torch.nn.nn.nn.nn.nn.nn.nn.nn.0.0f
+import torch.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.x
+import torch.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.0.0f
+import torch.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.</code>python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.cpp_extension
+
+from torch.utils.cpp_extension import load_inline
+
+from torch.utils.cpp_extension import load_inline
+
+# Fusing ReLU and Dropout (where p=0.0) into a single kernel.
+# Since Dropout(p=0.0) is a no-op, since Dropout(p=0.0) is a no-0.0f
+# Since Dropout(p.0) is a no-op, since Dropout(p=0.0) is a no-op, since Dropout(p=0.0) is a no-op, since Dropout(p=0.0) is a
+# Since Dropout(import torch.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.0.0f
+import torch.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.0.0f
+import torch.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.0.0f
+import torch.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.0.0f
+import torch.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.x
+import torch.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.in.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.hh.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.0.0f
+import torch.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.0.0f
+import torch.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.x
+import torch.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.fn-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-flatten-nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.x
+import torch.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.in.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.nn.

@@ -1,0 +1,153 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernel to fuse: 
+# 1. Concatenation of CLS token
+# 2. Addition of Positional Embedding
+# 3. Dropout (simplified as identity if p=0, but here we implement a basic version)
+# This reduces memory bandwidth by performing these operations in a single pass.
+
+fused_patch_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <curand_kernel.h>
+
+__global__ void fused_patch_ops_kernel(
+    const float* __restrict__ x,           // [B, N, D_patch]
+    const float* __restrict__ cls_token,   // [1, 1, D]
+    const float* __restrict__ pos_emb,     // [1, N+1, D]
+    float* __restrict__ out,               // [B, N+1, D]
+    int B, int N, int D, float dropout_p, unsigned long long seed) {
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = B * (N + 1) * D;
+    
+    if (idx < total_elements) {
+        int d = idx % D;
+        int n_plus_1 = idx / D % (N + 1);
+        int b = idx / (D * (N + 1));
+        
+        float val = 0.0f;
+        
+        // 1. Concatenation & 2. Positional Embedding Addition
+        if (n_plus_1 == 0) {
+            // CLS token part
+            val = cls_token[d] + pos_emb[idx % (D * (N + 1))]; // pos_emb is [1, N+1, D]
+            // Note: pos_emb indexing is simplified here assuming it's broadcastable
+            // In reality, pos_emb[0, 0, d] is the first element.
+            val = cls_token[d] + pos_emb[d]; 
+        } else {
+            // Patch part
+            int patch_idx = n_plus_1 - 1;
+            val = x[b * N * D + patch_idx * D + d] + pos_emb[n_plus_1 * D + d];
+        }
+        
+        // 3. Dropout (Simplified: if dropout_p is 0, just assign)
+        if (dropout_p > 0.0f) {
+            curandStatePhilox4_32_10_t state;
+            curand_init(seed, idx, 0, &state);
+            float rand_val = curand_uniform(&state);
+            if (rand_val < dropout_p) {
+                val = 0.0f;
+            } else {
+                val = val / (1.0f - dropout_p);
+            }
+        }
+        
+        out[idx] = val;
+    }
+}
+
+torch::Tensor fused_patch_ops_cuda(torch::Tensor x, torch::Tensor cls_token, torch::Tensor pos_emb, float dropout_p) {
+    int B = x.size(0);
+    int N = x.size(1);
+    int D = x.size(2);
+    
+    auto out = torch::empty({B, N + 1, D}, x.options());
+    
+    int total_elements = B * (N + 1) * D;
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    // Using a fixed seed for reproducibility in this example
+    unsigned long long seed = 42;
+
+    fused_patch_ops_kernel<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(), 
+        cls_token.data_ptr<float>(), 
+        pos_emb.data_ptr<float>(), 
+        out.data_ptr<float>(), 
+        B, N, D, dropout_p, seed
+    );
+    
+    return out;
+}
+"""
+
+fused_patch_ops_cpp_source = """
+torch::Tensor fused_patch_ops_cuda(torch::Tensor x, torch::Tensor cls_token, torch::Tensor pos_emb, float dropout_p);
+"""
+
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_patch_ops_cpp_source,
+    cuda_sources=fused_patch_ops_source,
+    functions=["fused_patch_ops_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels=3, dropout=0.1, emb_dropout=0.1):
+        super(ModelNew, self).__init__()
+        
+        assert image_size % patch_size == 0, "Image dimensions must be divisible by the patch size."
+        num_patches = (image_size // patch_size) ** 2
+        patch_dim = channels * patch_size ** 2
+        
+        self.patch_size = patch_size
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
+        self.patch_to_embedding = nn.Linear(patch_dim, dim)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.emb_dropout_p = emb_dropout
+        
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=dim, nhead=heads, dim_feedforward=mlp_dim, dropout=dropout),
+            num_layers=depth
+        )
+        
+        self.to_cls_token = nn.Identity()
+        self.mlp_head = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, num_classes)
+        )
+        self.fused_ops = fused_ops
+
+    def forward(self, img):
+        p = self.patch_size
+        B, C, H, W = img.shape
+        
+        # Efficient patch extraction using unfold
+        # x shape: [B, num_patches, patch_dim]
+        x = img.unfold(2, p, p).unfold(3, p, p).reshape(B, -1, p*p*C)
+        
+        # Linear projection to embedding dim
+        x = self.patch_to_embedding(x)
+        
+        # Fused Kernel: Cat CLS + Add Positional Embedding + Dropout
+        # This replaces:
+        # cls_tokens = self.cls_token.expand(B, -1, -1)
+        # x = torch.cat((cls_tokens, x), dim=1)
+        # x += self.pos_embedding
+        # x = self.dropout(x)
+        x = self.fused_ops.fused_patch_ops_cuda(x, self.cls_token, self.pos_embedding, self.emb_dropout_p)
+        
+        # Transformer Encoder
+        x = self.transformer(x)
+        
+        # Classification Head
+        x = self.to_cls_token(x[:, 0])
+        return self.mlp_head(x)

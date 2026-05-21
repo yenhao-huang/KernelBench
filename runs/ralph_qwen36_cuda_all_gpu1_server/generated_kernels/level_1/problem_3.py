@@ -1,0 +1,167 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernel for Batched Matrix Multiplication (BMM)
+# Optimized for FP32 precision.
+# We use a tiled approach to maximize shared memory usage and reduce global memory bandwidth pressure.
+bmm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Block size for the tile in the output matrix C (m x n)
+#define TILE_M 32
+#define TILE_N 32
+// Tile size for K dimension loaded into shared memory
+#define TILE_K 16
+
+__global__ void bmm_kernel(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, 
+                           int batch_size, int m, int k, int n) {
+    // Each block computes a tile of the output matrix C for one batch item.
+    // blockIdx.x corresponds to the batch index.
+    // blockIdx.y corresponds to the row tile in M (0 to ceil(m/TILE_M)-1)
+    // blockIdx.z corresponds to the column tile in N (0 to ceil(n/TILE_N)-1)
+
+    int batch = blockIdx.x;
+    int tile_row_m = blockIdx.y;
+    int tile_col_n = blockIdx.z;
+
+    // Shared memory for tiles of A and B
+    __shared__ float sA[TILE_M][TILE_K];
+    __shared__ float sB[TILE_K][TILE_N];
+
+    // Global memory pointers for the current batch
+    const float* A_batch = A + batch * m * k;
+    const float* B_batch = B + batch * k * n;
+    float* C_batch = C + batch * m * n;
+
+    // Thread indices within the block
+    int tx = threadIdx.x; // Column index in tile (0..TILE_N-1)
+    int ty = threadIdx.y; // Row index in tile (0..TILE_M-1)
+
+    // Calculate global row and column for this thread's contribution to the output tile
+    int global_row = tile_row_m * TILE_M + ty;
+    int global_col = tile_col_n * TILE_N + tx;
+
+    float sum = 0.0f;
+
+    // Loop over K dimension in tiles
+    int num_tiles_k = (k + TILE_K - 1) / TILE_K;
+    
+    for (int t = 0; t < num_tiles_k; ++t) {
+        // Load tile from A into shared memory
+        // Each thread loads one element if within bounds
+        int a_row = global_row;
+        int a_col = t * TILE_K + tx;
+        
+        if (a_row < m && a_col < k) {
+            sA[ty][tx] = A_batch[a_row * k + a_col];
+        } else {
+            sA[ty][tx] = 0.0f;
+        }
+
+        // Load tile from B into shared memory
+        int b_row = t * TILE_K + ty;
+        int b_col = global_col;
+        
+        if (b_row < k && b_col < n) {
+            sB[ty][tx] = B_batch[b_row * n + b_col];
+        } else {
+            sB[ty][tx] = 0.0f;
+        }
+
+        // Synchronize to ensure all data is loaded
+        __syncthreads();
+
+        // Compute partial dot product for the current tile of K
+        int k_start = t * TILE_K;
+        for (int i = 0; i < TILE_K; ++i) {
+            sum += sA[ty][i] * sB[i][tx];
+        }
+
+        // Synchronize before loading next tiles
+        __syncthreads();
+    }
+
+    // Write the result back to global memory
+    if (global_row < m && global_col < n) {
+        C_batch[global_row * n + global_col] = sum;
+    }
+}
+
+torch::Tensor bmm_cuda(torch::Tensor A, torch::Tensor B) {
+    TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
+    TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
+    TORCH_CHECK(A.scalar_type() == torch::kFloat32, "A must be FP32");
+    TORCH_CHECK(B.scalar_type() == torch::kFloat32, "B must be FP32");
+
+    auto batch_size = A.size(0);
+    auto m = A.size(1);
+    auto k = A.size(2);
+    auto n = B.size(2);
+
+    TORCH_CHECK(A.size(2) == B.size(1), "A's K dimension must match B's K dimension");
+
+    auto C = torch::zeros({batch_size, m, n}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+
+    // Grid dimensions
+    dim3 blocks_per_grid(batch_size, (m + TILE_M - 1) / TILE_M, (n + TILE_N - 1) / TILE_N);
+    
+    // Block dimensions: TILE_M rows, TILE_N cols
+    dim3 threads_per_block(TILE_N, TILE_M);
+
+    bmm_kernel<<<blocks_per_grid, threads_per_block>>>(
+        A.data_ptr<float>(), 
+        B.data_ptr<float>(), 
+        C.data_ptr<float>(), 
+        batch_size, m, k, n
+    );
+
+    // Check for launch errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA Error in bmm_kernel: %s\\n", cudaGetErrorString(err));
+    }
+
+    return C;
+}
+"""
+
+bmm_cpp_source = (
+    "torch::Tensor bmm_cuda(torch::Tensor A, torch::Tensor B);"
+)
+
+# Compile the inline CUDA code for batched matrix multiplication
+bmm_module = load_inline(
+    name="bmm_custom",
+    cpp_sources=bmm_cpp_source,
+    cuda_sources=bmm_source,
+    functions=["bmm_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Performs batched matrix multiplication (C = A * B) where A, B, and C have the same batch dimension.
+    Optimized with a custom CUDA kernel using tiled shared memory access.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.bmm_func = bmm_module.bmm_cuda
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """
+        Performs batched matrix multiplication using custom CUDA kernel.
+
+        Args:
+            A: Input tensor of shape (batch_size, m, k).
+            B: Input tensor of shape (batch_size, k, n).
+
+        Returns:
+            C: Output tensor of shape (batch_size, m, n).
+        """
+        return self.bmm_func(A, B)

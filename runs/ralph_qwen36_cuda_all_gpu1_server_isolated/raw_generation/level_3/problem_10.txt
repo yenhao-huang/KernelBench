@@ -1,0 +1,466 @@
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernels for Conv2d + BatchNorm2d + ReLU fusion
+# This is a common optimization to reduce memory bandwidth pressure by fusing these operations.
+# We assume the input tensor is in NCHW format.
+
+conv_bn_relu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper macro for CUDA error checking
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA error in %s at line %d: %s\\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while (0)
+
+// Kernel for Conv2d + BatchNorm2d + ReLU
+// Assumes input is NCHW, weights are OIHW, bias is O.
+// Output is NCHW.
+__global__ void conv_bn_relu_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    const float* __restrict__ bn_mean,
+    const float* __restrict__ bn_var,
+    const float* __restrict__ bn_weight,
+    const float* __restrict__ bn_bias,
+    float* __restrict__ output,
+    int N, int C, int H, int W,
+    int K, int R, int S, // K=output channels, R=kernel height, S=kernel width
+    int pad_h, int pad_w,
+    int stride_h, int stride_w) {
+
+    // Each thread handles one output element
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * K * H * W; // Assuming output spatial size matches input for simplicity in this basic kernel, 
+                                        // but we need to handle strides and padding properly.
+    
+    if (idx >= total_elements) return;
+
+    // Decode index to N, K, h_out, w_out
+    int w_out = idx % W;
+    int h_out = (idx / W) % H;
+    int k = (idx / (W * H)) % K;
+    int n = idx / (W * H * K);
+
+    float sum = 0.0f;
+
+    // Convolution loop
+    for (int r = 0; r < R; ++r) {
+        for (int s = 0; s < S; ++s) {
+            int h_in = h_out * stride_h - pad_h + r;
+            int w_in = w_out * stride_w - pad_w + s;
+
+            if (h_in >= 0 && h_in < H && w_in >= 0 && w_in < W) {
+                // Input index: NCHW
+                int input_idx = n * C * H * W + h_in * C * W + w_in * C;
+                
+                // Weight index: OIHW -> K, C, r, s
+                int weight_idx = k * C * R * S + r * C * S + s * C;
+
+                for (int c = 0; c < C; ++c) {
+                    sum += input[input_idx + c] * weight[weight_idx + c];
+                }
+            }
+        }
+    }
+
+    // Add bias from convolution
+    if (bias != nullptr) {
+        sum += bias[k];
+    }
+
+    // BatchNorm: y = gamma * (x - mean) / sqrt(var + eps) + beta
+    float var_eps = bn_var[k] + 1e-5f;
+    float inv_std = rsqrtf(var_eps);
+    
+    float normalized = (sum - bn_mean[k]) * inv_std;
+    if (bn_weight != nullptr) {
+        normalized *= bn_weight[k];
+    }
+    if (bn_bias != nullptr) {
+        normalized += bn_bias[k];
+    }
+
+    // ReLU
+    output[idx] = fmaxf(0.0f, normalized);
+}
+
+torch::Tensor conv_bn_relu_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor bn_mean,
+    torch::Tensor bn_var,
+    torch::Tensor bn_weight,
+    torch::Tensor bn_bias) {
+    
+    auto N = input.size(0);
+    auto C = input.size(1);
+    auto H = input.size(2);
+    auto W = input.size(3);
+
+    auto K = weight.size(0); // Output channels
+    auto R = weight.size(2); // Kernel height
+    auto S = weight.size(3); // Kernel width
+    
+    int pad_h = 0;
+    int pad_w = 0;
+    int stride_h = 1;
+    int stride_w = 1;
+
+    // Determine padding and stride from input tensor properties if needed, 
+    // but for this generic kernel we assume standard valid convolution or pass params.
+    // Since the original model uses specific padding/stride, we need to know them.
+    // For simplicity in this inline example, we assume stride=1, pad=0 for the fused kernel 
+    // and handle specific cases via separate kernels or by passing parameters.
+    // However, to make it robust for the ResNet bottleneck (which uses stride 1 or 2 and padding 1),
+    // we should ideally pass these as arguments. Let's modify the signature to include them.
+    
+    // Note: The above kernel assumes H_out = H_in and W_out = W_in, which is only true for stride=1, pad=0.
+    // ResNet Bottleneck conv2 has stride 1 or 2 and padding 1. 
+    // If stride=1, pad=1, then H_out = H_in.
+    // If stride=2, pad=1, then H_out = (H_in + 2*1 - R) / 2 + 1.
+    
+    // To keep the code simple and functional for the specific case of stride=1, padding=1 (common in bottlenecks),
+    // we will implement a kernel that handles general strides/padding but calculates output size dynamically.
+    
+    // Let's rewrite the kernel to be more general or just handle the most common case: 
+    // Conv2d with stride 1 and padding 1 (same padding).
+    
+    // For this solution, I will provide a specialized kernel for Conv2d + BN + ReLU with stride=1, pad=1.
+    // This covers the majority of operations in the Bottleneck block except the downsampling ones.
+    // Downsampling convs can be handled by standard PyTorch ops or a separate kernel if needed.
+    
+    // Let's assume for this optimization we target the inner layers (stride 1).
+    
+    auto output_h = H;
+    auto output_w = W;
+    
+    auto output = torch::empty({N, K, output_h, output_w}, input.options());
+
+    const int block_size = 256;
+    int total_threads = N * K * output_h * output_w;
+    int num_blocks = (total_threads + block_size - 1) / block_size;
+
+    conv_bn_relu_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias != nullptr ? bias.data_ptr<float>() : nullptr,
+        bn_mean.data_ptr<float>(),
+        bn_var.data_ptr<float>(),
+        bn_weight != nullptr ? bn_weight.data_ptr<float>() : nullptr,
+        bn_bias != nullptr ? bn_bias.data_ptr<float>() : nullptr,
+        output.data_ptr<float>(),
+        N, C, H, W, K, R, S, 0, 0, 1, 1 // pad=0, stride=1 assumed for this kernel version
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+    
+    return output;
+}
+
+// Kernel for Conv2d + BN (without ReLU) to handle downsampling layers where we might want to fuse differently or just leave as is.
+// For simplicity, we will use standard PyTorch for the first conv and maxpool, and fuse the rest.
+// Actually, let's create a more general kernel that accepts stride and padding.
+
+__global__ void conv_bn_relu_general_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    const float* __restrict__ bn_mean,
+    const float* __restrict__ bn_var,
+    const float* __restrict__ bn_weight,
+    const float* __restrict__ bn_bias,
+    float* __restrict__ output,
+    int N, int C_in, int H_in, int W_in,
+    int K, int R, int S,
+    int pad_h, int pad_w,
+    int stride_h, int stride_w) {
+
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Calculate output dimensions
+    int H_out = (H_in + 2 * pad_h - R) / stride_h + 1;
+    int W_out = (W_in + 2 * pad_w - S) / stride_w + 1;
+    
+    int total_elements = N * K * H_out * W_out;
+
+    if (idx >= total_elements) return;
+
+    int w_out = idx % W_out;
+    int h_out = (idx / W_out) % H_out;
+    int k = (idx / (W_out * H_out)) % K;
+    int n = idx / (W_out * H_out * K);
+
+    float sum = 0.0f;
+
+    for (int r = 0; r < R; ++r) {
+        for (int s = 0; s < S; ++s) {
+            int h_in = h_out * stride_h - pad_h + r;
+            int w_in = w_out * stride_w - pad_w + s;
+
+            if (h_in >= 0 && h_in < H_in && w_in >= 0 && w_in < W_in) {
+                int input_idx = n * C_in * H_in * W_in + h_in * C_in * W_in + w_in * C_in;
+                int weight_idx = k * C_in * R * S + r * C_in * S + s * C_in;
+
+                for (int c = 0; c < C_in; ++c) {
+                    sum += input[input_idx + c] * weight[weight_idx + c];
+                }
+            }
+        }
+    }
+
+    if (bias != nullptr) {
+        sum += bias[k];
+    }
+
+    float var_eps = bn_var[k] + 1e-5f;
+    float inv_std = rsqrtf(var_eps);
+    
+    float normalized = (sum - bn_mean[k]) * inv_std;
+    if (bn_weight != nullptr) {
+        normalized *= bn_weight[k];
+    }
+    if (bn_bias != nullptr) {
+        normalized += bn_bias[k];
+    }
+
+    output[idx] = fmaxf(0.0f, normalized);
+}
+
+torch::Tensor conv_bn_relu_general_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor bn_mean,
+    torch::Tensor bn_var,
+    torch::Tensor bn_weight,
+    torch::Tensor bn_bias,
+    int pad_h, int pad_w,
+    int stride_h, int stride_w) {
+    
+    auto N = input.size(0);
+    auto C_in = input.size(1);
+    auto H_in = input.size(2);
+    auto W_in = input.size(3);
+
+    auto K = weight.size(0);
+    auto R = weight.size(2);
+    auto S = weight.size(3);
+
+    int H_out = (H_in + 2 * pad_h - R) / stride_h + 1;
+    int W_out = (W_in + 2 * pad_w - S) / stride_w + 1;
+    
+    auto output = torch::empty({N, K, H_out, W_out}, input.options());
+
+    const int block_size = 256;
+    int total_threads = N * K * H_out * W_out;
+    int num_blocks = (total_threads + block_size - 1) / block_size;
+
+    conv_bn_relu_general_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias != nullptr ? bias.data_ptr<float>() : nullptr,
+        bn_mean.data_ptr<float>(),
+        bn_var.data_ptr<float>(),
+        bn_weight != nullptr ? bn_weight.data_ptr<float>() : nullptr,
+        bn_bias != nullptr ? bn_bias.data_ptr<float>() : nullptr,
+        output.data_ptr<float>(),
+        N, C_in, H_in, W_in, K, R, S, pad_h, pad_w, stride_h, stride_w
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+    
+    return output;
+}
+"""
+
+conv_bn_relu_cpp_source = (
+    "torch::Tensor conv_bn_relu_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, torch::Tensor bn_mean, torch::Tensor bn_var, torch::Tensor bn_weight, torch::Tensor bn_bias);"
+    "torch::Tensor conv_bn_relu_general_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, torch::Tensor bn_mean, torch::Tensor bn_var, torch::Tensor bn_weight, torch::Tensor bn_bias, int pad_h, int pad_w, int stride_h, int stride_w);"
+)
+
+# Compile the inline CUDA code
+conv_bn_relu_lib = load_inline(
+    name="conv_bn_relu",
+    cpp_sources=conv_bn_relu_cpp_source,
+    cuda_sources=conv_bn_relu_source,
+    functions=["conv_bn_relu_cuda", "conv_bn_relu_general_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class FusedConvBNReLU(nn.Module):
+    def __init__(self, conv, bn):
+        super().__init__()
+        self.conv = conv
+        self.bn = bn
+        
+    def forward(self, x):
+        # Extract parameters from PyTorch modules
+        weight = self.conv.weight
+        bias = self.conv.bias if self.conv.bias is not None else torch.empty(0)
+        
+        bn_weight = self.bn.weight
+        bn_bias = self.bn.bias
+        bn_mean = self.bn.running_mean
+        bn_var = self.bn.running_var
+        
+        # Get stride and padding from conv layer
+        stride_h, stride_w = self.conv.stride
+        pad_h, pad_w = self.conv.padding
+        
+        # Use the general fused kernel
+        out = conv_bn_relu_lib.conv_bn_relu_general_cuda(
+            x, weight, bias, bn_mean, bn_var, bn_weight, bn_bias,
+            pad_h[0] if isinstance(pad_h, tuple) else pad_h,
+            pad_w[0] if isinstance(pad_w, tuple) else pad_w,
+            stride_h[0] if isinstance(stride_h, tuple) else stride_h,
+            stride_w[0] if isinstance(stride_w, tuple) else stride_w
+        )
+        return out
+
+
+class BottleneckNew(nn.Module):
+    expansion = 4
+
+    def __init__(self, in_channels, out_channels, stride=1, downsample=None):
+        super(BottleneckNew, self).__init__()
+        
+        # Conv1: 1x1, stride 1, pad 0
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        
+        # Conv2: 3x3, stride=stride, pad 1
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        
+        # Conv3: 1x1, stride 1, pad 0
+        self.conv3 = nn.Conv2d(out_channels, out_channels * self.expansion, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels * self.expansion)
+        
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        identity = x
+
+        # Fuse Conv1 + BN1 + ReLU
+        out = FusedConvBNReLU(self.conv1, self.bn1)(x)
+
+        # Fuse Conv2 + BN2 + ReLU
+        out = FusedConvBNReLU(self.conv2, self.bn2)(out)
+
+        # Conv3 + BN3 (No ReLU yet, as it's added after residual)
+        # We can fuse Conv3+BN3 into a single kernel if we want, but let's keep it simple and just do Conv3+BN3
+        # To maximize speedup, let's fuse Conv3+BN3 as well.
+        out = FusedConvBNReLU(self.conv3, self.bn3)(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+
+        return out
+
+
+class ModelNew(nn.Module):
+    def __init__(self, layers, num_classes=1000):
+        super(ModelNew, self).__init__()
+        self.in_channels = 64
+
+        # First conv layer: Conv2d + BN2d + ReLU + MaxPool
+        # We can fuse Conv1+BN1+ReLU. MaxPool is left as standard PyTorch op for simplicity 
+        # or could be fused if we wanted to go deeper, but MaxPool is memory bound and simple.
+        self.conv1 = nn.Conv2d(3, self.in_channels, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(self.in_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        block = BottleneckNew
+
+        self.layer1 = self._make_layer(block, 64, layers[0])
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512 * block.expansion, num_classes)
+
+    def _make_layer(self, block, out_channels, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.in_channels != out_channels * block.expansion:
+            # Downsample is Conv + BN. We can fuse this too.
+            conv_ds = nn.Conv2d(self.in_channels, out_channels * block.expansion, kernel_size=1, stride=stride, bias=False)
+            bn_ds = nn.BatchNorm2d(out_channels * block.expansion)
+            downsample = FusedConvBNReLU(conv_ds, bn_ds)
+
+        layers = []
+        layers.append(block(self.in_channels, out_channels, stride, downsample))
+        self.in_channels = out_channels * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.in_channels, out_channels))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        # Fuse Conv1 + BN1 + ReLU
+        x = FusedConvBNReLU(self.conv1, self.bn1)(x)
+        x = self.relu(x) # This relu is redundant if fused, but kept for structure. 
+                         # Actually, the fused kernel already applies ReLU. 
+                         # So we should skip this explicit relu call or adjust the fused kernel to not apply it.
+                         # Let's adjust: The fused kernel applies ReLU. So we don't need the extra relu.
+        
+        # However, in __init__, self.relu is defined. In forward, I called FusedConvBNReLU which includes ReLU.
+        # So this line is redundant. I will remove it or leave it as no-op if input is already positive.
+        # To be safe and clean, let's just not call it again.
+        
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+
+        return x
+
+# Override the forward method to correctly handle the redundant ReLU from the first block
+def new_forward(self, x):
+    # Conv1 + BN1 + ReLU is fused
+    x = FusedConvBNReLU(self.conv1, self.bn1)(x)
+    
+    # MaxPool
+    x = self.maxpool(x)
+
+    x = self.layer1(x)
+    x = self.layer2(x)
+    x = self.layer3(x)
+    x = self.layer4(x)
+
+    x = self.avgpool(x)
+    x = torch.flatten(x, 1)
+    x = self.fc(x)
+
+    return x
+
+ModelNew.forward = new_forward
+```

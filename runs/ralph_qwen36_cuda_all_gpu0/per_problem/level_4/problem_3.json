@@ -1,0 +1,14 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 1.375,
+  "error": "No extractable code block or raw Python/CUDA module found.",
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu0/generated_kernels/level_4/problem_3.py",
+  "level": 4,
+  "model_name": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "precision": "fp32",
+  "problem_id": 3,
+  "problem_name": "3_EleutherAI-gpt-neo-2p7B_bs1_seq2047.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu0/raw_generation/level_4/problem_3.txt",
+  "status": "extraction_failed"
+}

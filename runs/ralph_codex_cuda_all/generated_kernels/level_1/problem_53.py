@@ -1,0 +1,133 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+min_reduce_cpp_source = """
+torch::Tensor min_reduce_cuda(torch::Tensor x, int64_t dim);
+"""
+
+min_reduce_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cfloat>
+#include <vector>
+
+#define COLS 32
+#define RTHREADS 8
+
+__global__ void min_dim1_kernel(const float* __restrict__ x, float* __restrict__ out,
+                                int B, int D1, int D2) {
+    int col = blockIdx.x * COLS + threadIdx.x;
+    int b = blockIdx.y;
+    int rlane = threadIdx.y;
+
+    float v = FLT_MAX;
+    if (col < D2) {
+        const float* base = x + ((long long)b * D1 * D2) + col;
+        for (int k = rlane; k < D1; k += RTHREADS) {
+            float val = base[(long long)k * D2];
+            v = fminf(v, val);
+        }
+    }
+
+    __shared__ float smem[RTHREADS][COLS];
+    smem[rlane][threadIdx.x] = v;
+    __syncthreads();
+
+    if (rlane == 0 && col < D2) {
+        float m = smem[0][threadIdx.x];
+        #pragma unroll
+        for (int i = 1; i < RTHREADS; ++i) {
+            m = fminf(m, smem[i][threadIdx.x]);
+        }
+        out[(long long)b * D2 + col] = m;
+    }
+}
+
+__global__ void min_dim2_kernel(const float* __restrict__ x, float* __restrict__ out,
+                                int B, int D1, int D2) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int b = row / D1;
+    int d1 = row - b * D1;
+
+    const float* base = x + ((long long)b * D1 + d1) * D2;
+    float v = FLT_MAX;
+    for (int i = tid; i < D2; i += blockDim.x) {
+        v = fminf(v, base[i]);
+    }
+
+    __shared__ float smem[256];
+    smem[tid] = v;
+    __syncthreads();
+
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] = fminf(smem[tid], smem[tid + s]);
+        __syncthreads();
+    }
+
+    if (tid == 0) out[row] = smem[0];
+}
+
+__global__ void min_dim0_kernel(const float* __restrict__ x, float* __restrict__ out,
+                                int B, int D1, int D2) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = D1 * D2;
+    if (idx >= total) return;
+
+    int d1 = idx / D2;
+    int d2 = idx - d1 * D2;
+    float v = FLT_MAX;
+    for (int b = 0; b < B; ++b) {
+        v = fminf(v, x[((long long)b * D1 + d1) * D2 + d2]);
+    }
+    out[idx] = v;
+}
+
+torch::Tensor min_reduce_cuda(torch::Tensor x, int64_t dim) {
+    int B = (int)x.size(0);
+    int D1 = (int)x.size(1);
+    int D2 = (int)x.size(2);
+
+    if (dim < 0) dim += 3;
+
+    if (dim == 1) {
+        auto out = torch::empty({B, D2}, x.options());
+        dim3 block(COLS, RTHREADS);
+        dim3 grid((D2 + COLS - 1) / COLS, B);
+        min_dim1_kernel<<<grid, block>>>(x.data_ptr<float>(), out.data_ptr<float>(), B, D1, D2);
+        return out;
+    }
+
+    if (dim == 2) {
+        auto out = torch::empty({B, D1}, x.options());
+        min_dim2_kernel<<<B * D1, 256>>>(x.data_ptr<float>(), out.data_ptr<float>(), B, D1, D2);
+        return out;
+    }
+
+    auto out = torch::empty({D1, D2}, x.options());
+    int total = D1 * D2;
+    min_dim0_kernel<<<(total + 255) / 256, 256>>>(x.data_ptr<float>(), out.data_ptr<float>(), B, D1, D2);
+    return out;
+}
+"""
+
+min_reduce_module = load_inline(
+    name="min_reduce_inline_cuda",
+    cpp_sources=min_reduce_cpp_source,
+    cuda_sources=min_reduce_cuda_source,
+    functions=["min_reduce_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, dim: int):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.min_reduce = min_reduce_module
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.min_reduce.min_reduce_cuda(x.contiguous(), self.dim)

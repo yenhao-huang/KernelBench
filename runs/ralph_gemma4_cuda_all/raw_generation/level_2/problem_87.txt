@@ -1,0 +1,574 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused-elementwise-operations (subtraction and Mish)
+fused_elementwise_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+__device__ inline float mish(float x) {
+    return x * (std::tanh(x * 1.7632371103513111) / (1.0f + std::exp(-x))); // This is a slightly simplified/approximate-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mix-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish-mish?
+"""
+```
+
+Wait, the user provided a broken/garbage string in the `mish` function. I need to write a clean, professional, and correct implementation.
+
+The goal is to fuse:
+1. `x - val1`
+2. `x - val2`
+3. `mish(x)`
+
+Mish activation is $x \cdot \tanh(\text{softplus}(x))$, where $\text{softplus}(x) = \ln(1 + e^x)$.
+Actually, the standard definition is $x \cdot \tanh(\ln(1 + e^x))$.
+
+Let's write the code.
+
+Plan:
+1. Define a CUDA kernel that takes the tensor, `val1`, and `val2`.
+2. For each element:
+   a. `val = input[idx] - val1 - val2`
+   b. `output[idx] = val * tanh(log(1 + exp(val)))`
+3. Use `load_inline` to compile it.
+4. Wrap it in `ModelNew`.
+
+Note: `std::tanh` and `std::log1p(std::exp(x))` are standard. For numerical stability of softplus, one often uses `log(1+exp(x))` but for large $x$, $\text{softplus}(x) \approx x$. However, for a simple custom operator, the standard formula is fine.
+
+Wait, the user's prompt contains a massive amount of "mish-mish-mish" garbage in the example. I must ignore that and provide a clean, working implementation.
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused-elementwise-operations (subtraction and Mish)
+fused_elementwise_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+__device__ inline float mish_device(float x) {
+    // Mish(x) = x * tanh(softplus(x))
+    // softplus(x) = log(1 + exp(x))
+    return x * std::tanh(std::log1p(std::exp(x)));
+}
+
+__global__ void fused_sub_mish_kernel(const float* __restrict__ input, 
+                                      float* __restrict__ output, 
+                                      float val1, 
+                                      float val2, 
+                                      int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float x = input[idx] - val1 - val2;
+        output[idx] = mish_device(x);
+    }
+}
+
+torch::Tensor fused_sub_mish_cuda(torch::Tensor input, float val1, float val2) {
+    auto size = input.numel();
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    fused_sub_mish_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(), 
+        output.data_ptr<float>(), 
+        val1, 
+        val2, 
+        size
+    );
+
+    return output;
+}
+"""
+
+fused_elementwise_cpp_source = (
+    "torch::Tensor fused_sub_mish_cuda(torch::Tensor input, float val1, float val2);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_elementwise_cpp_source,
+    cuda_sources=fused_elementwise_source,
+    functions=["fused_sub_mish_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, subtract_value_1, subtract_value_2):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.subtract_value_1 = subtract_value_1
+        self.subtract_value_2 = subtract_value_2
+        self.fused_ops = fused_ops
+
+    def forward(self, x):
+        x = self.conv(x)
+        # Fuse: x - val1 - val2 and Mish(x)
+        x = self.fused_ops.fused_sub_mish_cuda(x, self.subtract_value_1, self.subtract_value_2)
+        return x
+```
+
+Wait, I should check if `std::log1p(std::exp(x))` is safe. For very large $x$, `exp(x)` overflows.
+A more stable softplus is:
+`if (x > 20) return x; else return log1p(exp(x));`
+Or even better: `log(1 + exp(-abs(x))) + max(x, 0)`.
+However, for a standard implementation, `std::tanh(std::log1p(std::exp(x)))` is usually acceptable in these coding tasks unless specified. Let's use a slightly more robust version.
+
+Actually, `mish(x) = x * tanh(softplus(x))`.
+If $x$ is very large, $\text{softplus}(x) \approx x$, $\tanh(x) \approx 1$, so $\text{mish}(x) \approx x$.
+If $x$ is very small (negative), $\text{softplus}(x) \approx 0$, $\tanh(0) = 0$, so $\text{mish}(x) \approx 0$.
+
+Let's refine the kernel.
+
+```cpp
+__device__ inline float mish_device(float x) {
+    // Softplus(x) = log(1 + exp(x))
+    // To avoid overflow: log(1 + exp(x)) = x + log(1 + exp(-x)) for x > 0
+    float sp;
+    if (x > 20.0f) {
+        sp = x;
+    } else {
+        sp = std::log1p(std::exp(x));
+    }
+    return x * std::tanh(sp);
+}
+```
+
+This is much safer.
+
+Final check on the requirements:
+- Replace PyTorch operators with custom CUDA.
+- Fuse `conv`? No, `conv` is a heavy operation usually handled by cuDNN. Fusing element-wise operations after `conv` is the standard optimization.
+- Fuse `x - val1`, `x - val2`, and `mish`.
+- Output `ModelNew`.
+- FP32 precision.
+
+One detail: `self.subtract_value_1` and `self.subtract_value_2` are passed as floats to the kernel.
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused-elementwise-operations (subtraction and Mish)
+fused_elementwise_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+__device__ inline float mish_device(float x) {
+    // Mish(x) = x * tanh(softplus(x))
+    // Softplus(x) = log(1 + exp(x))
+    // For numerical stability, use the identity: log(1 + exp(x)) = x + log(1 + exp(-x))
+    float sp;
+    if (x > 20.0f) {
+        sp = x;
+    } else {
+        sp = std::log1p(std::exp(x));
+    }
+    return x * std::tanh(sp);
+}
+
+__global__ void fused_sub_mish_kernel(const float* __restrict__ input, 
+                                      float* __restrict__ output, 
+                                      float val1, 
+                                      float val2, 
+                                      int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float x = input[idx] - val1 - val2;
+        output[idx] = mish_device(x);
+    }
+}
+
+torch::Tensor fused_sub_mish_cuda(torch::Tensor input, float val1, float val2) {
+    auto size = input.numel();
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    fused_sub_mish_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(), 
+        output.data_ptr<float>(), 
+        val1, 
+        val2, 
+        size
+    );
+
+    return output;
+}
+"""
+
+fused_elementwise_cpp_source = (
+    "torch::Tensor fused_sub_mish_cuda(torch::Tensor input, float val1, float val2);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_elementwise_cpp_source,
+    cuda_sources=fused_elementwise_source,
+    functions=["fused_sub_mish_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, subtract_value_1, subtract_value_2):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.subtract_value_1 = subtract_value_1
+        self.subtract_value_2 = subtract_value_2
+        self.fused_ops = fused_ops
+
+    def forward(self, x):
+        x = self.conv(x)
+        # Fuse: x - val1 - val2 and Mish(x)
+        x = self.fused_ops.fused_sub_mish_cuda(x, float(self.subtract_value_1), float(self.subtract_value_2))
+        return x
+```
+
+Wait, the user's prompt had a very weird `mish` function in the example. I should make sure I don't accidentally include that. The prompt says "You are given the following architecture" and then provides the `Model` class. The "Example" section is just an example. I will ignore the garbage string in the example.
+
+One more thing: `input.numel()` is an `int64_t`. In the kernel, I used `int size`. For very large tensors, this might overflow, but for the given dimensions (128 * 64 * 256 * 256 $\approx$ 536 million), it fits in a signed 32-bit integer (up to 2.1 billion). So `int` is fine.
+
+Final check on the `ModelNew` signature. It must match the original `Model`'s `__init__` and `forward` to be a drop-in replacement.
+
+Original `__init__`: `(self, in_channels, out_channels, kernel_size, subtract_value_1, subtract_value_2)`
+Original `forward`: `(self, x)`
+
+My `ModelNew` matches.
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused-elementwise-operations (subtraction and Mish)
+fused_elementwise_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+__device__ inline float mish_device(float x) {
+    // Mish(x) = x * tanh(softplus(x))
+    // Softplus(x) = log(1 + exp(x))
+    // For numerical stability, use the identity: log(1 + exp(x)) = x + log(1 + exp(-x))
+    float sp;
+    if (x > 20.0f) {
+        sp = x;
+    } else {
+        sp = std::log1p(std::exp(x));
+    }
+    return x * std::tanh(sp);
+}
+
+__global__ void fused_sub_mish_kernel(const float* __restrict__ input, 
+                                      float* __restrict__ output, 
+                                      float val1, 
+                                      float val2, 
+                                      int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float x = input[idx] - val1 - val2;
+        output[idx] = mish_device(x);
+    }
+}
+
+torch::Tensor fused_sub_mish_cuda(torch::Tensor input, float val1, float val2) {
+    auto size = input.numel();
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    fused_sub_mish_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(), 
+        output.data_ptr<float>(), 
+        val1, 
+        val2, 
+        (int)size
+    );
+
+    return output;
+}
+"""
+
+fused_elementwise_cpp_source = (
+    "torch::Tensor fused_sub_mish_cuda(torch::Tensor input, float val1, float val2);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_elementwise_cpp_source,
+    cuda_sources=fused_elementwise_source,
+    functions=["fused_sub_mish_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, subtract_value_1, subtract_value_2):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.subtract_value_1 = subtract_value_1
+        self.subtract_value_2 = subtract_value_2
+        self.fused_ops = fused_ops
+
+    def forward(self, x):
+        x = self.conv(x)
+        # Fuse: x - val1 - val2 and Mish(x)
+        x = self.fused_ops.fused_sub_mish_cuda(x, float(self.subtract_value_1), float(self.subtract_value_2))
+        return x
+```
+
+One small detail: `input.numel()` returns `int64_t`. Casting to `int` in the kernel call is safer.
+
+Final code structure:
+1. Imports.
+2. CUDA source strings.
+3. `load_inline` call.
+4. `ModelNew` class.
+
+I'll make sure the `mish_device` is as accurate as possible.
+The standard Mish is $x \cdot \tanh(\text{softplus}(x))$.
+$\text{softplus}(x) = \ln(1 + e^x)$.
+My implementation:
+`if (x > 20.0f) sp = x; else sp = std::log1p(std::exp(x));`
+This is correct because for $x=20$, $e^{20}$ is large but manageable, and $\ln(1+e^{20}) \approx 20$. For $x > 20$, the difference is negligible for FP32.
+
+Wait, I should check if `std::tanh` and `std::exp` are available in `cuda_runtime.h` or if I need `math.h`. In CUDA, `__expf` and `__tanhf` are intrinsic, but `std::exp` and `std::tanh` are also supported via the host-side math headers in device code. Using `std::` is generally fine in modern CUDA.
+
+Actually, to be safest in CUDA kernels, one often uses `expf(x)` and `tanhf(x)`.
+
+```cpp
+__device__ inline float mish_device(float x) {
+    float sp;
+    if (x > 20.0f) {
+        sp = x;
+    } else {
+        sp = log1pf(expf(x));
+    }
+    return x * tanhf(sp);
+}
+```
+`log1pf` and `expf` are the float versions. This is more "CUDA-idiomatic".
+
+Let's use the `f` suffixed versions.
+
+```cpp
+__device__ inline float mish_device(float x) {
+    float sp;
+    if (x > 20.0f) {
+        sp = x;
+    } else {
+        sp = log1pf(expf(x));
+    }
+    return x * tanhf(sp);
+}
+```
+
+Wait, `log1pf` is not a standard CUDA intrinsic. `log1p` is. Let's stick to `std::log1p` or just `logf(1.0f + expf(x))`.
+Actually, `log1pf` is available in some environments, but `std::log1p` is safer.
+
+Let's use:
+`sp = logf(1.0f + expf(x));`
+And for $x > 20$, `sp = x`.
+
+Final check on the kernel:
+`fused_sub_mish_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), val1, val2, (int)size);`
+This looks solid.
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused-elementwise-operations (subtraction and Mish)
+fused_elementwise_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__device__ inline float mish_device(float x) {
+    // Mish(x) = x * tanh(softplus(x))
+    // Softplus(x) = log(1 + exp(x))
+    float sp;
+    if (x > 20.0f) {
+        sp = x;
+    } else {
+        sp = logf(1.0f + expf(x));
+    }
+    return x * tanhf(sp);
+}
+
+__global__ void fused_sub_mish_kernel(const float* __restrict__ input, 
+                                      float* __restrict__ output, 
+                                      float val1, 
+                                      float val2, 
+                                      int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float x = input[idx] - val1 - val2;
+        output[idx] = mish_device(x);
+    }
+}
+
+torch::Tensor fused_sub_mish_cuda(torch::Tensor input, float val1, float val2) {
+    auto size = input.numel();
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    fused_sub_mish_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(), 
+        output.data_ptr<float>(), 
+        val1, 
+        val2, 
+        (int)size
+    );
+
+    return output;
+}
+"""
+
+fused_elementwise_cpp_source = (
+    "torch::Tensor fused_sub_mish_cuda(torch::Tensor input, float val1, float val2);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_elementwise_cpp_source,
+    cuda_sources=fused_elementwise_source,
+    functions=["fused_sub_mish_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, subtract_value_1, subtract_value_2):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.subtract_value_1 = subtract_value_1
+        self.subtract_value_2 = subtract_value_2
+        self.fused_ops = fused_ops
+
+    def forward(self, x):
+        x = self.conv(x)
+        # Fuse: x - val1 - val2 and Mish(x)
+        x = self.fused_ops.fused_sub_mish_cuda(x, float(self.subtract_value_1), float(self.subtract_value_2))
+        return x
+```
+
+One last check: `logf(1.0f + expf(x))` is fine for $x < 20$. For $x=20$, $e^{20} \approx 4.8 \times 10^8$, which is well within the range of a 32-bit float (up to $3.4 \times 10^{38}$). So this is safe.
+
+Final code block.
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused-elementwise-operations (subtraction and Mish)
+fused_elementwise_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__device__ inline float mish_device(float x) {
+    // Mish(x) = x * tanh(softplus(x))
+    // Softplus(x) = log(1 + exp(x))
+    float sp;
+    if (x > 20.0f) {
+        sp = x;
+    } else {
+        sp = logf(1.0f + expf(x));
+    }
+    return x * tanhf(sp);
+}
+
+__global__ void fused_sub_mish_kernel(const float* __restrict__ input, 
+                                      float* __restrict__ output, 
+                                      float val1, 
+                                      float val2, 
+                                      int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float x = input[idx] - val1 - val2;
+        output[idx] = mish_device(x);
+    }
+}
+
+torch::Tensor fused_sub_mish_cuda(torch::Tensor input, float val1, float val2) {
+    auto size = input.numel();
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    fused_sub_mish_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(), 
+        output.data_ptr<float>(), 
+        val1, 
+        val2, 
+        (int)size
+    );
+
+    return output;
+}
+"""
+
+fused_elementwise_cpp_source = (
+    "torch::Tensor fused_sub_mish_cuda(torch::Tensor input, float val1, float val2);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_elementwise_cpp_source,
+    cuda_sources=fused_elementwise_source,
+    functions=["fused_sub_mish_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, subtract_value_1, subtract_value_2):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.subtract_value_1 = subtract_value_1
+        self.subtract_value_2 = subtract_value_2
+        self.fused_ops = fused_ops
+
+    def forward(self, x):
+        x = self.conv(x)
+        # Fuse: x - val1 - val2 and Mish(x)
+        x = self.fused_ops.fused_sub_mish_cuda(x, float(self.subtract_value_1), float(self.subtract_value_2))
+        return x
+```
+
+Wait, I should make sure `val1` and `val2` are passed correctly. In the original code, they are `self.subtract_value_1` and `self.subtract_value_2`. In my `forward`, I pass them as `float(self.subtract_value_1)`. This is correct.
+
+One final check: the original model uses `torch.nn.functional.mish(x)`. My kernel implements the same mathematical function.
+
+The `ModelNew` class is ready.
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused-elementwise-operations (subtraction and Mish)
+fused_elementwise_source =

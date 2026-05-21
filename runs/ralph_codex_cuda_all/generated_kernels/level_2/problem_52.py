@@ -1,0 +1,60 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+mish_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__device__ __forceinline__ float softplus_stable(float x) {
+    if (x > 20.0f) return x;
+    if (x < -20.0f) return expf(x);
+    return log1pf(expf(x));
+}
+
+__global__ void mish_kernel(const float* __restrict__ x, float* __restrict__ out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = x[i];
+        out[i] = v * tanhf(softplus_stable(v));
+    }
+}
+
+torch::Tensor mish_cuda(torch::Tensor x) {
+    auto out = torch::empty_like(x);
+    int n = (int)x.numel();
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    mish_kernel<<<blocks, threads>>>(x.data_ptr<float>(), out.data_ptr<float>(), n);
+    return out;
+}
+"""
+
+mish_cpp = r"""
+torch::Tensor mish_cuda(torch::Tensor x);
+"""
+
+mish_ext = load_inline(
+    name="mish_ext_kernelbench",
+    cpp_sources=mish_cpp,
+    cuda_sources=mish_source,
+    functions=["mish_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.bn = nn.BatchNorm2d(out_channels, eps=eps, momentum=momentum)
+        self.mish_ext = mish_ext
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.mish_ext.mish_cuda(x)
+        x = self.bn(x)
+        return x

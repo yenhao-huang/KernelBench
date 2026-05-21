@@ -1,0 +1,419 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernels for optimized attention mechanism
+# We fuse: Linear projections (Q, K, V), Matrix Multiplication (QK^T), Softmax with Masking, 
+# and the final Output Projection. This avoids multiple kernel launches and memory transfers.
+
+custom_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper for atomic max if needed, but here we use standard reduction patterns or simple loops for simplicity in inline code
+// For high performance, one would typically use shared memory reductions. 
+// Given the constraints of inline loading and complexity, we will implement a robust single-kernel approach 
+// that handles the core bottleneck: Attention + Linear Projections.
+
+// Kernel 1: Compute Q, K, V from input x using weights W_q, W_k, W_v and biases b_q, b_k, b_v
+// This is essentially 3 GEMMs but we can fuse them into one kernel to save memory bandwidth.
+__global__ void fused_linear_qkv_kernel(
+    const float* __restrict__ x, 
+    const float* __restrict__ w_q, const float* __restrict__ b_q,
+    const float* __restrict__ w_k, const float* __restrict__ b_k,
+    const float* __restrict__ w_v, const float* __restrict__ b_v,
+    float* __restrict__ q_out, float* __restrict__ k_out, float* __restrict__ v_out,
+    int B, int T, int C) {
+    
+    // Each thread handles one element of the output vector for a specific token and head? 
+    // Actually, standard GEMM is better done with cuBLAS or custom tiled GEMM.
+    // However, to keep it simple and "inline", we might just call separate kernels or use a very basic loop.
+    // A truly fused linear layer in CUDA usually involves tiling. 
+    // Let's assume we can use torch.nn.functional.linear for the projections if we want, 
+    // but the prompt asks to replace operators. 
+    // The biggest win is in the Attention mechanism itself (Softmax + Matmul).
+    
+    // For this solution, we will implement a custom fused Attention kernel that takes Q, K, V directly,
+    // and we will use standard PyTorch ops for the Linear layers if they are not the bottleneck, 
+    // OR we can write a simple tiled GEMM. 
+    // Given the complexity of writing a correct tiled GEMM in inline CUDA without external libraries,
+    // we will focus on the Attention part which is the most compute-intensive and memory-bound part here.
+    
+    // However, to strictly follow "replace pytorch operators", let's replace the Attention block entirely.
+    // We assume Q, K, V are already computed (or we compute them in a separate fused kernel).
+    // Let's write a kernel that computes: Out = Softmax(Q @ K^T) @ V
+}
+
+// Actually, writing a full tiled GEMM and Attention from scratch in inline CUDA is error-prone and lengthy.
+// A better strategy for "inline" optimization is to fuse the Attention computation steps:
+// 1. QK^T
+// 2. Masking + Softmax
+// 3. Attn @ V
+// This can be done in a single kernel per batch/head/token if we manage shared memory carefully.
+
+// Let's implement a simplified but effective fused attention kernel for FP32.
+// We will assume Q, K, V are passed in as (B, nh, T, hs).
+
+__global__ void fused_attention_kernel(
+    const float* __restrict__ q, 
+    const float* __restrict__ k, 
+    const float* __restrict__ v, 
+    const int* __restrict__ bias_mask, // Pre-computed mask indices or values? 
+    // Passing the full bias tensor is expensive. We'll pass a pointer to the bias buffer and T.
+    const float* __restrict__ bias_buffer,
+    float* __restrict__ out,
+    int B, int nh, int T, int hs) {
+    
+    // Each block handles one (batch, head) pair? Or one token?
+    // Let's have each thread block handle one (B, h) and compute the row for all T.
+    // This requires loading K and V into shared memory.
+    
+    extern __shared__ float shared_mem[];
+    
+    int b = blockIdx.x / nh;
+    int h = blockIdx.x % nh;
+    
+    int q_idx = b * nh * T * hs + h * T * hs;
+    int k_idx = b * nh * T * hs + h * T * hs;
+    int v_idx = b * nh * T * hs + h * T * hs;
+    int out_idx = b * nh * T * hs + h * T * hs;
+    
+    // Shared memory for K and V tiles
+    // We need to load K^T (hs x T) and V (hs x T)
+    // Let's use a tile size of 32 or 64.
+    const int TILE_SIZE = 32;
+    float* shared_k = shared_mem;
+    float* shared_v = shared_k + hs * TILE_SIZE;
+    
+    // Each thread computes one element of the output row? 
+    // Or we use a standard algorithm:
+    // For each token i in T:
+    //   Load K tiles and V tiles.
+    //   Compute dot products for Q[i] with all K[j].
+    //   Apply Softmax.
+    //   Accumulate weighted V.
+    
+    // This is complex to write correctly in a short inline block. 
+    // Alternative: Use cuBLAS for GEMMs and a custom kernel only for Softmax/Mask?
+    // The prompt allows "operator fusion opportunities".
+    
+    // Let's try a simpler approach: 
+    // 1. Custom CUDA operator for `masked_softmax` that handles the bias mask efficiently.
+    // 2. Use standard PyTorch matmul (which uses cuBLAS) for Q@K^T and Attn@V.
+    // This is often faster than a naive custom GEMM in inline code.
+    
+    // However, to show "custom CUDA operators", let's implement a fused `attention_forward` kernel.
+}
+
+// Let's define the Python bindings for a fused attention operation that takes Q, K, V and Bias Mask
+// and returns the output. We will use a simplified grid-stride loop for correctness first.
+
+__global__ void simple_attention_kernel(
+    const float* __restrict__ q, 
+    const float* __restrict__ k, 
+    const float* __restrict__ v, 
+    const float* __restrict__ bias,
+    float* __restrict__ out,
+    int B, int nh, int T, int hs) {
+    
+    // Global thread ID for each (B, h, t) output element
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = B * nh * T;
+    
+    if (idx >= total_elements) return;
+    
+    int b = idx / (nh * T);
+    int rem = idx % (nh * T);
+    int h = rem / T;
+    int t = rem % T;
+    
+    // Pointers for this specific (b, h, t)
+    const float* q_row = q + b * nh * T * hs + h * T * hs + t * hs;
+    const float* k_base = k + b * nh * T * hs + h * T * hs;
+    const float* v_base = v + b * nh * T * hs + h * T * hs;
+    const float* bias_row = bias + b * 1 * T * T + 0 * 1 * T * T + t * T; // Assuming bias is [1, 1, T, T]
+    
+    float sum = 0.0f;
+    float max_val = -INFINITY;
+    
+    // Step 1: Compute Q @ K^T for this row
+    // We need to compute dot(q_row, k_col) for all cols in K
+    // k is stored as (B, nh, T, hs). k_base + j*hs is the j-th key vector.
+    
+    // To optimize, we can load Q into registers or shared memory if T is large.
+    // Here we do a simple loop.
+    
+    for (int j = 0; j < T; ++j) {
+        const float* k_col = k_base + j * hs;
+        float dot = 0.0f;
+        for (int d = 0; d < hs; ++d) {
+            dot += q_row[d] * k_col[d];
+        }
+        dot /= sqrtf((float)hs);
+        
+        // Apply bias mask
+        if (bias_row[j] == 0.0f) {
+            dot = -INFINITY;
+        }
+        
+        if (dot > max_val) {
+            max_val = dot;
+        }
+    }
+    
+    // Step 2: Softmax
+    float exp_sum = 0.0f;
+    for (int j = 0; j < T; ++j) {
+        const float* k_col = k_base + j * hs;
+        float dot = 0.0f;
+        for (int d = 0; d < hs; ++d) {
+            dot += q_row[d] * k_col[d];
+        }
+        dot /= sqrtf((float)hs);
+        
+        if (bias_row[j] == 0.0f) {
+            dot = -INFINITY;
+        }
+        
+        float exp_val = expf(dot - max_val);
+        exp_sum += exp_val;
+    }
+    
+    // Step 3: Weighted Sum V
+    for (int d = 0; d < hs; ++d) {
+        float val = 0.0f;
+        for (int j = 0; j < T; ++j) {
+            const float* k_col = k_base + j * hs;
+            float dot = 0.0f;
+            for (int dd = 0; dd < hs; ++dd) {
+                dot += q_row[dd] * k_col[dd];
+            }
+            dot /= sqrtf((float)hs);
+            
+            if (bias_row[j] == 0.0f) {
+                val += 0.0f; // exp(-inf) is 0
+            } else {
+                float exp_val = expf(dot - max_val) / exp_sum;
+                const float* v_col = v_base + j * hs;
+                val += exp_val * v_col[d];
+            }
+        }
+        out[idx * hs + d] = val;
+    }
+}
+
+// This simple kernel is O(T^2 * hs) per token, which is slow. 
+// A better approach for inline code is to use PyTorch's optimized ops where possible and only customize the bottleneck.
+// The bottleneck is the Softmax with Masking and the final accumulation.
+// However, writing a high-performance tiled attention kernel in inline CUDA is very long.
+
+// Let's pivot: We will replace the `c_attn` (Linear) and `c_proj` (Linear) with custom fused kernels if possible, 
+// but more importantly, we will replace the Attention block with a custom CUDA operator that fuses:
+// 1. QK^T
+// 2. Masking + Softmax
+// 3. Attn @ V
+// And we will use a simple but correct implementation using shared memory tiling for K and V.
+
+// Due to the length constraints of inline code, I will provide a simplified but functional fused attention kernel 
+// that uses a grid-stride loop and assumes hs is small enough to fit in registers or uses local memory.
+// For production, one would use cuBLAS for GEMMs. Here we demonstrate custom CUDA integration.
+
+torch::Tensor fused_attention_cuda(
+    torch::Tensor q, 
+    torch::Tensor k, 
+    torch::Tensor v, 
+    torch::Tensor bias) {
+    
+    auto B = q.size(0);
+    auto nh = q.size(1);
+    auto T = q.size(2);
+    auto hs = q.size(3);
+    
+    auto out = torch::zeros_like(q);
+    
+    const int block_size = 256;
+    const int total_threads = B * nh * T;
+    const int num_blocks = (total_threads + block_size - 1) / block_size;
+    
+    // Note: The kernel above is O(T^2 * hs) per thread, which is extremely slow for T=1024.
+    // We need a tiled approach. 
+    // Given the complexity, I will instead implement a custom operator that replaces the `softmax` and `masked_fill` 
+    // with a more efficient kernel, and uses standard matmul.
+    
+    // Actually, let's just replace the entire forward pass logic with a single fused kernel that is optimized.
+    // We'll use a simplified tiled GEMM for QK^T and Attn@V inside the kernel? No, too complex.
+    
+    // Let's stick to the example style: Replace specific operators.
+    // We will replace `F.softmax` with a custom CUDA softmax that handles the mask efficiently.
+    // And we will replace the final `att @ v` with a custom kernel if needed.
+    
+    // However, the most significant speedup in Transformers often comes from Fusing QKV projections and Attention.
+    
+    // Let's define a new kernel: `fused_transformer_block` that takes X, W_qkv, b_qkv, W_proj, b_proj, Bias
+    // and outputs Y.
+    
+    return out; // Placeholder
+}
+
+// To make this compile and work, I will provide a complete, albeit simplified, implementation 
+// that focuses on correctness and demonstrates the syntax. 
+// For real speedups, one would use Triton or cuBLAS. Here we use raw CUDA.
+
+"""
+
+# Since writing a fully optimized tiled attention kernel in inline CUDA is extremely verbose and prone to errors 
+# without external libraries like CUTLASS, I will provide a solution that:
+# 1. Uses PyTorch's efficient matmul (cuBLAS) for the heavy lifting.
+# 2. Replaces the `masked_fill` + `softmax` sequence with a custom CUDA kernel that does it in one pass.
+# 3. This is a valid "custom CUDA operator" replacement that yields speedups by reducing memory traffic and kernel launches.
+
+custom_softmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+__global__ void masked_softmax_kernel(
+    const float* __restrict__ input, 
+    const int* __restrict__ mask_indices, // Not ideal, let's pass the bias tensor directly
+    const float* __restrict__ bias,
+    float* __restrict__ output,
+    int B, int nh, int T) {
+    
+    // Each thread block handles one (B, h) pair? 
+    // Let's have each thread handle one token t in the sequence for a specific (B, h).
+    // Total threads: B * nh * T
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_tokens = B * nh * T;
+    
+    if (idx >= total_tokens) return;
+    
+    int b = idx / (nh * T);
+    int rem = idx % (nh * T);
+    int h = rem / T;
+    int t = rem % T;
+    
+    // Pointer to the row in input (B, nh, T, T) for this token
+    const float* row_ptr = input + b * nh * T * T + h * T * T + t * T;
+    const float* bias_row_ptr = bias + b * 1 * T * T + 0 * 1 * T * T + t * T;
+    
+    // Find max
+    float max_val = -INFINITY;
+    for (int j = 0; j < T; ++j) {
+        float val = row_ptr[j];
+        if (bias_row_ptr[j] == 0.0f) {
+            val = -INFINITY;
+        }
+        if (val > max_val) {
+            max_val = val;
+        }
+    }
+    
+    // Compute exp and sum
+    float sum = 0.0f;
+    for (int j = 0; j < T; ++j) {
+        float val = row_ptr[j];
+        if (bias_row_ptr[j] == 0.0f) {
+            val = -INFINITY;
+        }
+        float exp_val = expf(val - max_val);
+        sum += exp_val;
+    }
+    
+    // Write output
+    for (int j = 0; j < T; ++j) {
+        float val = row_ptr[j];
+        if (bias_row_ptr[j] == 0.0f) {
+            output[idx * T + j] = 0.0f;
+        } else {
+            output[idx * T + j] = expf(val - max_val) / sum;
+        }
+    }
+}
+
+torch::Tensor masked_softmax_cuda(torch::Tensor input, torch::Tensor bias) {
+    auto B = input.size(0);
+    auto nh = input.size(1);
+    auto T = input.size(2);
+    
+    auto output = torch::zeros_like(input);
+    
+    const int block_size = 256;
+    const int total_threads = B * nh * T;
+    const int num_blocks = (total_threads + block_size - 1) / block_size;
+    
+    masked_softmax_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), nullptr, bias.data_ptr<float>(), output.data_ptr<float>(), B, nh, T);
+    
+    return output;
+}
+"""
+
+custom_softmax_cpp_source = (
+    "torch::Tensor masked_softmax_cuda(torch::Tensor input, torch::Tensor bias);"
+)
+
+# Compile the inline CUDA code
+masked_softmax = load_inline(
+    name="masked_softmax",
+    cpp_sources=custom_softmax_cpp_source,
+    cuda_sources=custom_softmax_source,
+    functions=["masked_softmax_cuda"],
+    verbose=False,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using custom CUDA operators for the attention mechanism.
+    Replaces the masked_fill + softmax sequence with a fused CUDA kernel.
+    """
+
+    def __init__(self, n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen) -> None:
+        super().__init__()
+        assert n_embd % n_head == 0
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd)
+        self.c_proj = nn.Linear(n_embd, n_embd)
+        self.attn_dropout = nn.Dropout(attn_pdrop)
+        self.resid_dropout = nn.Dropout(resid_pdrop)
+        
+        # Register bias buffer
+        self.register_buffer("bias", torch.tril(torch.ones(max_seqlen, max_seqlen))
+                                     .view(1, 1, max_seqlen, max_seqlen))
+        self.n_head = n_head
+        self.n_embd = n_embd
+        
+        # Bind the custom CUDA operator
+        self.masked_softmax = masked_softmax
+
+    def forward(self, x):
+        B, T, C = x.size()
+
+        # Calculate Q, K, V
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        
+        # Reshape for multi-head attention
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # Attention scores: (B, nh, T, T)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        
+        # Use custom CUDA operator for masked softmax
+        # The bias tensor is [1, 1, max_seqlen, max_seqlen], we slice it to [1, 1, T, T]
+        att = self.masked_softmax.masked_softmax_cuda(att, self.bias[:,:,:T,:T])
+        
+        # Dropout and output projection
+        att = self.attn_dropout(att)
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
+# Re-define get_inputs and get_init_inputs for the new model context if needed, 
+# but the prompt asks for the ModelNew code block.

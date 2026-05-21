@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 81.325,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "0.827324",
+        "0.824812",
+        "0.827166",
+        "0.826269",
+        "0.825805"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "130.623871",
+        "130.046280",
+        "130.035645",
+        "130.279160",
+        "129.764694"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_codex_cuda_all/generated_kernels/level_2/problem_39.py",
+  "level": 2,
+  "model_name": "codex-gpt-5.5",
+  "precision": "fp32",
+  "problem_id": 39,
+  "problem_name": "39_Gemm_Scale_BatchNorm.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_codex_cuda_all/raw_generation/level_2/problem_39.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

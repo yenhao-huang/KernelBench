@@ -1,0 +1,170 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for the fused operation: Matmul -> AvgPool1d (kernel=16) -> GELU -> Scale -> MaxPool1d (kernel=out_features, effectively global max over feature dim)
+# Note: The original code does:
+# 1. Linear(in, out): x = x @ W.T + b
+# 2. AvgPool1d(16): Since input is (B, out), unsqueezed to (B, 1, out). 
+#    Wait, AvgPool1d expects (N, C, L). Here C=1, L=out_features.
+#    Kernel size 16 on length 8192. This reduces the sequence length from 8192 to 8192/16 = 512.
+#    So output shape becomes (B, 1, 512). Then squeeze(1) -> (B, 512).
+# 3. GELU: Element-wise on (B, 512).
+# 4. Scale: Element-wise multiply by scale_factor on (B, 512).
+# 5. Max(dim=1): Global max over the feature dimension (size 512). Output shape (B,).
+
+# Let's break down the fusion strategy:
+# The most expensive part is the Matmul (8192x8192). We can use cuBLAS for this or write a custom tiled matmul. 
+# Given the constraints and typical optimization patterns, using a highly optimized GEMM from cuBLAS via torch.mm is often best, 
+# but the prompt asks to replace operators with CUSTOM CUDA operators.
+# However, writing a full GEMM from scratch in inline CUDA for 8192x8192 is complex and error-prone without shared memory tiling logic which is verbose.
+# A better approach for "custom operator" speedup in this specific chain is to fuse the post-matmul operations (AvgPool, GELU, Scale, Max) into a single kernel 
+# because they are element-wise or small-reduction operations that suffer from memory bandwidth bottlenecks if separated.
+# The Matmul itself is compute-bound and already very optimized in PyTorch (cuBLAS). Replacing it with a naive custom CUDA matmul would likely be SLOWER.
+# Therefore, the optimal strategy is to keep the Matmul as standard PyTorch (which uses cuBLAS) but fuse the subsequent operations into a single custom kernel 
+# to reduce memory traffic and kernel launch overheads.
+
+# Actually, looking at the prompt: "You write custom CUDA operators to replace the pytorch operators... You may make the decision to replace some operators... and leave others unchanged."
+# So I will keep `nn.Linear` (which uses efficient cuBLAS) but replace the sequence `AvgPool -> GELU -> Scale -> Max` with a single fused CUDA kernel.
+
+fused_post_matmul_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+// Helper for GELU approximation or exact calculation
+__device__ inline float gelu(float x) {
+    return 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+}
+
+__global__ void fused_avgpool_gelu_scale_max_kernel(
+    const float* input,      // Shape: (batch_size, out_features)
+    float* output,           // Shape: (batch_size)
+    int batch_size,
+    int in_len,              // out_features from linear layer
+    int pool_kernel_size,    // 16
+    float scale_factor
+) {
+    int batch_idx = blockIdx.x;
+    if (batch_idx >= batch_size) return;
+
+    const float* row_ptr = input + batch_idx * in_len;
+    
+    // Calculate number of blocks after pooling
+    // AvgPool1d with kernel=16, stride=16 (default for non-overlapping usually, but PyTorch AvgPool1d default stride is same as kernel if not specified? 
+    // Actually, nn.AvgPool1d(kernel_size) defaults to stride=kernel_size.
+    // So we divide the input length by pool_kernel_size.
+    
+    int num_pooled_elements = in_len / pool_kernel_size;
+    
+    float max_val = -INFINITY;
+
+    for (int i = 0; i < num_pooled_elements; ++i) {
+        // Calculate average over the pool window
+        float sum = 0.0f;
+        int start_idx = i * pool_kernel_size;
+        
+        #pragma unroll
+        for (int j = 0; j < pool_kernel_size; ++j) {
+            sum += row_ptr[start_idx + j];
+        }
+        
+        float avg = sum / pool_kernel_size;
+        
+        // Apply GELU
+        float gelu_val = gelu(avg);
+        
+        // Apply Scale
+        float scaled_val = gelu_val * scale_factor;
+        
+        // Update Max
+        if (scaled_val > max_val) {
+            max_val = scaled_val;
+        }
+    }
+
+    output[batch_idx] = max_val;
+}
+
+torch::Tensor fused_post_matmul_cuda(torch::Tensor x, int pool_kernel_size, float scale_factor) {
+    // x is expected to be (batch_size, out_features)
+    auto batch_size = x.size(0);
+    auto in_len = x.size(1);
+    
+    auto output = torch::empty({batch_size}, x.options());
+
+    const int block_size = 1; // One thread per sample for this reduction-heavy task is fine, or we can use a grid of blocks.
+    // Since each thread handles one entire row reduction, 1D grid of size batch_size is appropriate.
+    
+    fused_avgpool_gelu_scale_max_kernel<<<batch_size, block_size>>>(
+        x.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        in_len,
+        pool_kernel_size,
+        scale_factor
+    );
+
+    return output;
+}
+"""
+
+fused_post_matmul_cpp_source = (
+    "torch::Tensor fused_post_matmul_cuda(torch::Tensor x, int pool_kernel_size, float scale_factor);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_post_matmul",
+    cpp_sources=fused_post_matmul_cpp_source,
+    cuda_sources=fused_post_matmul_source,
+    functions=["fused_post_matmul_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using custom CUDA operator for the post-matmul sequence.
+    """
+    def __init__(self, in_features, out_features, pool_kernel_size, scale_factor):
+        super(ModelNew, self).__init__()
+        self.matmul = nn.Linear(in_features, out_features)
+        self.pool_kernel_size = pool_kernel_size
+        self.scale_factor = scale_factor
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size).
+        """
+        # 1. Matmul (Kept as nn.Linear for optimal cuBLAS performance)
+        x = self.matmul(x)
+        
+        # 2-5. Fused AvgPool -> GELU -> Scale -> Max into a single custom CUDA kernel
+        # The original code:
+        # x = self.avg_pool(x.unsqueeze(1)).squeeze(1) 
+        # This performs AvgPool1d on the feature dimension. 
+        # Note: nn.AvgPool1d expects (N, C, L). 
+        # In the original code: x is (B, out_features). unsqueeze(1) -> (B, 1, out_features).
+        # AvgPool1d(kernel=16) on length 8192 with default stride=16 results in length 512.
+        # squeeze(1) -> (B, 512).
+        # Our custom kernel takes (B, out_features) and directly computes the pooled values, applies GELU, Scale, and Max.
+        
+        x = fused_ops.fused_post_matmul_cuda(x, self.pool_kernel_size, self.scale_factor)
+        
+        return x
+
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, pool_kernel_size, scale_factor]
+```

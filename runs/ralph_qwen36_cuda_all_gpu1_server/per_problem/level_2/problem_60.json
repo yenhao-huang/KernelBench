@@ -1,0 +1,17 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 40.962,
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server/generated_kernels/level_2/problem_60.py",
+  "level": 2,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 60,
+  "problem_name": "60_ConvTranspose3d_Swish_GroupNorm_HardSwish.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server/raw_generation/level_2/problem_60.txt",
+  "static_errors": [
+    "Contains 'pass' statement (inheritance bypass)"
+  ],
+  "static_warnings": [],
+  "status": "static_failed"
+}

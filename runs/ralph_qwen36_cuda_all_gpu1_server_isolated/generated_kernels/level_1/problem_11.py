@@ -1,0 +1,120 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for 4D tensor-matrix multiplication
+# This kernel performs: C[b, i, j, k] = sum_l A[b, i, j, l] * B[l, k]
+# We treat the first three dimensions (b, i, j) as a batch of matrix multiplications.
+# Each "batch" element is a matrix of shape (j, l) multiplied by B (l, k).
+# To optimize for FP32 and memory bandwidth, we use a tiled approach or simple block mapping.
+# Given the shapes, a straightforward block-per-(b,i,j) might be too many blocks if b*i*j is large.
+# Instead, we map each thread to one output element (b, i, j, k).
+
+einsum_bijl_lk_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void einsum_bijl_lk_kernel(
+    const float* __restrict__ A, 
+    const float* __restrict__ B, 
+    float* __restrict__ C, 
+    int b, int i, int j, int l, int k) 
+{
+    // Total number of output elements is b * i * j * k
+    // We map each thread to one output element (b_idx, i_idx, j_idx, k_idx)
+    
+    long long total_elements = (long long)b * i * j * k;
+    long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < total_elements) {
+        // Decode linear index to 4D coordinates
+        long long temp = idx;
+        int k_idx = temp % k;
+        temp /= k;
+        int j_idx = temp % j;
+        temp /= j;
+        int i_idx = temp % i;
+        int b_idx = temp / i; // This is actually temp since we divided by i*j*k effectively
+        
+        // Calculate pointers for A and B
+        // A shape: (b, i, j, l) -> stride: (i*j*l, j*l, l, 1)
+        // B shape: (l, k) -> stride: (k, 1)
+        
+        const float* a_ptr = A + b_idx * (i * j * l) + i_idx * (j * l) + j_idx * l;
+        const float* b_ptr = B + k_idx; // B[l, k], so for fixed k, we iterate l
+        
+        float sum = 0.0f;
+        
+        // Perform the dot product over dimension l
+        // A[b,i,j,l] * B[l,k]
+        for (int ll = 0; ll < l; ++ll) {
+            sum += a_ptr[ll] * b_ptr[ll * k];
+        }
+        
+        C[idx] = sum;
+    }
+}
+
+torch::Tensor einsum_bijl_lk_cuda(torch::Tensor A, torch::Tensor B) {
+    TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
+    TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
+    TORCH_CHECK(A.dim() == 4, "A must be a 4D tensor");
+    TORCH_CHECK(B.dim() == 2, "B must be a 2D tensor");
+    
+    int b = A.size(0);
+    int i = A.size(1);
+    int j = A.size(2);
+    int l_a = A.size(3);
+    int l_b = B.size(0);
+    int k = B.size(1);
+    
+    TORCH_CHECK(l_a == l_b, "Dimension mismatch in einsum: A's last dim must match B's first dim");
+    
+    auto C = torch::zeros({b, i, j, k}, A.options());
+    
+    long long total_elements = (long long)b * i * j * k;
+    if (total_elements == 0) {
+        return C;
+    }
+    
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    // Launch kernel
+    einsum_bijl_lk_kernel<<<num_blocks, block_size>>>(
+        A.data_ptr<float>(), 
+        B.data_ptr<float>(), 
+        C.data_ptr<float>(), 
+        b, i, j, l_a, k
+    );
+    
+    return C;
+}
+"""
+
+einsum_bijl_lk_cpp_source = (
+    "torch::Tensor einsum_bijl_lk_cuda(torch::Tensor A, torch::Tensor B);"
+)
+
+# Compile the inline CUDA code
+einsum_custom = load_inline(
+    name="einsum_bijl_lk",
+    cpp_sources=einsum_bijl_lk_cpp_source,
+    cuda_sources=einsum_bijl_lk_source,
+    functions=["einsum_bijl_lk_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Performs 4D tensor-matrix multiplication using a custom CUDA operator.
+        C[b, i, j, k] = sum_l A[b, i, j, l] * B[l, k]
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, A, B):
+        return einsum_custom.einsum_bijl_lk_cuda(A, B)

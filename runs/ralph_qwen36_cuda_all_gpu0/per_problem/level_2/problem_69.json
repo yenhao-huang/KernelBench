@@ -1,0 +1,14 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 1.469,
+  "error": "No extractable code block or raw Python/CUDA module found.",
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu0/generated_kernels/level_2/problem_69.py",
+  "level": 2,
+  "model_name": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "precision": "fp32",
+  "problem_id": 69,
+  "problem_name": "69_Conv2d_HardSwish_ReLU.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu0/raw_generation/level_2/problem_69.txt",
+  "status": "extraction_failed"
+}

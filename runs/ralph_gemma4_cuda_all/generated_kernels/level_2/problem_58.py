@@ -1,0 +1,138 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# The optimization strategy is to fuse the LogSumExp, HardSwish-like activation, 
+# subtraction, and clamp operations into a single CUDA kernel.
+# Since LogSumExp involves a reduction over the channel dimension (dim=1), 
+# we implement a kernel that performs a reduction per (N, D, H, W) spatial location.
+
+fused_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+#include <vector>
+
+// Kernel to perform LogSumExp reduction over dim=1, followed by fused element-wise ops.
+// Input x shape: (N, C, D, H, W)
+// Output shape: (N, 1, D, H, W)
+__global__ void fused_logsumexp_ops_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ bias,
+    float* __restrict__ out,
+    int N, int C, int D, int H, int W) 
+{
+    // Each thread handles one (n, d, h, w) location
+    int spatial_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_spatial = N * D * H * W;
+
+    if (spatial_idx < total_spatial) {
+        // Decompose spatial_idx into (n, d, h, w)
+        // We assume the output is (N, 1, D, H, W)
+        int w = spatial_idx % W;
+        int h = (spatial_idx / W) % H;
+        int d = (spatial_idx / (W * H)) % D;
+        int n = spatial_idx / (W * H * D);
+
+        // The input index for (n, c, d, h, w) is:
+        // n * (C*D*H*W) + c * (D*H*W) + d * (H*W) + h * W + w
+        int spatial_stride = D * H * W;
+        int base_idx = n * (C * spatial_stride) + d * (H * W) + h * W + w;
+
+        // 1. LogSumExp reduction over C
+        float max_val = -1e38f;
+        for (int c = 0; c < C; ++c) {
+            float val = x[base_idx + c * spatial_stride];
+            if (val > max_val) max_val = val;
+        }
+
+        float sum_exp = 0.0f;
+        for (int c = 0; c < C; ++c) {
+            float val = x[base_idx + c * spatial_stride];
+            sum_exp += expf(val - max_val);
+        }
+        float lse = max_val + logf(sum_exp);
+
+        // 2. Fused element-wise ops:
+        // x = x * torch.sigmoid(x + 3) / 6
+        // x = x - bias
+        // x = torch.clamp(x, min=-1, max=1)
+        
+        float val = lse;
+        float sigmoid_part = 1.0f / (1.0f + expf(-(val + 3.0f)));
+        val = (val * sigmoid_part) / 6.0f;
+        
+        // bias is (1, 1, 1, 1), so we just take bias[0]
+        val = val - bias[0];
+
+        // Clamp
+        if (val < -1.0f) val = -1.0f;
+        if (val > 1.0f) val = 1.0f;
+
+        // Write to output (N, 1, D, H, W)
+        // Output index: n * (D*H*W) + d * (H*W) + h * W + w
+        int out_idx = n * spatial_stride + d * (H * W) + h * W + w;
+        out[out_idx] = val;
+    }
+}
+
+torch::Tensor fused_logsumexp_ops_cuda(torch::Tensor x, torch::Tensor bias) {
+    auto N = x.size(0);
+    auto C = x.size(1);
+    auto D = x.size(2);
+    auto H = x.size(3);
+    auto W = x.size(4);
+
+    auto out = torch::empty({N, 1, D, H, W}, x.options());
+
+    int total_spatial = N * D * H * W;
+    int block_size = 256;
+    int num_blocks = (total_spatial + block_size - 1) / block_size;
+
+    fused_logsumexp_ops_kernel<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C, D, H, W
+    );
+
+    return out;
+}
+"""
+
+fused_ops_cpp_source = """
+torch::Tensor fused_logsumexp_ops_cuda(torch::Tensor x, torch::Tensor bias);
+"""
+
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_source,
+    functions=["fused_logsumexp_ops_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model using a fused CUDA kernel for LogSumExp, HardSwish, Subtraction, and Clamp.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.bias = nn.Parameter(torch.randn(*bias_shape))
+        self.fused_ops = fused_ops
+
+    def forward(self, x):
+        # Step 1: Standard ConvTranspose3d (highly optimized in cuDNN)
+        x = self.conv_transpose(x)
+        
+        # Step 2: Fused CUDA kernel for the remaining operations
+        # This replaces:
+        # x = torch.logsumexp(x, dim=1, keepdim=True)
+        # x = x * torch.sigmoid(x + 3) / 6
+        # x = x - self.bias
+        # x = torch.clamp(x, min=-1, max=1)
+        x = self.fused_ops.fused_logsumexp_ops_cuda(x, self.bias)
+        
+        return x

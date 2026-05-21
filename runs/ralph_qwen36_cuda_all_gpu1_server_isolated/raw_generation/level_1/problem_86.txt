@@ -1,0 +1,331 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernels for Depthwise Separable Convolution
+# We will fuse the depthwise convolution, bias addition (if applicable), 
+# and pointwise convolution into a single kernel or two tightly coupled kernels.
+# Given the structure, a single fused kernel that processes each output pixel 
+# by reading from the input, applying depthwise filter, then pointwise filter is complex due to memory access patterns.
+# A more efficient approach for small kernels (like 3x3) and 1x1 is often:
+# 1. Depthwise Conv (with optional bias)
+# 2. Pointwise Conv (with optional bias)
+# However, to maximize speedup, we can fuse the Depthwise + Bias into one kernel, 
+# and then use a highly optimized GEMM-like or direct convolution for Pointwise.
+# But since Pointwise is 1x1, it's essentially a channel-wise linear transform (GEMM with 1x1 spatial dims).
+# Let's create two custom kernels: one for Depthwise Conv+Bias and one for Pointwise Conv+Bias.
+# Actually, we can fuse the entire operation into a single kernel if we are careful about memory coalescing.
+# For simplicity and robustness in inline CUDA, let's implement:
+# 1. depthwise_conv_bias: Performs depthwise convolution and adds bias.
+# 2. pointwise_conv_bias: Performs 1x1 convolution (matrix multiplication per pixel) and adds bias.
+
+cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper macro for CUDA error checking
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA error in %s at line %d: %s\\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while (0)
+
+// Kernel for Depthwise Convolution with Bias
+__global__ void depthwise_conv_bias_kernel(
+    const float* input, 
+    const float* weight, 
+    const float* bias, 
+    float* output, 
+    int batch_size, 
+    int channels, 
+    int height, 
+    int width, 
+    int kernel_size, 
+    int stride, 
+    int padding, 
+    int dilation) 
+{
+    // Each thread handles one output element
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    int total_elements = batch_size * channels * height * width;
+    if (idx >= total_elements) return;
+
+    // Decode index to coordinates
+    int w_idx = idx % width;
+    int temp = idx / width;
+    int h_idx = temp % height;
+    temp = temp / height;
+    int c_idx = temp % channels;
+    int b_idx = temp / channels;
+
+    float sum = 0.0f;
+    
+    // Calculate input coordinates for the kernel window
+    int kh_start = -padding;
+    int kh_end = kernel_size - padding;
+    int kw_start = -padding;
+    int kw_end = kernel_size - padding;
+
+    for (int kh = kh_start; kh < kh_end; ++kh) {
+        for (int kw = kw_start; kw < kw_end; ++kw) {
+            int in_h = h_idx * stride + kh * dilation;
+            int in_w = w_idx * stride + kw * dilation;
+
+            // Check bounds
+            if (in_h >= 0 && in_h < height && in_w >= 0 && in_w < width) {
+                // Weight index: [c, kh, kw] since groups=channels
+                int weight_idx = c_idx * kernel_size * kernel_size + kh * dilation * kernel_size + kw * dilation; 
+                // Note: The weight layout in PyTorch Conv2d is [out_channels, in_channels/groups, kH, kW].
+                // For depthwise, out_channels=in_channels, groups=in_channels. So weight shape is [C, 1, K, K] effectively if we view it as such, 
+                // but actually it's [C, C/K, K, K] -> [C, 1, K, K].
+                // The input layout is [N, C, H, W].
+                
+                int input_idx = b_idx * channels * height * width + c_idx * height * width + in_h * width + in_w;
+                
+                sum += input[input_idx] * weight[weight_idx];
+            }
+        }
+    }
+
+    if (bias != nullptr) {
+        sum += bias[c_idx];
+    }
+
+    output[idx] = sum;
+}
+
+// Kernel for Pointwise Convolution (1x1 Conv) with Bias
+// This is essentially a matrix multiplication: Output[N, C_out, H, W] = Input[N, C_in, H, W] * Weight[C_out, C_in, 1, 1] + Bias[C_out]
+__global__ void pointwise_conv_bias_kernel(
+    const float* input, 
+    const float* weight, 
+    const float* bias, 
+    float* output, 
+    int batch_size, 
+    int in_channels, 
+    int out_channels, 
+    int height, 
+    int width) 
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * out_channels * height * width;
+    
+    if (idx >= total_elements) return;
+
+    // Decode index to coordinates
+    int w_idx = idx % width;
+    int temp = idx / width;
+    int h_idx = temp % height;
+    temp = temp / height;
+    int c_out_idx = temp % out_channels;
+    int b_idx = temp / out_channels;
+
+    float sum = 0.0f;
+    
+    // Iterate over input channels
+    for (int c_in = 0; c_in < in_channels; ++c_in) {
+        // Weight index: [out_channels, in_channels, 1, 1] -> [c_out, c_in]
+        int weight_idx = c_out_idx * in_channels + c_in;
+        
+        // Input index: [N, C_in, H, W]
+        int input_idx = b_idx * in_channels * height * width + c_in * height * width + h_idx * width + w_idx;
+        
+        sum += input[input_idx] * weight[weight_idx];
+    }
+
+    if (bias != nullptr) {
+        sum += bias[c_out_idx];
+    }
+
+    output[idx] = sum;
+}
+
+torch::Tensor depthwise_conv_bias_cuda(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    torch::Tensor bias) 
+{
+    auto batch_size = input.size(0);
+    auto channels = input.size(1);
+    auto height = input.size(2);
+    auto width = input.size(3);
+    
+    // Get kernel parameters from weight shape or assume standard 3x3 for this specific model usage?
+    // The problem statement gives kernel_size, stride, padding, dilation as init inputs.
+    // We need to pass these or infer them. Since we are replacing the operator in a specific model, 
+    // we can hardcode the logic if we know the args, but better to make it generic.
+    // However, load_inline doesn't easily allow passing extra python args to the kernel launch config without modifying the wrapper.
+    // Let's assume the standard 3x3 kernel for this specific optimization task as per the test case, 
+    // or we can extract stride/padding/dilation from the weight tensor if possible? No, they are not stored in weight.
+    // We will modify the function signature to accept these parameters.
+    
+    // Actually, looking at the example, the custom function takes tensors. 
+    // To support variable kernel sizes/strides, we should pass them as arguments.
+    // Let's redefine the C++ function to take these ints.
+    
+    return torch::zeros_like(input); // Placeholder
+}
+
+// Redefining with explicit parameters for flexibility
+torch::Tensor depthwise_conv_bias_cuda_params(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    torch::Tensor bias,
+    int kernel_size,
+    int stride,
+    int padding,
+    int dilation) 
+{
+    auto batch_size = input.size(0);
+    auto channels = input.size(1);
+    auto height = input.size(2);
+    auto width = input.size(3);
+    
+    auto output = torch::zeros_like(input);
+    
+    const int block_size = 256;
+    int total_elements = batch_size * channels * height * width;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    float* bias_ptr = bias.numel() > 0 ? bias.data_ptr<float>() : nullptr;
+
+    depthwise_conv_bias_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias_ptr,
+        output.data_ptr<float>(),
+        batch_size,
+        channels,
+        height,
+        width,
+        kernel_size,
+        stride,
+        padding,
+        dilation
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+    return output;
+}
+
+torch::Tensor pointwise_conv_bias_cuda_params(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    torch::Tensor bias) 
+{
+    auto batch_size = input.size(0);
+    auto in_channels = input.size(1);
+    auto out_channels = weight.size(0); // Output channels
+    auto height = input.size(2);
+    auto width = input.size(3);
+    
+    auto output = torch::zeros_like(input);
+    
+    const int block_size = 256;
+    int total_elements = batch_size * out_channels * height * width;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    float* bias_ptr = bias.numel() > 0 ? bias.data_ptr<float>() : nullptr;
+
+    pointwise_conv_bias_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias_ptr,
+        output.data_ptr<float>(),
+        batch_size,
+        in_channels,
+        out_channels,
+        height,
+        width
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+    return output;
+}
+"""
+
+cpp_source = """
+#include <torch/extension.h>
+
+torch::Tensor depthwise_conv_bias_cuda_params(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    torch::Tensor bias,
+    int kernel_size,
+    int stride,
+    int padding,
+    int dilation);
+
+torch::Tensor pointwise_conv_bias_cuda_params(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    torch::Tensor bias);
+"""
+
+# Load the inline CUDA extension
+custom_ops = load_inline(
+    name="custom_depthwise_pointwise",
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    functions=["depthwise_conv_bias_cuda_params", "pointwise_conv_bias_cuda_params"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized Depthwise-Separable Convolution using custom CUDA operators.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, bias: bool = False):
+        super(ModelNew, self).__init__()
+        
+        # Store parameters for the custom kernels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.bias = bias
+        
+        # Define the layers as usual to get the weights/biases
+        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, groups=in_channels, bias=bias)
+        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the depthwise-separable 2D convolution using custom CUDA kernels.
+        """
+        # Depthwise Convolution + Bias
+        dw_weight = self.depthwise.weight
+        dw_bias = self.depthwise.bias if self.bias else None
+        
+        x = custom_ops.depthwise_conv_bias_cuda_params(
+            x, 
+            dw_weight, 
+            dw_bias,
+            self.kernel_size,
+            self.stride,
+            self.padding,
+            self.dilation
+        )
+        
+        # Pointwise Convolution + Bias
+        pw_weight = self.pointwise.weight
+        pw_bias = self.pointwise.bias if self.bias else None
+        
+        x = custom_ops.pointwise_conv_bias_cuda_params(
+            x, 
+            pw_weight, 
+            pw_bias
+        )
+        
+        return x
+
+# Test code is not included as per instructions
+```

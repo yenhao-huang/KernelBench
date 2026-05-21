@@ -1,0 +1,28 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 54.053,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "correctness_issue": "Output shape mismatch: Expected torch.Size([128]), got torch.Size([128, 64])",
+      "correctness_issue_name": "correctness_issue",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090"
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_2/problem_65.py",
+  "level": 2,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 65,
+  "problem_name": "65_Conv2d_AvgPool_Sigmoid_Sum.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_2/problem_65.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

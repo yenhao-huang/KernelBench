@@ -1,0 +1,223 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cpp_sources = """
+torch::Tensor conv2d3x3_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor b);
+torch::Tensor fused_gn_act_lse_cuda(torch::Tensor x, torch::Tensor gamma, torch::Tensor beta, int groups, double eps);
+"""
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void conv2d3x3_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ y,
+    int N, int Cin, int H, int W, int Cout, int OH, int OW
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * Cout * OH * OW;
+    if (idx >= total) return;
+
+    int ow = idx % OW;
+    int t = idx / OW;
+    int oh = t % OH;
+    t /= OH;
+    int co = t % Cout;
+    int n = t / Cout;
+
+    float acc = b[co];
+    int x_base = ((n * Cin) * H + oh) * W + ow;
+    int w_base = co * Cin * 9;
+
+    #pragma unroll
+    for (int ci = 0; ci < 8; ++ci) {
+        const float* xp = x + x_base + ci * H * W;
+        const float* wp = w + w_base + ci * 9;
+        acc += xp[0 * W + 0] * wp[0];
+        acc += xp[0 * W + 1] * wp[1];
+        acc += xp[0 * W + 2] * wp[2];
+        acc += xp[1 * W + 0] * wp[3];
+        acc += xp[1 * W + 1] * wp[4];
+        acc += xp[1 * W + 2] * wp[5];
+        acc += xp[2 * W + 0] * wp[6];
+        acc += xp[2 * W + 1] * wp[7];
+        acc += xp[2 * W + 2] * wp[8];
+    }
+
+    y[idx] = acc;
+}
+
+__global__ void gn_stats_kernel(
+    const float* __restrict__ x,
+    float* __restrict__ mean,
+    float* __restrict__ rstd,
+    int N, int C, int H, int W, int groups, float eps
+) {
+    int ng = blockIdx.x;
+    int n = ng / groups;
+    int g = ng - n * groups;
+    int cpg = C / groups;
+    int elems = cpg * H * W;
+
+    float sum = 0.0f;
+    float sumsq = 0.0f;
+
+    for (int i = threadIdx.x; i < elems; i += blockDim.x) {
+        int c_local = i / (H * W);
+        int hw = i - c_local * H * W;
+        int c = g * cpg + c_local;
+        float v = x[((n * C + c) * H * W) + hw];
+        sum += v;
+        sumsq += v * v;
+    }
+
+    __shared__ float ssum[256];
+    __shared__ float ssq[256];
+    ssum[threadIdx.x] = sum;
+    ssq[threadIdx.x] = sumsq;
+    __syncthreads();
+
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            ssum[threadIdx.x] += ssum[threadIdx.x + stride];
+            ssq[threadIdx.x] += ssq[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        float m = ssum[0] / (float)elems;
+        float var = ssq[0] / (float)elems - m * m;
+        mean[ng] = m;
+        rstd[ng] = rsqrtf(var + eps);
+    }
+}
+
+__global__ void fused_lse_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ mean,
+    const float* __restrict__ rstd,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    float* __restrict__ out,
+    int N, int C, int H, int W, int groups
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * H * W;
+    if (idx >= total) return;
+
+    int hw = idx % (H * W);
+    int n = idx / (H * W);
+    int cpg = C / groups;
+
+    float vals[64];
+    float mval = -INFINITY;
+
+    #pragma unroll
+    for (int c = 0; c < 64; ++c) {
+        int g = c / cpg;
+        float xc = x[((n * C + c) * H * W) + hw];
+        float z = (xc - mean[n * groups + g]) * rstd[n * groups + g];
+        z = z * gamma[c] + beta[c];
+
+        float th = tanhf(z);
+        float relu6 = fminf(fmaxf(th + 3.0f, 0.0f), 6.0f);
+        float hs = th * relu6 * 0.16666666666666666f;
+        float v = xc + hs;
+
+        vals[c] = v;
+        mval = fmaxf(mval, v);
+    }
+
+    float sum = 0.0f;
+    #pragma unroll
+    for (int c = 0; c < 64; ++c) {
+        sum += expf(vals[c] - mval);
+    }
+
+    out[idx] = logf(sum) + mval;
+}
+
+torch::Tensor conv2d3x3_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor b) {
+    int N = x.size(0);
+    int Cin = x.size(1);
+    int H = x.size(2);
+    int W = x.size(3);
+    int Cout = w.size(0);
+    int OH = H - 2;
+    int OW = W - 2;
+
+    auto y = torch::empty({N, Cout, OH, OW}, x.options());
+    int total = N * Cout * OH * OW;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+
+    conv2d3x3_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(), w.data_ptr<float>(), b.data_ptr<float>(), y.data_ptr<float>(),
+        N, Cin, H, W, Cout, OH, OW
+    );
+    return y;
+}
+
+torch::Tensor fused_gn_act_lse_cuda(torch::Tensor x, torch::Tensor gamma, torch::Tensor beta, int groups, double eps) {
+    int N = x.size(0);
+    int C = x.size(1);
+    int H = x.size(2);
+    int W = x.size(3);
+
+    auto stats_opts = x.options();
+    auto mean = torch::empty({N, groups}, stats_opts);
+    auto rstd = torch::empty({N, groups}, stats_opts);
+    auto out = torch::empty({N, 1, H, W}, x.options());
+
+    gn_stats_kernel<<<N * groups, 256>>>(
+        x.data_ptr<float>(), mean.data_ptr<float>(), rstd.data_ptr<float>(),
+        N, C, H, W, groups, (float)eps
+    );
+
+    int total = N * H * W;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    fused_lse_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(), mean.data_ptr<float>(), rstd.data_ptr<float>(),
+        gamma.data_ptr<float>(), beta.data_ptr<float>(), out.data_ptr<float>(),
+        N, C, H, W, groups
+    );
+
+    return out;
+}
+"""
+
+_kb_ext = load_inline(
+    name="kb_conv_gn_act_lse_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["conv2d3x3_cuda", "fused_gn_act_lse_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, groups, eps=1e-5):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.group_norm = nn.GroupNorm(groups, out_channels, eps=eps)
+        self.groups = groups
+        self.eps = eps
+        self.ext = _kb_ext
+
+    def forward(self, x):
+        x_conv = self.ext.conv2d3x3_cuda(x, self.conv.weight, self.conv.bias)
+        return self.ext.fused_gn_act_lse_cuda(
+            x_conv,
+            self.group_norm.weight,
+            self.group_norm.bias,
+            self.groups,
+            self.eps,
+        )

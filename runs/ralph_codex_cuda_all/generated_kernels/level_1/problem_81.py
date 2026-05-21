@@ -1,0 +1,180 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+conv_transpose2d_cpp_source = """
+torch::Tensor conv_transpose2d_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int stride_h,
+    int stride_w,
+    int pad_h,
+    int pad_w,
+    int dilation_h,
+    int dilation_w,
+    bool has_bias
+);
+"""
+
+conv_transpose2d_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void conv_transpose2d_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* __restrict__ out,
+    int N,
+    int Cin,
+    int Hin,
+    int Win,
+    int Cout,
+    int Kh,
+    int Kw,
+    int Hout,
+    int Wout,
+    int stride_h,
+    int stride_w,
+    int pad_h,
+    int pad_w,
+    int dilation_h,
+    int dilation_w,
+    bool has_bias,
+    long total
+) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int ow = idx % Wout;
+    int t = idx / Wout;
+    int oh = t % Hout;
+    t /= Hout;
+    int oc = t % Cout;
+    int n = t / Cout;
+
+    float acc = has_bias ? bias[oc] : 0.0f;
+
+    for (int kh = 0; kh < Kh; ++kh) {
+        int ih_num = oh + pad_h - kh * dilation_h;
+        if (ih_num < 0 || ih_num % stride_h != 0) continue;
+        int ih = ih_num / stride_h;
+        if (ih < 0 || ih >= Hin) continue;
+
+        for (int kw = 0; kw < Kw; ++kw) {
+            int iw_num = ow + pad_w - kw * dilation_w;
+            if (iw_num < 0 || iw_num % stride_w != 0) continue;
+            int iw = iw_num / stride_w;
+            if (iw < 0 || iw >= Win) continue;
+
+            const float* x_base = x + ((n * Cin) * Hin + ih) * Win + iw;
+            const float* w_base = weight + (oc * Kh + kh) * Kw + kw;
+
+            #pragma unroll
+            for (int ic = 0; ic < Cin; ++ic) {
+                acc += x_base[ic * Hin * Win] * w_base[ic * Cout * Kh * Kw];
+            }
+        }
+    }
+
+    out[idx] = acc;
+}
+
+torch::Tensor conv_transpose2d_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int stride_h,
+    int stride_w,
+    int pad_h,
+    int pad_w,
+    int dilation_h,
+    int dilation_w,
+    bool has_bias
+) {
+    int N = x.size(0);
+    int Cin = x.size(1);
+    int Hin = x.size(2);
+    int Win = x.size(3);
+    int Cout = weight.size(1);
+    int Kh = weight.size(2);
+    int Kw = weight.size(3);
+
+    int Hout = (Hin - 1) * stride_h - 2 * pad_h + dilation_h * (Kh - 1) + 1;
+    int Wout = (Win - 1) * stride_w - 2 * pad_w + dilation_w * (Kw - 1) + 1;
+
+    auto out = torch::empty({N, Cout, Hout, Wout}, x.options());
+    long total = (long)N * Cout * Hout * Wout;
+
+    const int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+
+    const float* bias_ptr = has_bias ? bias.data_ptr<float>() : nullptr;
+
+    conv_transpose2d_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias_ptr,
+        out.data_ptr<float>(),
+        N, Cin, Hin, Win, Cout, Kh, Kw, Hout, Wout,
+        stride_h, stride_w, pad_h, pad_w, dilation_h, dilation_w,
+        has_bias,
+        total
+    );
+
+    return out;
+}
+"""
+
+conv_transpose2d_ext = load_inline(
+    name="conv_transpose2d_custom_ext",
+    cpp_sources=conv_transpose2d_cpp_source,
+    cuda_sources=conv_transpose2d_cuda_source,
+    functions=["conv_transpose2d_cuda"],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        dilation: int = 1,
+        bias: bool = False,
+    ):
+        super(ModelNew, self).__init__()
+        self.conv_transpose2d = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            bias=bias,
+        )
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.has_bias = bias
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bias = self.conv_transpose2d.bias
+        if bias is None:
+            bias = self.conv_transpose2d.weight
+        return conv_transpose2d_ext.conv_transpose2d_cuda(
+            x,
+            self.conv_transpose2d.weight,
+            bias,
+            self.stride,
+            self.stride,
+            self.padding,
+            self.padding,
+            self.dilation,
+            self.dilation,
+            self.has_bias,
+        )

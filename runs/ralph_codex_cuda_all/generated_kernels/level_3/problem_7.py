@@ -1,0 +1,229 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <float.h>
+
+__global__ void relu_kernel(const float* x, float* y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = x[i];
+        y[i] = v > 0.0f ? v : 0.0f;
+    }
+}
+
+__global__ void maxpool3_kernel(const float* x, float* y, int N, int C, int H, int W, int OH, int OW, int stride) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C * OH * OW;
+    if (idx >= total) return;
+
+    int ow = idx % OW;
+    int oh = (idx / OW) % OH;
+    int c = (idx / (OW * OH)) % C;
+    int n = idx / (OW * OH * C);
+
+    int ih0 = oh * stride - 1;
+    int iw0 = ow * stride - 1;
+    float m = -FLT_MAX;
+
+    for (int kh = 0; kh < 3; ++kh) {
+        int ih = ih0 + kh;
+        if (ih < 0 || ih >= H) continue;
+        for (int kw = 0; kw < 3; ++kw) {
+            int iw = iw0 + kw;
+            if (iw < 0 || iw >= W) continue;
+            float v = x[((n * C + c) * H + ih) * W + iw];
+            m = v > m ? v : m;
+        }
+    }
+    y[idx] = m;
+}
+
+__global__ void relu_maxpool3_kernel(const float* x, float* y, int N, int C, int H, int W, int OH, int OW, int stride) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C * OH * OW;
+    if (idx >= total) return;
+
+    int ow = idx % OW;
+    int oh = (idx / OW) % OH;
+    int c = (idx / (OW * OH)) % C;
+    int n = idx / (OW * OH * C);
+
+    int ih0 = oh * stride - 1;
+    int iw0 = ow * stride - 1;
+    float m = 0.0f;
+
+    for (int kh = 0; kh < 3; ++kh) {
+        int ih = ih0 + kh;
+        if (ih < 0 || ih >= H) continue;
+        for (int kw = 0; kw < 3; ++kw) {
+            int iw = iw0 + kw;
+            if (iw < 0 || iw >= W) continue;
+            float v = x[((n * C + c) * H + ih) * W + iw];
+            v = v > 0.0f ? v : 0.0f;
+            m = v > m ? v : m;
+        }
+    }
+    y[idx] = m;
+}
+
+__global__ void avgpool_linear_kernel(const float* x, const float* w, const float* b, float* y,
+                                      int N, int C, int H, int W, int O) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * O;
+    if (idx >= total) return;
+
+    int o = idx % O;
+    int n = idx / O;
+    float acc = b[o];
+    float inv = 1.0f / (float)(H * W);
+
+    for (int c = 0; c < C; ++c) {
+        float s = 0.0f;
+        const float* base = x + ((n * C + c) * H * W);
+        for (int i = 0; i < H * W; ++i) s += base[i];
+        acc += (s * inv) * w[o * C + c];
+    }
+    y[idx] = acc;
+}
+
+torch::Tensor relu_cuda(torch::Tensor x) {
+    auto y = torch::empty_like(x);
+    int n = x.numel();
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    relu_kernel<<<blocks, threads>>>(x.data_ptr<float>(), y.data_ptr<float>(), n);
+    return y;
+}
+
+torch::Tensor maxpool3_cuda(torch::Tensor x, int64_t stride) {
+    int N = x.size(0), C = x.size(1), H = x.size(2), W = x.size(3);
+    int OH = (H + 2 - 3) / stride + 1;
+    int OW = (W + 2 - 3) / stride + 1;
+    auto y = torch::empty({N, C, OH, OW}, x.options());
+    int total = N * C * OH * OW;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    maxpool3_kernel<<<blocks, threads>>>(x.data_ptr<float>(), y.data_ptr<float>(), N, C, H, W, OH, OW, (int)stride);
+    return y;
+}
+
+torch::Tensor relu_maxpool3_cuda(torch::Tensor x, int64_t stride) {
+    int N = x.size(0), C = x.size(1), H = x.size(2), W = x.size(3);
+    int OH = (H + 2 - 3) / stride + 1;
+    int OW = (W + 2 - 3) / stride + 1;
+    auto y = torch::empty({N, C, OH, OW}, x.options());
+    int total = N * C * OH * OW;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    relu_maxpool3_kernel<<<blocks, threads>>>(x.data_ptr<float>(), y.data_ptr<float>(), N, C, H, W, OH, OW, (int)stride);
+    return y;
+}
+
+torch::Tensor avgpool_linear_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor b) {
+    int N = x.size(0), C = x.size(1), H = x.size(2), W = x.size(3), O = w.size(0);
+    auto y = torch::empty({N, O}, x.options());
+    int total = N * O;
+    int threads = 128;
+    int blocks = (total + threads - 1) / threads;
+    avgpool_linear_kernel<<<blocks, threads>>>(x.data_ptr<float>(), w.data_ptr<float>(), b.data_ptr<float>(),
+                                               y.data_ptr<float>(), N, C, H, W, O);
+    return y;
+}
+"""
+
+cpp_sources = """
+torch::Tensor relu_cuda(torch::Tensor x);
+torch::Tensor maxpool3_cuda(torch::Tensor x, int64_t stride);
+torch::Tensor relu_maxpool3_cuda(torch::Tensor x, int64_t stride);
+torch::Tensor avgpool_linear_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor b);
+"""
+
+kb_ops = load_inline(
+    name="kb_googlenet_ops",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["relu_cuda", "maxpool3_cuda", "relu_maxpool3_cuda", "avgpool_linear_cuda"],
+    verbose=False,
+)
+
+
+class InceptionModuleNew(nn.Module):
+    def __init__(self, in_channels, out_1x1, reduce_3x3, out_3x3, reduce_5x5, out_5x5, pool_proj):
+        super().__init__()
+        self.branch1x1 = nn.Conv2d(in_channels, out_1x1, kernel_size=1)
+        self.branch3x3 = nn.Sequential(
+            nn.Conv2d(in_channels, reduce_3x3, kernel_size=1),
+            nn.Conv2d(reduce_3x3, out_3x3, kernel_size=3, padding=1),
+        )
+        self.branch5x5 = nn.Sequential(
+            nn.Conv2d(in_channels, reduce_5x5, kernel_size=1),
+            nn.Conv2d(reduce_5x5, out_5x5, kernel_size=5, padding=2),
+        )
+        self.branch_pool = nn.Sequential(
+            nn.MaxPool2d(kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(in_channels, pool_proj, kernel_size=1),
+        )
+
+    def forward(self, x):
+        return torch.cat(
+            (
+                self.branch1x1(x),
+                self.branch3x3(x),
+                self.branch5x5(x),
+                self.branch_pool[1](kb_ops.maxpool3_cuda(x, 1)),
+            ),
+            1,
+        )
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000):
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3)
+        self.maxpool1 = nn.MaxPool2d(3, stride=2, padding=1)
+        self.conv2 = nn.Conv2d(64, 64, kernel_size=1)
+        self.conv3 = nn.Conv2d(64, 192, kernel_size=3, padding=1)
+        self.maxpool2 = nn.MaxPool2d(3, stride=2, padding=1)
+
+        self.inception3a = InceptionModuleNew(192, 64, 96, 128, 16, 32, 32)
+        self.inception3b = InceptionModuleNew(256, 128, 128, 192, 32, 96, 64)
+        self.maxpool3 = nn.MaxPool2d(3, stride=2, padding=1)
+
+        self.inception4a = InceptionModuleNew(480, 192, 96, 208, 16, 48, 64)
+        self.inception4b = InceptionModuleNew(512, 160, 112, 224, 24, 64, 64)
+        self.inception4c = InceptionModuleNew(512, 128, 128, 256, 24, 64, 64)
+        self.inception4d = InceptionModuleNew(512, 112, 144, 288, 32, 64, 64)
+        self.inception4e = InceptionModuleNew(528, 256, 160, 320, 32, 128, 128)
+        self.maxpool4 = nn.MaxPool2d(3, stride=2, padding=1)
+
+        self.inception5a = InceptionModuleNew(832, 256, 160, 320, 32, 128, 128)
+        self.inception5b = InceptionModuleNew(832, 384, 192, 384, 48, 128, 128)
+
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.dropout = nn.Dropout(0.0)
+        self.fc = nn.Linear(1024, num_classes)
+
+    def forward(self, x):
+        x = kb_ops.relu_maxpool3_cuda(self.conv1(x), 2)
+        x = kb_ops.relu_cuda(self.conv2(x))
+        x = kb_ops.relu_maxpool3_cuda(self.conv3(x), 2)
+
+        x = self.inception3a(x)
+        x = self.inception3b(x)
+        x = kb_ops.maxpool3_cuda(x, 2)
+
+        x = self.inception4a(x)
+        x = self.inception4b(x)
+        x = self.inception4c(x)
+        x = self.inception4d(x)
+        x = self.inception4e(x)
+        x = kb_ops.maxpool3_cuda(x, 2)
+
+        x = self.inception5a(x)
+        x = self.inception5b(x)
+
+        return kb_ops.avgpool_linear_cuda(x, self.fc.weight, self.fc.bias)

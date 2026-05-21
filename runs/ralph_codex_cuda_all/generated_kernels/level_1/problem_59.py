@@ -1,0 +1,188 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+conv3d_asym_cpp = """
+torch::Tensor conv3d_asym_cuda(torch::Tensor x, torch::Tensor w, int stride, int padding, int dilation);
+"""
+
+conv3d_asym_cuda = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void conv3d_k3_c3_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    float* __restrict__ y,
+    int N, int H, int W, int D,
+    int O, int Ho, int Wo
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * O * Ho * Wo * D;
+    if (idx >= total) return;
+
+    int d = idx % D;
+    int t = idx / D;
+    int ow = t % Wo;
+    t /= Wo;
+    int oh = t % Ho;
+    t /= Ho;
+    int o = t % O;
+    int n = t / O;
+
+    int ih0 = oh;
+    int iw0 = ow;
+
+    const float* xp = x + (((n * 3) * H + ih0) * W + iw0) * D + d;
+    const float* wp = w + o * 27;
+
+    float acc = 0.0f;
+
+    #pragma unroll
+    for (int c = 0; c < 3; ++c) {
+        const float* xc = xp + c * H * W * D;
+        const float* wc = wp + c * 9;
+
+        acc += xc[(0 * W + 0) * D] * wc[0];
+        acc += xc[(0 * W + 1) * D] * wc[1];
+        acc += xc[(0 * W + 2) * D] * wc[2];
+
+        acc += xc[(1 * W + 0) * D] * wc[3];
+        acc += xc[(1 * W + 1) * D] * wc[4];
+        acc += xc[(1 * W + 2) * D] * wc[5];
+
+        acc += xc[(2 * W + 0) * D] * wc[6];
+        acc += xc[(2 * W + 1) * D] * wc[7];
+        acc += xc[(2 * W + 2) * D] * wc[8];
+    }
+
+    y[idx] = acc;
+}
+
+__global__ void conv3d_general_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    float* __restrict__ y,
+    int N, int C, int H, int W, int D,
+    int O, int K, int Ho, int Wo, int Do_,
+    int stride, int padding, int dilation
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * O * Ho * Wo * Do_;
+    if (idx >= total) return;
+
+    int od = idx % Do_;
+    int t = idx / Do_;
+    int ow = t % Wo;
+    t /= Wo;
+    int oh = t % Ho;
+    t /= Ho;
+    int o = t % O;
+    int n = t / O;
+
+    float acc = 0.0f;
+
+    for (int c = 0; c < C; ++c) {
+        for (int kh = 0; kh < K; ++kh) {
+            int ih = oh * stride - padding + kh * dilation;
+            if ((unsigned)ih >= (unsigned)H) continue;
+            for (int kw = 0; kw < K; ++kw) {
+                int iw = ow * stride - padding + kw * dilation;
+                if ((unsigned)iw >= (unsigned)W) continue;
+                int id = od * stride - padding;
+                if ((unsigned)id >= (unsigned)D) continue;
+
+                int xoff = ((((n * C + c) * H + ih) * W + iw) * D + id);
+                int woff = ((((o * C + c) * K + kh) * K + kw));
+                acc += x[xoff] * w[woff];
+            }
+        }
+    }
+
+    y[idx] = acc;
+}
+
+torch::Tensor conv3d_asym_cuda(torch::Tensor x, torch::Tensor w, int stride, int padding, int dilation) {
+    x = x.contiguous();
+    w = w.contiguous();
+
+    int N = x.size(0);
+    int C = x.size(1);
+    int H = x.size(2);
+    int W = x.size(3);
+    int D = x.size(4);
+    int O = w.size(0);
+    int K = w.size(2);
+
+    int Ho = (H + 2 * padding - dilation * (K - 1) - 1) / stride + 1;
+    int Wo = (W + 2 * padding - dilation * (K - 1) - 1) / stride + 1;
+    int Do_ = (D + 2 * padding - 1) / stride + 1;
+
+    auto y = torch::empty({N, O, Ho, Wo, Do_}, x.options());
+
+    int total = N * O * Ho * Wo * Do_;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+
+    if (C == 3 && K == 3 && stride == 1 && padding == 0 && dilation == 1 && Do_ == D) {
+        conv3d_k3_c3_kernel<<<grid, block>>>(
+            x.data_ptr<float>(), w.data_ptr<float>(), y.data_ptr<float>(),
+            N, H, W, D, O, Ho, Wo
+        );
+    } else {
+        conv3d_general_kernel<<<grid, block>>>(
+            x.data_ptr<float>(), w.data_ptr<float>(), y.data_ptr<float>(),
+            N, C, H, W, D, O, K, Ho, Wo, Do_,
+            stride, padding, dilation
+        );
+    }
+
+    return y;
+}
+"""
+
+_conv3d_asym_mod = load_inline(
+    name="conv3d_asym_inline",
+    cpp_sources=conv3d_asym_cpp,
+    cuda_sources=conv3d_asym_cuda,
+    functions=["conv3d_asym_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        dilation: int = 1,
+        groups: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.conv3d = nn.Conv3d(
+            in_channels,
+            out_channels,
+            (kernel_size, kernel_size, 1),
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+        )
+        self.stride = stride if isinstance(stride, int) else stride[0]
+        self.padding = padding if isinstance(padding, int) else padding[0]
+        self.dilation = dilation if isinstance(dilation, int) else dilation[0]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _conv3d_asym_mod.conv3d_asym_cuda(
+            x,
+            self.conv3d.weight,
+            self.stride,
+            self.padding,
+            self.dilation,
+        )

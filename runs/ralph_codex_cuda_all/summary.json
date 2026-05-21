@@ -1,0 +1,14 @@
+{
+  "accuracy_all": 0.5333333333333333,
+  "accuracy_evaluated": 0.5333333333333333,
+  "compile_rate_all": 0.9925925925925926,
+  "compiled": 268,
+  "completed": 270,
+  "correct": 144,
+  "evaluated": 270,
+  "expected_total": 270,
+  "is_complete": true,
+  "status_counts": {
+    "evaluated": 270
+  }
+}

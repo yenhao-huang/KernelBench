@@ -1,0 +1,79 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+gelu_cpp_source = """
+torch::Tensor gelu_cuda(torch::Tensor x);
+"""
+
+gelu_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdint.h>
+
+static __device__ __forceinline__ float gelu_exact(float x) {
+    return 0.5f * x * (1.0f + erff(x * 0.70710678118654752440f));
+}
+
+__global__ void gelu_scalar_kernel(const float* __restrict__ x, float* __restrict__ out, int64_t n) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        out[idx] = gelu_exact(x[idx]);
+    }
+}
+
+__global__ void gelu_vec4_kernel(const float4* __restrict__ x, float4* __restrict__ out, int64_t n4) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n4) {
+        float4 v = x[idx];
+        v.x = gelu_exact(v.x);
+        v.y = gelu_exact(v.y);
+        v.z = gelu_exact(v.z);
+        v.w = gelu_exact(v.w);
+        out[idx] = v;
+    }
+}
+
+torch::Tensor gelu_cuda(torch::Tensor x) {
+    auto out = torch::empty_like(x);
+    int64_t n = x.numel();
+
+    const int threads = 256;
+    uintptr_t xp = reinterpret_cast<uintptr_t>(x.data_ptr<float>());
+    uintptr_t op = reinterpret_cast<uintptr_t>(out.data_ptr<float>());
+
+    if ((n % 4 == 0) && ((xp & 15) == 0) && ((op & 15) == 0)) {
+        int64_t n4 = n / 4;
+        int blocks = (int)((n4 + threads - 1) / threads);
+        gelu_vec4_kernel<<<blocks, threads>>>(
+            reinterpret_cast<const float4*>(x.data_ptr<float>()),
+            reinterpret_cast<float4*>(out.data_ptr<float>()),
+            n4
+        );
+    } else {
+        int blocks = (int)((n + threads - 1) / threads);
+        gelu_scalar_kernel<<<blocks, threads>>>(x.data_ptr<float>(), out.data_ptr<float>(), n);
+    }
+
+    return out;
+}
+"""
+
+gelu_ext = load_inline(
+    name="custom_gelu_exact_ext",
+    cpp_sources=gelu_cpp_source,
+    cuda_sources=gelu_cuda_source,
+    functions=["gelu_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gelu_ext = gelu_ext
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.gelu_ext.gelu_cuda(x)

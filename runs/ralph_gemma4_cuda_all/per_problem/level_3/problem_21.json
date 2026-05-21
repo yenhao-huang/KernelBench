@@ -1,0 +1,20 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 35.458,
+  "generated_kernel_path": "runs/ralph_gemma4_cuda_all/generated_kernels/level_3/problem_21.py",
+  "level": 3,
+  "model_name": "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
+  "precision": "fp32",
+  "problem_id": 21,
+  "problem_name": "21_EfficientNetMBConv.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_gemma4_cuda_all/raw_generation/level_3/problem_21.txt",
+  "static_errors": [
+    "Contains 'pass' statement (inheritance bypass)"
+  ],
+  "static_warnings": [
+    "Uses torch.nn compute layer (only containers, Parameter, init allowed)",
+    "Uses torch.nn.functional op: F.relu"
+  ],
+  "status": "static_failed"
+}

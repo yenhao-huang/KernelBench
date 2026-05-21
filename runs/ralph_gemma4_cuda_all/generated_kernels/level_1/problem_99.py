@@ -1,0 +1,106 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernel to compute Triplet Margin Loss in a single pass.
+# The standard TripletMarginLoss computes: max(0, d(a, p) - d(a, n) + margin)
+# where d(x, y) is the Euclidean distance ||x - y||_2.
+# We optimize this by computing the squared Euclidean distance directly in the kernel
+# to avoid multiple passes and intermediate large tensors.
+# Note: The standard PyTorch TripletMarginLoss uses Euclidean distance (L2 norm), 
+# not squared Euclidean distance. We follow the L2 norm definition.
+
+triplet_loss_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void triplet_margin_loss_kernel(
+    const float* __restrict__ anchor,
+    const float* __restrict__ positive,
+    const float* __restrict__ negative,
+    float margin,
+    float* __restrict__ output,
+    int batch_size,
+    int dim) {
+    
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b < batch_size) {
+        float dist_ap_sq = 0.0f;
+        float dist_an_sq = 0.0f;
+        
+        for (int d = 0; d < dim; ++d) {
+            int idx = b * dim + d;
+            float diff_p = anchor[idx] - positive[idx];
+            float diff_n = anchor[idx] - negative[idx];
+            dist_ap_sq += diff_p * diff_p;
+            dist_an_sq += diff_n * diff_n;
+        }
+        
+        float dist_ap = sqrtf(dist_ap_sq);
+        float dist_an = sqrtf(dist_an_sq);
+        
+        float loss = dist_ap - dist_an + margin;
+        output[b] = fmaxf(0.0f, loss);
+    }
+}
+
+torch::Tensor triplet_margin_loss_cuda(torch::Tensor anchor, torch::Tensor positive, torch::Tensor negative, float margin) {
+    auto batch_size = anchor.size(0);
+    auto dim = anchor.size(1);
+    auto output = torch::empty({batch_size}, anchor.options());
+
+    const int block_size = 256;
+    const int num_blocks = (batch_size + block_size - 1) / block_size;
+
+    triplet_margin_loss_kernel<<<num_blocks, block_size>>>(
+        anchor.data_ptr<float>(),
+        positive.data_ptr<float>(),
+        negative.data_ptr<float>(),
+        margin,
+        output.data_ptr<float>(),
+        batch_size,
+        dim
+    );
+
+    return output;
+}
+"""
+
+triplet_loss_cpp_source = """
+torch::Tensor triplet_margin_loss_cuda(torch::Tensor anchor, torch::Tensor positive, torch::Tensor negative, float margin);
+"""
+
+# Compile the inline CUDA code
+triplet_loss_lib = load_inline(
+    name="triplet_loss_lib",
+    cpp_sources=triplet_loss_cpp_source,
+    cuda_sources=triplet_loss_source,
+    functions=["triplet_margin_loss_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    """
+    An optimized version of Triplet Margin Loss using a custom CUDA kernel.
+    The kernel fuses the distance computation and the margin operation to reduce 
+    memory bandwidth usage and kernel launch overhead.
+    """
+    def __init__(self, margin=1.0):
+        super(ModelNew, self).__init__()
+        self.margin = margin
+        self.triplet_loss_lib = triplet_loss_lib
+
+    def forward(self, anchor, positive, negative):
+        # Ensure inputs are contiguous for the CUDA kernel
+        anchor = anchor.contiguous()
+        positive = positive.contiguous()
+        negative = negative.contiguous()
+        
+        # Compute the per-sample loss using the custom kernel
+        losses = self.triplet_loss_lib.triplet_margin_loss_cuda(
+            anchor, positive, negative, self.margin
+        )
+        
+        # Return the mean loss to match standard PyTorch behavior
+        return losses.mean()

@@ -1,0 +1,131 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+matmul_cpp_source = """
+torch::Tensor matmul_cuda(torch::Tensor A, torch::Tensor B);
+"""
+
+matmul_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+#define TILE 32
+#define THREAD_TILE 2
+
+__global__ void matmul_tiled_kernel(const float* __restrict__ A,
+                                    const float* __restrict__ B,
+                                    float* __restrict__ C,
+                                    int N) {
+    __shared__ float As[TILE][TILE + 1];
+    __shared__ float Bs[TILE][TILE + 1];
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int row_base = blockIdx.y * TILE + ty * THREAD_TILE;
+    int col_base = blockIdx.x * TILE + tx * THREAD_TILE;
+
+    float c00 = 0.0f;
+    float c01 = 0.0f;
+    float c10 = 0.0f;
+    float c11 = 0.0f;
+
+    for (int k_base = 0; k_base < N; k_base += TILE) {
+        int a_row0 = row_base;
+        int a_row1 = row_base + 1;
+        int a_col0 = k_base + tx * THREAD_TILE;
+        int a_col1 = a_col0 + 1;
+
+        int b_row0 = k_base + ty * THREAD_TILE;
+        int b_row1 = b_row0 + 1;
+        int b_col0 = col_base;
+        int b_col1 = col_base + 1;
+
+        As[ty * THREAD_TILE][tx * THREAD_TILE] =
+            (a_row0 < N && a_col0 < N) ? A[a_row0 * N + a_col0] : 0.0f;
+        As[ty * THREAD_TILE][tx * THREAD_TILE + 1] =
+            (a_row0 < N && a_col1 < N) ? A[a_row0 * N + a_col1] : 0.0f;
+        As[ty * THREAD_TILE + 1][tx * THREAD_TILE] =
+            (a_row1 < N && a_col0 < N) ? A[a_row1 * N + a_col0] : 0.0f;
+        As[ty * THREAD_TILE + 1][tx * THREAD_TILE + 1] =
+            (a_row1 < N && a_col1 < N) ? A[a_row1 * N + a_col1] : 0.0f;
+
+        Bs[ty * THREAD_TILE][tx * THREAD_TILE] =
+            (b_row0 < N && b_col0 < N) ? B[b_row0 * N + b_col0] : 0.0f;
+        Bs[ty * THREAD_TILE][tx * THREAD_TILE + 1] =
+            (b_row0 < N && b_col1 < N) ? B[b_row0 * N + b_col1] : 0.0f;
+        Bs[ty * THREAD_TILE + 1][tx * THREAD_TILE] =
+            (b_row1 < N && b_col0 < N) ? B[b_row1 * N + b_col0] : 0.0f;
+        Bs[ty * THREAD_TILE + 1][tx * THREAD_TILE + 1] =
+            (b_row1 < N && b_col1 < N) ? B[b_row1 * N + b_col1] : 0.0f;
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int k = 0; k < TILE; ++k) {
+            float a0 = As[ty * THREAD_TILE][k];
+            float a1 = As[ty * THREAD_TILE + 1][k];
+            float b0 = Bs[k][tx * THREAD_TILE];
+            float b1 = Bs[k][tx * THREAD_TILE + 1];
+
+            c00 += a0 * b0;
+            c01 += a0 * b1;
+            c10 += a1 * b0;
+            c11 += a1 * b1;
+        }
+
+        __syncthreads();
+    }
+
+    if (row_base < N && col_base < N) {
+        C[row_base * N + col_base] = c00;
+    }
+    if (row_base < N && col_base + 1 < N) {
+        C[row_base * N + col_base + 1] = c01;
+    }
+    if (row_base + 1 < N && col_base < N) {
+        C[(row_base + 1) * N + col_base] = c10;
+    }
+    if (row_base + 1 < N && col_base + 1 < N) {
+        C[(row_base + 1) * N + col_base + 1] = c11;
+    }
+}
+
+torch::Tensor matmul_cuda(torch::Tensor A, torch::Tensor B) {
+    int N = A.size(0);
+    auto C = torch::empty({N, N}, A.options());
+
+    dim3 block(16, 16);
+    dim3 grid((N + TILE - 1) / TILE, (N + TILE - 1) / TILE);
+
+    matmul_tiled_kernel<<<grid, block>>>(
+        A.data_ptr<float>(),
+        B.data_ptr<float>(),
+        C.data_ptr<float>(),
+        N
+    );
+
+    return C;
+}
+"""
+
+matmul_ext = load_inline(
+    name="custom_square_matmul_fp32",
+    cpp_sources=matmul_cpp_source,
+    cuda_sources=matmul_cuda_source,
+    functions=["matmul_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.matmul_ext = matmul_ext
+
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        return self.matmul_ext.matmul_cuda(A, B)
+```

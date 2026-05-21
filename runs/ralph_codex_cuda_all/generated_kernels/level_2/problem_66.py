@@ -1,0 +1,213 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+#include <stdint.h>
+
+#define BM 8
+#define BN 16
+#define BK 32
+
+__global__ void linear_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ y,
+    int M, int K, int N
+) {
+    __shared__ float sx[BM][BK];
+    __shared__ float sw[BN][BK];
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int row = blockIdx.y * BM + ty;
+    int col = blockIdx.x * BN + tx;
+
+    float acc = 0.0f;
+
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        int kx = k0 + tx;
+        int ky = k0 + ty;
+
+        if (row < M && kx < K) {
+            sx[ty][tx] = x[row * K + kx];
+        } else {
+            sx[ty][tx] = 0.0f;
+        }
+
+        if (ty < 2) {
+            int wk = k0 + ty * BN + tx;
+            if (col < N && wk < K) {
+                sw[tx][ty * BN + tx] = w[col * K + wk];
+            } else {
+                sw[tx][ty * BN + tx] = 0.0f;
+            }
+        }
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int kk = 0; kk < BK; ++kk) {
+            acc += sx[ty][kk] * sw[tx][kk];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        y[row * N + col] = acc + b[col];
+    }
+}
+
+__device__ __forceinline__ uint32_t hash_u32(uint32_t x) {
+    x ^= x >> 16;
+    x *= 0x7feb352dU;
+    x ^= x >> 15;
+    x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return x;
+}
+
+__global__ void dropout_softmax_kernel(
+    const float* __restrict__ inp,
+    float* __restrict__ out,
+    int M, int N,
+    float dropout_p,
+    int training
+) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    __shared__ float smem[256];
+
+    float keep = 1.0f - dropout_p;
+    float scale = keep > 0.0f ? 1.0f / keep : 0.0f;
+
+    float local_max = -INFINITY;
+    for (int col = tid; col < N; col += blockDim.x) {
+        float v = inp[row * N + col];
+        if (training && dropout_p > 0.0f) {
+            uint32_t h = hash_u32((uint32_t)(row * 16777619u + col * 2166136261u));
+            float r = (float)(h & 0x00ffffffU) * (1.0f / 16777216.0f);
+            v = (r < keep) ? v * scale : 0.0f;
+        }
+        local_max = fmaxf(local_max, v);
+    }
+
+    smem[tid] = local_max;
+    __syncthreads();
+
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] = fmaxf(smem[tid], smem[tid + s]);
+        __syncthreads();
+    }
+
+    float m = smem[0];
+    float local_sum = 0.0f;
+
+    for (int col = tid; col < N; col += blockDim.x) {
+        float v = inp[row * N + col];
+        if (training && dropout_p > 0.0f) {
+            uint32_t h = hash_u32((uint32_t)(row * 16777619u + col * 2166136261u));
+            float r = (float)(h & 0x00ffffffU) * (1.0f / 16777216.0f);
+            v = (r < keep) ? v * scale : 0.0f;
+        }
+        local_sum += expf(v - m);
+    }
+
+    smem[tid] = local_sum;
+    __syncthreads();
+
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] += smem[tid + s];
+        __syncthreads();
+    }
+
+    float inv_sum = 1.0f / smem[0];
+
+    for (int col = tid; col < N; col += blockDim.x) {
+        float v = inp[row * N + col];
+        if (training && dropout_p > 0.0f) {
+            uint32_t h = hash_u32((uint32_t)(row * 16777619u + col * 2166136261u));
+            float r = (float)(h & 0x00ffffffU) * (1.0f / 16777216.0f);
+            v = (r < keep) ? v * scale : 0.0f;
+        }
+        out[row * N + col] = expf(v - m) * inv_sum;
+    }
+}
+
+torch::Tensor linear_dropout_softmax_cuda(
+    torch::Tensor x,
+    torch::Tensor w,
+    torch::Tensor b,
+    double dropout_p,
+    bool training
+) {
+    int M = (int)x.size(0);
+    int K = (int)x.size(1);
+    int N = (int)w.size(0);
+
+    auto tmp = torch::empty({M, N}, x.options());
+    auto out = torch::empty({M, N}, x.options());
+
+    dim3 block(BN, BM);
+    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+    linear_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        w.data_ptr<float>(),
+        b.data_ptr<float>(),
+        tmp.data_ptr<float>(),
+        M, K, N
+    );
+
+    dropout_softmax_kernel<<<M, 256>>>(
+        tmp.data_ptr<float>(),
+        out.data_ptr<float>(),
+        M, N,
+        (float)dropout_p,
+        training ? 1 : 0
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = """
+torch::Tensor linear_dropout_softmax_cuda(
+    torch::Tensor x,
+    torch::Tensor w,
+    torch::Tensor b,
+    double dropout_p,
+    bool training
+);
+"""
+
+linear_dropout_softmax = load_inline(
+    name="linear_dropout_softmax_kernelbench",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["linear_dropout_softmax_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, dropout_p):
+        super().__init__()
+        self.matmul = nn.Linear(in_features, out_features)
+        self.dropout_p = dropout_p
+        self.op = linear_dropout_softmax
+
+    def forward(self, x):
+        return self.op.linear_dropout_softmax_cuda(
+            x.contiguous(),
+            self.matmul.weight.contiguous(),
+            self.matmul.bias.contiguous(),
+            float(self.dropout_p),
+            bool(self.training),
+        )

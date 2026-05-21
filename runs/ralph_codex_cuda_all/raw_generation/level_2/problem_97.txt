@@ -1,0 +1,252 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+#define TILE 16
+
+__global__ void linear_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ y,
+    int N, int K, int M
+) {
+    __shared__ float xs[TILE][TILE + 1];
+    __shared__ float ws[TILE][TILE + 1];
+
+    int row = blockIdx.y * TILE + threadIdx.y;
+    int col = blockIdx.x * TILE + threadIdx.x;
+
+    float acc = 0.0f;
+
+    for (int t = 0; t < K; t += TILE) {
+        int x_col = t + threadIdx.x;
+        int w_col = t + threadIdx.y;
+
+        xs[threadIdx.y][threadIdx.x] = (row < N && x_col < K) ? x[row * K + x_col] : 0.0f;
+        ws[threadIdx.y][threadIdx.x] = (col < M && w_col < K) ? w[col * K + w_col] : 0.0f;
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE; ++i) {
+            acc += xs[threadIdx.y][i] * ws[i][threadIdx.x];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < N && col < M) {
+        y[row * M + col] = acc + b[col];
+    }
+}
+
+__global__ void bn_swish_train_kernel(
+    const float* __restrict__ inp,
+    float* __restrict__ out,
+    float* __restrict__ running_mean,
+    float* __restrict__ running_var,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    const float* __restrict__ extra_bias,
+    int N, int M, int bias_numel,
+    float eps, float momentum, float divide_value
+) {
+    int col = blockIdx.x;
+    int tid = threadIdx.x;
+
+    __shared__ float s_sum[256];
+    __shared__ float s_sq[256];
+
+    float sum = 0.0f;
+    float sq = 0.0f;
+
+    for (int row = tid; row < N; row += blockDim.x) {
+        float v = inp[row * M + col];
+        sum += v;
+        sq += v * v;
+    }
+
+    s_sum[tid] = sum;
+    s_sq[tid] = sq;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_sum[tid] += s_sum[tid + stride];
+            s_sq[tid] += s_sq[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    float mean = s_sum[0] / (float)N;
+    float var = fmaxf(s_sq[0] / (float)N - mean * mean, 0.0f);
+    float inv_std = rsqrtf(var + eps);
+
+    if (tid == 0) {
+        float unbiased = var * ((float)N / (float)(N - 1));
+        running_mean[col] = running_mean[col] * (1.0f - momentum) + mean * momentum;
+        running_var[col] = running_var[col] * (1.0f - momentum) + unbiased * momentum;
+    }
+
+    float g = gamma[col];
+    float be = beta[col];
+    float add = extra_bias[(bias_numel == 1) ? 0 : col];
+
+    for (int row = tid; row < N; row += blockDim.x) {
+        float z = (inp[row * M + col] - mean) * inv_std;
+        z = z * g + be;
+        z = (z + add) / divide_value;
+        float sig = 1.0f / (1.0f + expf(-z));
+        out[row * M + col] = z * sig;
+    }
+}
+
+__global__ void bn_swish_eval_kernel(
+    const float* __restrict__ inp,
+    float* __restrict__ out,
+    const float* __restrict__ running_mean,
+    const float* __restrict__ running_var,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    const float* __restrict__ extra_bias,
+    int total, int M, int bias_numel,
+    float eps, float divide_value
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int col = idx % M;
+    float z = (inp[idx] - running_mean[col]) * rsqrtf(running_var[col] + eps);
+    z = z * gamma[col] + beta[col];
+    z = (z + extra_bias[(bias_numel == 1) ? 0 : col]) / divide_value;
+    float sig = 1.0f / (1.0f + expf(-z));
+    out[idx] = z * sig;
+}
+
+torch::Tensor linear_bn_swish_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor linear_bias,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    torch::Tensor extra_bias,
+    bool training,
+    double momentum,
+    double eps,
+    double divide_value
+) {
+    int N = (int)x.size(0);
+    int K = (int)x.size(1);
+    int M = (int)weight.size(0);
+
+    auto tmp = torch::empty({N, M}, x.options());
+    auto out = torch::empty({N, M}, x.options());
+
+    dim3 block(TILE, TILE);
+    dim3 grid((M + TILE - 1) / TILE, (N + TILE - 1) / TILE);
+
+    linear_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        linear_bias.data_ptr<float>(),
+        tmp.data_ptr<float>(),
+        N, K, M
+    );
+
+    int bias_numel = (int)extra_bias.numel();
+
+    if (training) {
+        bn_swish_train_kernel<<<M, 256>>>(
+            tmp.data_ptr<float>(),
+            out.data_ptr<float>(),
+            running_mean.data_ptr<float>(),
+            running_var.data_ptr<float>(),
+            gamma.data_ptr<float>(),
+            beta.data_ptr<float>(),
+            extra_bias.data_ptr<float>(),
+            N, M, bias_numel,
+            (float)eps, (float)momentum, (float)divide_value
+        );
+    } else {
+        int total = N * M;
+        int threads = 256;
+        int blocks = (total + threads - 1) / threads;
+        bn_swish_eval_kernel<<<blocks, threads>>>(
+            tmp.data_ptr<float>(),
+            out.data_ptr<float>(),
+            running_mean.data_ptr<float>(),
+            running_var.data_ptr<float>(),
+            gamma.data_ptr<float>(),
+            beta.data_ptr<float>(),
+            extra_bias.data_ptr<float>(),
+            total, M, bias_numel,
+            (float)eps, (float)divide_value
+        );
+    }
+
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor linear_bn_swish_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor linear_bias,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    torch::Tensor extra_bias,
+    bool training,
+    double momentum,
+    double eps,
+    double divide_value
+);
+"""
+
+linear_bn_swish_ext = load_inline(
+    name="linear_bn_swish_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["linear_bn_swish_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+    extra_cflags=["-O3"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, bn_eps=1e-5, bn_momentum=0.1, bias_shape=(1,), divide_value=1.0):
+        super(ModelNew, self).__init__()
+        self.matmul = nn.Linear(in_features, out_features)
+        self.bn = nn.BatchNorm1d(out_features, eps=bn_eps, momentum=bn_momentum)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.divide_value = divide_value
+        self.ext = linear_bn_swish_ext
+
+    def forward(self, x):
+        return self.ext.linear_bn_swish_cuda(
+            x.contiguous(),
+            self.matmul.weight.contiguous(),
+            self.matmul.bias.contiguous(),
+            self.bn.running_mean,
+            self.bn.running_var,
+            self.bn.weight.contiguous(),
+            self.bn.bias.contiguous(),
+            self.bias.contiguous(),
+            self.training,
+            float(self.bn.momentum),
+            float(self.bn.eps),
+            float(self.divide_value),
+        )
+```

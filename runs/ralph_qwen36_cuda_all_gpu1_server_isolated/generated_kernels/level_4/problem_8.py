@@ -1,0 +1,486 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+from transformers import AutoModelForCausalLM, AutoConfig
+
+# Define custom CUDA kernels for optimized operations
+# We will replace the standard Linear (Matmul) and LayerNorm with fused/custom implementations
+# to demonstrate significant optimization potential.
+
+custom_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper macro for CUDA error checking
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA error in %s at line %d: %s\\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while (0)
+
+// 1. Optimized LayerNorm Kernel
+// Combines mean/variance calculation, normalization, and affine transformation into one kernel.
+__global__ void layer_norm_kernel(
+    const float* __restrict__ input, 
+    const float* __restrict__ weight, 
+    const float* __restrict__ bias, 
+    float* __restrict__ output, 
+    int hidden_size, 
+    int batch_size) 
+{
+    // Each block handles one sample in the batch
+    int idx = blockIdx.x;
+    if (idx >= batch_size) return;
+
+    const float* x = input + idx * hidden_size;
+    float* out = output + idx * hidden_size;
+    
+    // Shared memory for mean and variance calculation if needed, 
+    // but for simplicity and correctness in this inline example, we use registers/local vars.
+    // Note: For very large hidden sizes, shared memory is better, but here we assume standard sizes.
+    
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    
+    // Calculate mean and variance
+    for (int i = 0; i < hidden_size; ++i) {
+        float val = x[i];
+        sum += val;
+        sum_sq += val * val;
+    }
+    
+    float mean = sum / hidden_size;
+    float var = (sum_sq / hidden_size) - (mean * mean);
+    // Add epsilon for numerical stability
+    var += 1e-5f;
+    float inv_std = rsqrtf(var);
+
+    // Apply normalization and affine transform
+    for (int i = 0; i < hidden_size; ++i) {
+        float val = x[i];
+        float normalized = (val - mean) * inv_std;
+        out[i] = weight[i] * normalized + bias[i];
+    }
+}
+
+// 2. Optimized Matmul Kernel (GEMM)
+// Uses a simple tiled approach or direct mapping for demonstration. 
+// For production, cuBLAS is preferred, but here we write a custom kernel to replace the operator.
+// We assume A is [batch, seq_len, in_features] and B is [in_features, out_features].
+// Output is [batch, seq_len, out_features].
+
+__global__ void matmul_kernel(
+    const float* __restrict__ A, 
+    const float* __restrict__ B, 
+    float* __restrict__ C, 
+    int M, // Batch * SeqLen
+    int N, // Out Features
+    int K) // In Features
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < M && col < N) {
+        float sum = 0.0f;
+        const float* A_row = A + row * K;
+        const float* B_col = B + col * K; // Note: B is stored in standard layout, so we iterate K
+        
+        // Simple unrolled loop for small K or general case
+        for (int i = 0; i < K; ++i) {
+            sum += A_row[i] * B_col[i];
+        }
+        C[row * N + col] = sum;
+    }
+}
+
+// Python bindings
+torch::Tensor layer_norm_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias) {
+    auto batch_size = input.size(0);
+    auto hidden_size = input.size(1);
+    
+    auto output = torch::empty_like(input);
+    
+    const int block_size = 256; // Threads per block (not used directly in this grid config but good practice)
+    dim3 grid(batch_size);
+    dim3 block(hidden_size > 1024 ? 1024 : hidden_size); 
+    
+    // If hidden size is very large, we might need to split blocks, but for OPT-1.3B (2048), 1024 threads per block is fine if we adjust grid.
+    // Actually, the kernel above assumes one thread block per sample? No, it uses blockIdx.x for batch.
+    // Let's fix the kernel launch configuration.
+    
+    // Re-defining kernel launch to be safe:
+    // We will use 1 thread per element in the hidden dimension for simplicity in this specific inline example 
+    // OR use a 2D grid where x is batch and y is something else? 
+    // The kernel above uses blockIdx.x for batch. So we need grid size = batch_size.
+    // But if batch_size is large, we might exceed max grid dim. OPT-1.3B usually has small batch in inference or moderate in training.
+    // Let's assume batch_size fits in 1D grid.
+    
+    layer_norm_kernel<<<batch_size, hidden_size>>>(input.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(), output.data_ptr<float>(), hidden_size, batch_size);
+    
+    CUDA_CHECK(cudaGetLastError());
+    return output;
+}
+
+torch::Tensor matmul_cuda(torch::Tensor A, torch::Tensor B) {
+    // A: [M, K], B: [K, N] -> C: [M, N]
+    int M = A.size(0);
+    int K = A.size(1);
+    int N = B.size(1);
+    
+    auto C = torch::empty({M, N}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    
+    dim3 threadsPerBlock(16, 16); // 256 threads per block
+    dim3 numBlocks((N + threadsPerBlock.x - 1) / threadsPerBlock.x, (M + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    
+    matmul_kernel<<<numBlocks, threadsPerBlock>>>(A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), M, N, K);
+    
+    CUDA_CHECK(cudaGetLastError());
+    return C;
+}
+
+"""
+
+custom_cpp_source = """
+torch::Tensor layer_norm_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias);
+torch::Tensor matmul_cuda(torch::Tensor A, torch::Tensor B);
+"""
+
+# Load the custom extensions
+opt_ops = load_inline(
+    name="opt_custom_ops",
+    cpp_sources=custom_cpp_source,
+    cuda_sources=custom_cuda_source,
+    functions=["layer_norm_cuda", "matmul_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"]
+)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, model_name, config):
+        super().__init__()
+        self.model_name = model_name
+        self.config = config
+        
+        # Load the original model to get weights and structure
+        self.original_model = AutoModelForCausalLM.from_pretrained(model_name, config=config)
+        
+        # We will replace specific layers with our custom CUDA implementations.
+        # In OPT models, the main heavy operations are:
+        # 1. Embedding (kept as is, usually fast enough or handled by embedding lookup)
+        # 2. LayerNorm (before attention and after FFN)
+        # 3. Linear layers (Attention QKV projection, Attention Output, FFN W1/W2)
+        
+        # To make this work seamlessly, we need to intercept the forward pass of the transformer blocks.
+        # However, since we are replacing the entire model class with ModelNew, 
+        # we can manually reconstruct the forward pass or monkey-patch.
+        # A cleaner way for "ModelNew" is to wrap the original model's layers and replace their forward methods.
+        
+        self.model = self.original_model
+        
+        # Replace all Linear layers with a wrapper that uses our custom matmul if desired, 
+        # but standard cuBLAS is often faster than naive CUDA kernels. 
+        # However, the prompt asks to REPLACE operators with CUSTOM CUDA operators.
+        # We will replace the LayerNorm and Linear operations inside the transformer blocks.
+        
+        # Note: Replacing every single linear layer in OPT-1.3B with a custom kernel might be slower due to launch overhead 
+        # compared to highly optimized cuBLAS. But for the sake of the exercise, we demonstrate the replacement.
+        # We will specifically target the LayerNorm and the final Linear projection to show the pattern.
+        
+        # Actually, to ensure it works and provides a "speedup" in the context of the question (which implies custom ops are faster),
+        # we assume our fused/custom ops are competitive or faster for these specific shapes.
+        
+        # We will replace the `forward` method of the model to use our custom ops for key components.
+        # Since OPTModel is complex, we will override the forward pass of ModelNew to manually execute the logic using our ops.
+        
+        # Extract parameters from original model to initialize our custom layers' weights/biases
+        self.register_buffer('embed_tokens_weight', self.model.model.embed_tokens.weight)
+        
+        # We need to access the decoder layers. 
+        # OPTForCausalLM -> model -> decoder -> layers
+        
+        # Let's create a list of custom linear and norm modules that hold the parameters
+        self.custom_layernorms = nn.ModuleList()
+        self.custom_linears = nn.ModuleList()
+        
+        # We will rebuild the forward pass logic. 
+        # This is complex because we need to replicate the exact architecture of OPT-1.3B.
+        # A simpler approach for this specific prompt format:
+        # 1. Keep the original model structure.
+        # 2. Replace the `forward` method of ModelNew to call the original model's forward, 
+        #    but intercept and replace specific tensor operations? No, that's hard with PyTorch tracing.
+        
+        # Better Approach:
+        # Create a new Module that mimics OPT-1.3B but uses our custom CUDA ops for Linear and LayerNorm.
+        
+        self.decoder_layers = nn.ModuleList()
+        
+        # We need to copy the weights from the original model into our new structure.
+        # This is tedious to do manually for 24 layers. 
+        # Instead, we will use a trick: Replace the forward method of the internal modules.
+        
+        # Let's replace the LayerNorm and Linear classes in the loaded model with custom ones that call our CUDA ops.
+        
+        class CustomLayerNorm(nn.Module):
+            def __init__(self, normalized_shape, eps=1e-5, elementwise_affine=True):
+                super().__init__()
+                if isinstance(normalized_shape, int):
+                    self.normalized_shape = (normalized_shape,)
+                else:
+                    self.normalized_shape = normalized_shape
+                
+                self.eps = eps
+                self.elementwise_affine = elementwise_affine
+                if self.elementwise_affine:
+                    self.weight = nn.Parameter(torch.ones(self.normalized_shape))
+                    self.bias = nn.Parameter(torch.zeros(self.normalized_shape))
+                else:
+                    self.register_parameter('weight', None)
+                    self.register_parameter('bias', None)
+
+            def forward(self, x):
+                # x shape: (*, normalized_shape)
+                # We need to flatten the batch dimensions for our kernel which expects [Batch, Hidden]
+                # Our kernel assumes input is [Batch, Hidden]. 
+                # OPT LayerNorm is applied on the last dimension.
+                
+                original_shape = x.shape
+                hidden_size = self.normalized_shape[-1]
+                
+                # Flatten all but the last dimension
+                x_flat = x.view(-1, hidden_size)
+                
+                if self.weight is not None:
+                    w = self.weight
+                    b = self.bias
+                else:
+                    # If no affine transform, we still need to normalize. 
+                    # Our kernel applies affine. If no affine, weight=1, bias=0.
+                    w = torch.ones_like(x_flat[:, :hidden_size]) # This is tricky with broadcasting
+                    b = torch.zeros_like(x_flat[:, :hidden_size])
+                
+                # For simplicity in this custom op, we assume elementwise_affine=True for OPT layers
+                out = opt_ops.layer_norm_cuda(x_flat, w, b)
+                
+                return out.view(original_shape)
+
+        class CustomLinear(nn.Module):
+            def __init__(self, in_features, out_features, bias=True):
+                super().__init__()
+                self.in_features = in_features
+                self.out_features = out_features
+                self.weight = nn.Parameter(torch.empty(out_features, in_features)) # Note: OPT uses [out, in]
+                if bias:
+                    self.bias = nn.Parameter(torch.empty(out_features))
+                else:
+                    self.register_parameter('bias', None)
+
+            def forward(self, x):
+                # x shape: (*, in_features)
+                original_shape = x.shape
+                hidden_size = self.in_features
+                
+                # Flatten all but the last dimension
+                x_flat = x.view(-1, hidden_size)
+                
+                # Our matmul kernel expects A: [M, K], B: [K, N] -> C: [M, N]
+                # PyTorch Linear: out = x @ weight.T + bias
+                # weight is [out_features, in_features]. 
+                # So we want: x_flat (M, K) @ weight.T (K, N)? No.
+                # Standard Linear: y = x A^T + b. A is [out, in]. A^T is [in, out].
+                # Our kernel computes C[i,j] = sum_k A[i,k] * B[k,j].
+                # If we pass weight as B, then B is [K, N]? No, weight is [N, K].
+                # We need to transpose weight or adjust the kernel.
+                # Let's assume our matmul_kernel does C = A @ B^T? Or just standard GEMM.
+                # The kernel above: sum += A_row[i] * B_col[i]. 
+                # If B is stored as [N, K], then B_col[i] accesses the i-th element of the column? 
+                # No, in row-major, B[k*N + j] is element k,j.
+                # The kernel iterates k (0..K-1). A_row[k] * B_col[k].
+                # If B is [N, K], then for a fixed j (col), the elements are B[j*K + 0], B[j*K + 1]...
+                # So B_col should be the pointer to the start of column j? 
+                # In row-major, columns are not contiguous.
+                
+                # To make this work with standard PyTorch weight layout [out, in]:
+                # We want C = x @ W^T.
+                # Let A = x (M, K). Let B = W^T (K, N).
+                # Then C = A @ B is M, N.
+                # So we should pass W^T to the kernel? Or modify the kernel to handle transposed weights.
+                
+                # Let's modify the matmul call to transpose the weight if necessary.
+                # However, transposing on CPU/GPU has cost.
+                # Let's assume we store weights in [in, out] layout for our custom op? 
+                # No, we must use the pretrained weights.
+                
+                # So, we will transpose the weight inside the forward pass or adjust the kernel.
+                # Adjusting the kernel to do C = A @ B^T is easier if we just swap indices.
+                # But let's stick to the kernel defined: C[i,j] = sum_k A[i,k] * B[k,j].
+                # If we want x @ W^T, and W is [N, K], then W^T is [K, N].
+                # So we should pass W^T as B.
+                
+                weight_t = self.weight.t() # [in, out] -> [out, in]? No.
+                # Weight is [out, in]. Transpose is [in, out].
+                # We want to multiply x (M, in) by Weight^T (in, out).
+                # So B should be Weight^T.
+                
+                if self.bias is not None:
+                    out = opt_ops.matmul_cuda(x_flat, weight_t) + self.bias
+                else:
+                    out = opt_ops.matmul_cuda(x_flat, weight_t)
+                    
+                return out.view(original_shape)
+
+        # Now, we need to replace the layers in the original model with these custom ones.
+        # This is difficult because the original model's forward pass is hardcoded.
+        # Instead, we will create a new ModelNew that manually replicates the OPT-1.3B forward pass using our custom modules.
+        
+        # Since replicating 24 layers manually is error-prone and verbose, 
+        # and the prompt allows "complete freedom", we can replace the entire model's forward logic.
+        
+        # However, to ensure correctness with the pretrained weights, we must copy them.
+        
+        # Let's create a simplified wrapper that replaces the key components.
+        # We will store the original model's parameters and use our custom ops in a manual forward pass.
+        
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens.weight.data.copy_(self.original_model.model.embed_tokens.weight)
+        
+        self.layers = nn.ModuleList()
+        for i in range(config.num_hidden_layers):
+            # Create custom layer norm and linear modules
+            ln1 = CustomLayerNorm(config.hidden_size)
+            ln1.weight.data.copy_(self.original_model.model.decoder.layers[i].self_attn_layer_norm.weight)
+            ln1.bias.data.copy_(self.original_model.model.decoder.layers[i].self_attn_layer_norm.bias)
+            
+            # Attention QKV
+            q_proj = CustomLinear(config.hidden_size, config.hidden_size)
+            q_proj.weight.data.copy_(self.original_model.model.decoder.layers[i].self_attn.q_proj.weight)
+            if self.original_model.model.decoder.layers[i].self_attn.q_proj.bias is not None:
+                q_proj.bias.data.copy_(self.original_model.model.decoder.layers[i].self_attn.q_proj.bias)
+                
+            k_proj = CustomLinear(config.hidden_size, config.hidden_size)
+            k_proj.weight.data.copy_(self.original_model.model.decoder.layers[i].self_attn.k_proj.weight)
+            if self.original_model.model.decoder.layers[i].self_attn.k_proj.bias is not None:
+                k_proj.bias.data.copy_(self.original_model.model.decoder.layers[i].self_attn.k_proj.bias)
+                
+            v_proj = CustomLinear(config.hidden_size, config.hidden_size)
+            v_proj.weight.data.copy_(self.original_model.model.decoder.layers[i].self_attn.v_proj.weight)
+            if self.original_model.model.decoder.layers[i].self_attn.v_proj.bias is not None:
+                v_proj.bias.data.copy_(self.original_model.model.decoder.layers[i].self_attn.v_proj.bias)
+                
+            # Attention Output
+            out_proj = CustomLinear(config.hidden_size, config.hidden_size)
+            out_proj.weight.data.copy_(self.original_model.model.decoder.layers[i].self_attn.out_proj.weight)
+            if self.original_model.model.decoder.layers[i].self_attn.out_proj.bias is not None:
+                out_proj.bias.data.copy_(self.original_model.model.decoder.layers[i].self_attn.out_proj.bias)
+                
+            ln2 = CustomLayerNorm(config.hidden_size)
+            ln2.weight.data.copy_(self.original_model.model.decoder.layers[i].final_layer_norm.weight)
+            ln2.bias.data.copy_(self.original_model.model.decoder.layers[i].final_layer_norm.bias)
+            
+            # FFN
+            fc1 = CustomLinear(config.hidden_size, config.ffn_dim)
+            fc1.weight.data.copy_(self.original_model.model.decoder.layers[i].fc1.weight)
+            if self.original_model.model.decoder.layers[i].fc1.bias is not None:
+                fc1.bias.data.copy_(self.original_model.model.decoder.layers[i].fc1.bias)
+                
+            fc2 = CustomLinear(config.ffn_dim, config.hidden_size)
+            fc2.weight.data.copy_(self.original_model.model.decoder.layers[i].fc2.weight)
+            if self.original_model.model.decoder.layers[i].fc2.bias is not None:
+                fc2.bias.data.copy_(self.original_model.model.decoder.layers[i].fc2.bias)
+                
+            self.layers.append({
+                'ln1': ln1,
+                'q_proj': q_proj,
+                'k_proj': k_proj,
+                'v_proj': v_proj,
+                'out_proj': out_proj,
+                'ln2': ln2,
+                'fc1': fc1,
+                'fc2': fc2
+            })
+            
+        self.final_layer_norm = CustomLayerNorm(config.hidden_size)
+        self.final_layer_norm.weight.data.copy_(self.original_model.model.decoder.final_layer_norm.weight)
+        self.final_layer_norm.bias.data.copy_(self.original_model.model.decoder.final_layer_norm.bias)
+        
+        # The lm_head is a linear layer from hidden_size to vocab_size
+        self.lm_head = CustomLinear(config.hidden_size, config.vocab_size)
+        self.lm_head.weight.data.copy_(self.original_model.lm_head.weight)
+        if self.original_model.lm_head.bias is not None:
+            self.lm_head.bias.data.copy_(self.original_model.lm_head.bias)
+
+    def forward(self, x):
+        # x: [batch, seq_len]
+        
+        # Embedding
+        hidden_states = self.embed_tokens(x)
+        
+        for i in range(len(self.layers)):
+            layer = self.layers[i]
+            
+            # Self Attention
+            residual = hidden_states
+            
+            # LayerNorm 1
+            hidden_states = layer['ln1'](hidden_states)
+            
+            # Q, K, V projections
+            query = layer['q_proj'](hidden_states)
+            key = layer['k_proj'](hidden_states)
+            value = layer['v_proj'](hidden_states)
+            
+            # Reshape for attention: [batch*seq, head_dim] -> [batch, seq, heads, head_dim]
+            # OPT uses multi-head attention. 
+            # We need to implement the attention mechanism. 
+            # Since we are replacing operators, we can also replace the attention logic with a custom kernel if needed,
+            # but for simplicity and correctness, we will use PyTorch's efficient attention or standard ops for the complex parts,
+            # while relying on our custom Linear/LayerNorm for the heavy linear algebra.
+            
+            batch_size, seq_len, hidden_size = query.shape
+            num_heads = self.config.num_attention_heads
+            head_dim = hidden_size // num_heads
+            
+            query = query.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2) # [B, H, S, D]
+            key = key.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+            value = value.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+            
+            # Scaled Dot-Product Attention
+            scores = torch.matmul(query, key.transpose(-2, -1)) / (head_dim ** 0.5)
+            attn_weights = F.softmax(scores, dim=-1)
+            attn_output = torch.matmul(attn_weights, value)
+            
+            attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, hidden_size)
+            
+            # Output projection (Custom Linear)
+            attn_output = layer['out_proj'](attn_output)
+            
+            # Residual connection
+            hidden_states = residual + attn_output
+            
+            # FFN
+            residual = hidden_states
+            hidden_states = layer['ln2'](hidden_states)
+            hidden_states = layer['fc1'](hidden_states)
+            hidden_states = F.relu(hidden_states)
+            hidden_states = layer['fc2'](hidden_states)
+            hidden_states = residual + hidden_states
+            
+        # Final LayerNorm
+        hidden_states = self.final_layer_norm(hidden_states)
+        
+        # LM Head (Custom Linear)
+        logits = self.lm_head(hidden_states)
+        
+        return type(self.original_model).outputs_type(logits=logits)
+
+def get_inputs():
+    inputs = torch.randint(0, config.vocab_size, (batch_size, sequence_length))
+    return [inputs]
+
+def get_init_inputs():
+    return [model_name, config]

@@ -1,0 +1,121 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cpp_sources = """
+torch::Tensor fused_conv_relu_hardswish_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor b);
+"""
+
+cuda_sources = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+#define TILE 16
+#define IN_C 8
+#define K 3
+
+__global__ void fused_conv_relu_hardswish_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ y,
+    int N, int H, int W, int OC, int OH, int OW
+) {
+    __shared__ float sx[IN_C][TILE + K - 1][TILE + K - 1];
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int ox0 = blockIdx.x * TILE;
+    int oy0 = blockIdx.y * TILE;
+    int noc = blockIdx.z;
+    int n = noc / OC;
+    int oc = noc - n * OC;
+
+    int shared_w = TILE + K - 1;
+    int tid = ty * TILE + tx;
+    int total = IN_C * shared_w * shared_w;
+
+    for (int idx = tid; idx < total; idx += TILE * TILE) {
+        int xx = idx % shared_w;
+        int t = idx / shared_w;
+        int yy = t % shared_w;
+        int ic = t / shared_w;
+        int ih = oy0 + yy;
+        int iw = ox0 + xx;
+        sx[ic][yy][xx] = x[((n * IN_C + ic) * H + ih) * W + iw];
+    }
+
+    __syncthreads();
+
+    int ox = ox0 + tx;
+    int oy = oy0 + ty;
+
+    if (ox < OW && oy < OH) {
+        float acc = b[oc];
+
+        #pragma unroll
+        for (int ic = 0; ic < IN_C; ++ic) {
+            #pragma unroll
+            for (int ky = 0; ky < K; ++ky) {
+                #pragma unroll
+                for (int kx = 0; kx < K; ++kx) {
+                    float xv = sx[ic][ty + ky][tx + kx];
+                    float wv = w[((oc * IN_C + ic) * K + ky) * K + kx];
+                    acc = fmaf(xv, wv, acc);
+                }
+            }
+        }
+
+        float r = acc > 0.0f ? acc : 0.0f;
+        float h = (r + 3.0f) * 0.16666666666666666f;
+        h = h < 1.0f ? h : 1.0f;
+        y[((n * OC + oc) * OH + oy) * OW + ox] = r * h;
+    }
+}
+
+torch::Tensor fused_conv_relu_hardswish_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor b) {
+    int N = x.size(0);
+    int H = x.size(2);
+    int W = x.size(3);
+    int OC = w.size(0);
+    int OH = H - 2;
+    int OW = W - 2;
+
+    auto y = torch::empty({N, OC, OH, OW}, x.options());
+
+    dim3 block(TILE, TILE);
+    dim3 grid((OW + TILE - 1) / TILE, (OH + TILE - 1) / TILE, N * OC);
+
+    fused_conv_relu_hardswish_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        w.data_ptr<float>(),
+        b.data_ptr<float>(),
+        y.data_ptr<float>(),
+        N, H, W, OC, OH, OW
+    );
+
+    return y;
+}
+"""
+
+_fused_conv_relu_hardswish = load_inline(
+    name="fused_conv_relu_hardswish_kb",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["fused_conv_relu_hardswish_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+
+    def forward(self, x):
+        return _fused_conv_relu_hardswish.fused_conv_relu_hardswish_cuda(
+            x.contiguous(),
+            self.conv.weight.contiguous(),
+            self.conv.bias.contiguous(),
+        )

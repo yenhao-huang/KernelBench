@@ -1,0 +1,116 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for sum reduction along a specific dimension
+sum_reduction_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Kernel to perform sum reduction along dim 1 (the middle dimension)
+// Input shape: [batch_size, dim1, dim2]
+// Output shape: [batch_size, 1, dim2]
+__global__ void sum_reduction_kernel(const float* input, float* output, int batch_size, int dim1, int dim2) {
+    // Each thread block handles one element in the output tensor (one batch item, one position in dim2)
+    // We use grid-stride loop or simple mapping
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Total number of elements in the output tensor is batch_size * dim2
+    if (idx >= batch_size * dim2) {
+        return;
+    }
+    
+    int b = idx / dim2;
+    int d2 = idx % dim2;
+    
+    float sum = 0.0f;
+    // Sum over dim1
+    for (int i = 0; i < dim1; ++i) {
+        sum += input[b * dim1 * dim2 + i * dim2 + d2];
+    }
+    
+    output[idx] = sum;
+}
+
+torch::Tensor sum_reduction_cuda(torch::Tensor x, int dim) {
+    // We assume the model always reduces over dim 1 as per the specific architecture provided
+    // If dim is not 1, we might need a more general kernel, but for this specific task:
+    if (dim != 1) {
+        throw std::runtime_error("This optimized kernel only supports reduction over dimension 1");
+    }
+
+    auto batch_size = x.size(0);
+    auto dim1 = x.size(1);
+    auto dim2 = x.size(2);
+
+    // Output shape: [batch_size, 1, dim2]
+    auto output = torch::zeros({batch_size, 1, dim2}, torch::dtype(torch::kFloat32).device(x.device()));
+
+    const int block_size = 256;
+    const int total_output_elements = batch_size * dim2;
+    const int num_blocks = (total_output_elements + block_size - 1) / block_size;
+
+    sum_reduction_kernel<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        dim1,
+        dim2
+    );
+
+    // Check for kernel launch errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA error in sum_reduction: ") + cudaGetErrorString(err));
+    }
+
+    return output;
+}
+"""
+
+sum_reduction_cpp_source = (
+    "torch::Tensor sum_reduction_cuda(torch::Tensor x, int dim);"
+)
+
+# Compile the inline CUDA code for sum reduction
+sum_reduction = load_inline(
+    name="sum_reduction",
+    cpp_sources=sum_reduction_cpp_source,
+    cuda_sources=sum_reduction_source,
+    functions=["sum_reduction_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs sum reduction over dimension 1 using a custom CUDA operator.
+    """
+    def __init__(self, dim: int):
+        """
+        Initializes the model with the dimension to reduce over.
+
+        Args:
+            dim (int): Dimension to reduce over.
+        """
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.sum_reduction_op = sum_reduction
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies sum reduction over the specified dimension using custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (..., dim, ...).
+
+        Returns:
+            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).
+        """
+        return self.sum_reduction_op.sum_reduction_cuda(x, self.dim)
+```

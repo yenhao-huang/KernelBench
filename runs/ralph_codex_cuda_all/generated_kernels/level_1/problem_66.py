@@ -1,0 +1,194 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+conv3d_cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void conv3d_forward_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ y,
+    int total,
+    int N, int C, int D, int H, int W,
+    int OC, int KD, int KH, int KW,
+    int OD, int OH, int OW,
+    int sd, int sh, int sw,
+    int pd, int ph, int pw,
+    int dd, int dh, int dw,
+    int groups,
+    bool has_bias
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int ow = idx % OW;
+    int t = idx / OW;
+    int oh = t % OH;
+    t /= OH;
+    int od = t % OD;
+    t /= OD;
+    int oc = t % OC;
+    int n = t / OC;
+
+    int cpg = C / groups;
+    int ocpg = OC / groups;
+    int g = oc / ocpg;
+    int c_start = g * cpg;
+
+    float acc = has_bias ? b[oc] : 0.0f;
+
+    int in_d0 = od * sd - pd;
+    int in_h0 = oh * sh - ph;
+    int in_w0 = ow * sw - pw;
+
+    for (int icg = 0; icg < cpg; ++icg) {
+        int ic = c_start + icg;
+        for (int kd = 0; kd < KD; ++kd) {
+            int id = in_d0 + kd * dd;
+            if ((unsigned)id >= (unsigned)D) continue;
+            for (int kh = 0; kh < KH; ++kh) {
+                int ih = in_h0 + kh * dh;
+                if ((unsigned)ih >= (unsigned)H) continue;
+
+                const float* x_row = x + (((n * C + ic) * D + id) * H + ih) * W;
+                const float* w_row = w + ((((oc * cpg + icg) * KD + kd) * KH + kh) * KW);
+
+                #pragma unroll
+                for (int kw = 0; kw < KW; ++kw) {
+                    int iw = in_w0 + kw * dw;
+                    if ((unsigned)iw < (unsigned)W) {
+                        acc += x_row[iw] * w_row[kw];
+                    }
+                }
+            }
+        }
+    }
+
+    y[idx] = acc;
+}
+
+torch::Tensor conv3d_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int sd, int sh, int sw,
+    int pd, int ph, int pw,
+    int dd, int dh, int dw,
+    int groups,
+    bool has_bias
+) {
+    int N = (int)x.size(0);
+    int C = (int)x.size(1);
+    int D = (int)x.size(2);
+    int H = (int)x.size(3);
+    int W = (int)x.size(4);
+
+    int OC = (int)weight.size(0);
+    int KD = (int)weight.size(2);
+    int KH = (int)weight.size(3);
+    int KW = (int)weight.size(4);
+
+    int OD = (D + 2 * pd - dd * (KD - 1) - 1) / sd + 1;
+    int OH = (H + 2 * ph - dh * (KH - 1) - 1) / sh + 1;
+    int OW = (W + 2 * pw - dw * (KW - 1) - 1) / sw + 1;
+
+    auto y = torch::empty({N, OC, OD, OH, OW}, x.options());
+    int total = N * OC * OD * OH * OW;
+
+    const int block = 256;
+    const int grid = (total + block - 1) / block;
+
+    conv3d_forward_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        has_bias ? bias.data_ptr<float>() : nullptr,
+        y.data_ptr<float>(),
+        total,
+        N, C, D, H, W,
+        OC, KD, KH, KW,
+        OD, OH, OW,
+        sd, sh, sw,
+        pd, ph, pw,
+        dd, dh, dw,
+        groups,
+        has_bias
+    );
+
+    return y;
+}
+"""
+
+conv3d_cpp_sources = r"""
+torch::Tensor conv3d_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int sd, int sh, int sw,
+    int pd, int ph, int pw,
+    int dd, int dh, int dw,
+    int groups,
+    bool has_bias
+);
+"""
+
+conv3d_ext = load_inline(
+    name="kb_asym_conv3d_direct_fp32",
+    cpp_sources=conv3d_cpp_sources,
+    cuda_sources=conv3d_cuda_sources,
+    functions=["conv3d_forward_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: tuple,
+        stride: tuple = (1, 1, 1),
+        padding: tuple = (0, 0, 0),
+        dilation: tuple = (1, 1, 1),
+        groups: int = 1,
+        bias: bool = False,
+    ):
+        super(ModelNew, self).__init__()
+        self.conv3d = nn.Conv3d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+        )
+        self.register_buffer("_empty_bias", torch.empty(0))
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+        self.has_bias = bias
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bias = self.conv3d.bias if self.conv3d.bias is not None else self._empty_bias
+        return conv3d_ext.conv3d_forward_cuda(
+            x,
+            self.conv3d.weight,
+            bias,
+            self.stride[0],
+            self.stride[1],
+            self.stride[2],
+            self.padding[0],
+            self.padding[1],
+            self.padding[2],
+            self.dilation[0],
+            self.dilation[1],
+            self.dilation[2],
+            self.groups,
+            self.has_bias,
+        )

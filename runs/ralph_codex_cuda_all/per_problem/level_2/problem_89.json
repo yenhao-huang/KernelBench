@@ -1,0 +1,27 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 140.427,
+  "eval_result": {
+    "compiled": true,
+    "correctness": true,
+    "metadata": {
+      "correctness_trials": "(5 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090"
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_codex_cuda_all/generated_kernels/level_2/problem_89.py",
+  "level": 2,
+  "model_name": "codex-gpt-5.5",
+  "precision": "fp32",
+  "problem_id": 89,
+  "problem_name": "89_ConvTranspose3d_MaxPool_Softmax_Subtract_Swish_Max.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_codex_cuda_all/raw_generation/level_2/problem_89.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

@@ -1,0 +1,25 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 86.072,
+  "error": "Isolated KernelBench evaluator failed.",
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_4/problem_8.py",
+  "isolated_eval": {
+    "error": "'OPTModel' object has no attribute 'embed_tokens'",
+    "error_type": "builtins.AttributeError",
+    "ok": false,
+    "subprocess_output_tail": "Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.\n\nLoading weights:   0%|          | 0/389 [00:00<?, ?it/s]\nLoading weights: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 389/389 [00:00<00:00, 77016.01it/s]\n[1/3] c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=opt_custom_ops -DTORCH_API_INCLUDE_EXTENSION_H -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/include -isystem /home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -fPIC -std=c++17 -O3 -c /home/howard/.cache/torch_extensions/py310_cu128/opt_custom_ops/main.cpp -o main.o \n[2/3] /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=opt_custom_ops -DTORCH_API_INCLUDE_EXTENSION_H -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/include -isystem /home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 --compiler-options '-fPIC' -std=c++17 -c /home/howard/.cache/torch_extensions/py310_cu128/opt_custom_ops/cuda.cu -o cuda.cuda.o \n/home/howard/.cache/torch_extensions/py310_cu128/opt_custom_ops/cuda.cu(94): warning #177-D: variable \"block_size\" was declared but never referenced\n      const int block_size = 256;\n                ^\n\nRemark: The warnings can be suppressed with \"-diag-suppress <warning-number>\"\n\n[3/3] c++ main.o cuda.cuda.o -shared -lcudart -L/workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/lib -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -ltorch -ltorch_python -L/workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/lib -lcudart -o opt_custom_ops.so\n\nLoading weights:   0%|          | 0/389 [00:00<?, ?it/s]\nLoading weights: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 389/389 [00:00<00:00, 54672.26it/s]\n",
+    "subprocess_returncode": 0,
+    "traceback": "Traceback (most recent call last):\n  File \"<string>\", line 18, in <module>\n  File \"/workspace/external/KernelBench/src/kernelbench/eval.py\", line 562, in eval_kernel_against_ref\n    custom_model = ModelNew(*init_inputs)\n  File \"<string>\", line 202, in __init__\n  File \"/workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1965, in __getattr__\n    raise AttributeError(\nAttributeError: 'OPTModel' object has no attribute 'embed_tokens'\n"
+  },
+  "level": 4,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 8,
+  "problem_name": "8_facebook-opt-1p3b_bs512_seq32.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_4/problem_8.txt",
+  "static_warnings": [
+    "Uses torch computation op: torch.matmul"
+  ],
+  "status": "evaluation_error"
+}

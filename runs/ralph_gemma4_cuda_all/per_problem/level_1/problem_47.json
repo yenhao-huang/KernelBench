@@ -1,0 +1,30 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 18.712,
+  "eval_result": {
+    "compiled": false,
+    "correctness": false,
+    "metadata": {
+      "compilation_error": "Syntax error in custom generated code or ModelNew not found",
+      "compilation_error_name": "SyntaxError",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090"
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_gemma4_cuda_all/generated_kernels/level_1/problem_47.py",
+  "level": 1,
+  "model_name": "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
+  "precision": "fp32",
+  "problem_id": 47,
+  "problem_name": "47_Sum_reduction_over_a_dimension.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_gemma4_cuda_all/raw_generation/level_1/problem_47.txt",
+  "static_warnings": [
+    "Uses torch.nn compute layer (only containers, Parameter, init allowed)"
+  ],
+  "status": "evaluated"
+}

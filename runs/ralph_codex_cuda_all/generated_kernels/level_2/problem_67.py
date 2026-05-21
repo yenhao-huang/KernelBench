@@ -1,0 +1,116 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__device__ __forceinline__ float gelu_exact(float x) {
+    return 0.5f * x * (1.0f + erff(x * 0.70710678118654752440f));
+}
+
+__global__ void conv_gelu_gap_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ out,
+    int N, int C, int H, int W,
+    int OC, int K,
+    int OH, int OW
+) {
+    int pair = blockIdx.x;
+    int n = pair / OC;
+    int oc = pair - n * OC;
+    int tid = threadIdx.x;
+
+    float acc = 0.0f;
+    int total = OH * OW;
+
+    for (int idx = tid; idx < total; idx += blockDim.x) {
+        int oh = idx / OW;
+        int ow = idx - oh * OW;
+
+        float v = b[oc];
+        const float* wp = w + oc * C * K * K;
+
+        #pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            for (int ky = 0; ky < K; ++ky) {
+                int ih = oh + ky;
+                for (int kx = 0; kx < K; ++kx) {
+                    int iw = ow + kx;
+                    float xv = x[((n * C + c) * H + ih) * W + iw];
+                    float wv = wp[(c * K + ky) * K + kx];
+                    v += xv * wv;
+                }
+            }
+        }
+
+        acc += gelu_exact(v);
+    }
+
+    __shared__ float smem[256];
+    smem[tid] = acc;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] += smem[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out[n * OC + oc] = smem[0] / (float)total;
+    }
+}
+
+torch::Tensor conv_gelu_gap_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias) {
+    int N = (int)x.size(0);
+    int C = (int)x.size(1);
+    int H = (int)x.size(2);
+    int W = (int)x.size(3);
+    int OC = (int)weight.size(0);
+    int K = (int)weight.size(2);
+    int OH = H - K + 1;
+    int OW = W - K + 1;
+
+    auto out = torch::empty({N, OC}, x.options());
+
+    dim3 block(256);
+    dim3 grid(N * OC);
+
+    conv_gelu_gap_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C, H, W, OC, K, OH, OW
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = "torch::Tensor conv_gelu_gap_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias);"
+
+conv_gelu_gap_ext = load_inline(
+    name="conv_gelu_gap_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["conv_gelu_gap_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+
+    def forward(self, x):
+        return conv_gelu_gap_ext.conv_gelu_gap_cuda(x, self.conv.weight, self.conv.bias)

@@ -1,0 +1,793 @@
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernels for MobileNetV1 components
+# We will fuse Conv2d + BatchNorm2d + ReLU into a single kernel for performance.
+# We also optimize the Depthwise Separable Convolution structure.
+
+custom_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper to get channel dimension from NCHW tensor
+#define CHANNELS(x) (x.sizes()[1])
+#define HEIGHT(x) (x.sizes()[2])
+#define WIDTH(x) (x.sizes()[3])
+#define BATCH_SIZE(x) (x.sizes()[0])
+
+// Kernel for Conv2d + BatchNorm2d + ReLU fusion
+// Assumes input is NCHW, weight is OIHW, bias is O, running_mean/var are O.
+__global__ void conv_bn_relu_kernel(
+    const float* input, 
+    const float* weight, 
+    const float* bias, 
+    const float* running_mean, 
+    const float* running_var, 
+    float* output, 
+    int batch_size, 
+    int in_channels, 
+    int out_channels, 
+    int kernel_h, 
+    int kernel_w, 
+    int stride_h, 
+    int stride_w, 
+    int pad_h, 
+    int pad_w, 
+    int height_in, 
+    int width_in, 
+    int height_out, 
+    int width_out
+) {
+    // Each thread handles one output element (N, C, H, W)
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * out_channels * height_out * width_out;
+    
+    if (idx >= total_elements) return;
+
+    // Decompose index into N, C_out, H_out, W_out
+    int w_out = idx % width_out;
+    int h_out = (idx / width_out) % height_out;
+    int c_out = (idx / (width_out * height_out)) % out_channels;
+    int n = idx / (width_out * height_out * out_channels);
+
+    float sum = 0.0f;
+    
+    // Convolution loop
+    for (int c_in = 0; c_in < in_channels; ++c_in) {
+        for (int kh = 0; kh < kernel_h; ++kh) {
+            for (int kw = 0; kw < kernel_w; ++kw) {
+                int h_in = h_out * stride_h - pad_h + kh;
+                int w_in = w_out * stride_w - pad_w + kw;
+                
+                if (h_in >= 0 && h_in < height_in && w_in >= 0 && w_in < width_in) {
+                    // Input index: N, C_in, H_in, W_in
+                    int input_idx = n * in_channels * height_in * width_in + 
+                                    c_in * height_in * width_in + 
+                                    h_in * width_in + w_in;
+                    
+                    // Weight index: C_out, C_in, KH, KW
+                    int weight_idx = c_out * in_channels * kernel_h * kernel_w + 
+                                     c_in * kernel_h * kernel_w + 
+                                     kh * kernel_w + kw;
+                    
+                    sum += input[input_idx] * weight[weight_idx];
+                }
+            }
+        }
+    }
+
+    // BatchNorm and ReLU
+    float mean = running_mean[c_out];
+    float var = running_var[c_out];
+    float inv_std = rsqrtf(var + 1e-5); // epsilon for BN
+    
+    float normalized = (sum - mean) * inv_std;
+    
+    if (bias != nullptr) {
+        normalized += bias[c_out];
+    }
+    
+    // ReLU
+    output[idx] = fmaxf(0.0f, normalized);
+}
+
+// Kernel for Depthwise Convolution + BN + ReLU
+// Groups = in_channels == out_channels
+__global__ void depthwise_conv_bn_relu_kernel(
+    const float* input, 
+    const float* weight, 
+    const float* bias, 
+    const float* running_mean, 
+    const float* running_var, 
+    float* output, 
+    int batch_size, 
+    int channels, 
+    int kernel_h, 
+    int kernel_w, 
+    int stride_h, 
+    int stride_w, 
+    int pad_h, 
+    int pad_w, 
+    int height_in, 
+    int width_in, 
+    int height_out, 
+    int width_out
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * channels * height_out * width_out;
+    
+    if (idx >= total_elements) return;
+
+    int w_out = idx % width_out;
+    int h_out = (idx / width_out) % height_out;
+    int c = (idx / (width_out * height_out)) % channels;
+    int n = idx / (width_out * height_out * channels);
+
+    float sum = 0.0f;
+    
+    for (int kh = 0; kh < kernel_h; ++kh) {
+        for (int kw = 0; kw < kernel_w; ++kw) {
+            int h_in = h_out * stride_h - pad_h + kh;
+            int w_in = w_out * stride_w - pad_w + kw;
+            
+            if (h_in >= 0 && h_in < height_in && w_in >= 0 && w_in < width_in) {
+                int input_idx = n * channels * height_in * width_in + 
+                                c * height_in * width_in + 
+                                h_in * width_in + w_in;
+                
+                int weight_idx = c * kernel_h * kernel_w + 
+                                 kh * kernel_w + kw;
+                
+                sum += input[input_idx] * weight[weight_idx];
+            }
+        }
+    }
+
+    float mean = running_mean[c];
+    float var = running_var[c];
+    float inv_std = rsqrtf(var + 1e-5);
+    
+    float normalized = (sum - mean) * inv_std;
+    
+    if (bias != nullptr) {
+        normalized += bias[c];
+    }
+    
+    output[idx] = fmaxf(0.0f, normalized);
+}
+
+// Kernel for Pointwise Convolution (1x1) + BN + ReLU
+__global__ void pointwise_conv_bn_relu_kernel(
+    const float* input, 
+    const float* weight, 
+    const float* bias, 
+    const float* running_mean, 
+    const float* running_var, 
+    float* output, 
+    int batch_size, 
+    int in_channels, 
+    int out_channels, 
+    int height_in, 
+    int width_in
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * out_channels * height_in * width_in;
+    
+    if (idx >= total_elements) return;
+
+    int w = idx % width_in;
+    int h = (idx / width_in) % height_in;
+    int c_out = (idx / (width_in * height_in)) % out_channels;
+    int n = idx / (width_in * height_in * out_channels);
+
+    float sum = 0.0f;
+    
+    for (int c_in = 0; c_in < in_channels; ++c_in) {
+        int input_idx = n * in_channels * height_in * width_in + 
+                        c_in * height_in * width_in + 
+                        h * width_in + w;
+        
+        int weight_idx = c_out * in_channels + c_in;
+        
+        sum += input[input_idx] * weight[weight_idx];
+    }
+
+    float mean = running_mean[c_out];
+    float var = running_var[c_out];
+    float inv_std = rsqrtf(var + 1e-5);
+    
+    float normalized = (sum - mean) * inv_std;
+    
+    if (bias != nullptr) {
+        normalized += bias[c_out];
+    }
+    
+    output[idx] = fmaxf(0.0f, normalized);
+}
+
+// Kernel for Global Average Pooling + Linear Layer
+__global__ void gap_fc_kernel(
+    const float* input, 
+    const float* weight, 
+    const float* bias, 
+    float* output, 
+    int batch_size, 
+    int in_features, 
+    int out_features, 
+    int height_in, 
+    int width_in
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * out_features;
+    
+    if (idx >= total_elements) return;
+
+    int c_out = idx % out_features;
+    int n = idx / out_features;
+
+    float sum = 0.0f;
+    int spatial_size = height_in * width_in;
+    
+    // Global Average Pooling: average over H and W for each channel
+    for (int c_in = 0; c_in < in_features; ++c_in) {
+        float channel_sum = 0.0f;
+        for (int i = 0; i < spatial_size; ++i) {
+            int input_idx = n * in_features * spatial_size + 
+                            c_in * spatial_size + i;
+            channel_sum += input[input_idx];
+        }
+        float avg = channel_sum / spatial_size;
+        
+        // Linear layer: y = xW^T + b
+        int weight_idx = c_out * in_features + c_in;
+        sum += avg * weight[weight_idx];
+    }
+    
+    if (bias != nullptr) {
+        sum += bias[c_out];
+    }
+    
+    output[idx] = sum;
+}
+
+// Wrapper functions for PyTorch
+
+torch::Tensor conv_bn_relu_cuda(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    torch::Tensor bias, 
+    torch::Tensor running_mean, 
+    torch::Tensor running_var, 
+    int stride_h, 
+    int stride_w, 
+    int pad_h, 
+    int pad_w
+) {
+    auto batch_size = input.size(0);
+    auto in_channels = input.size(1);
+    auto height_in = input.size(2);
+    auto width_in = input.size(3);
+    
+    auto kernel_h = weight.size(2);
+    auto kernel_w = weight.size(3);
+    auto out_channels = weight.size(0);
+    
+    auto height_out = (height_in + 2 * pad_h - kernel_h) / stride_h + 1;
+    auto width_out = (width_in + 2 * pad_w - kernel_w) / stride_w + 1;
+    
+    auto output = torch::zeros({batch_size, out_channels, height_out, width_out}, input.options());
+    
+    const int block_size = 256;
+    int total_elements = batch_size * out_channels * height_out * width_out;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    conv_bn_relu_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(), 
+        weight.data_ptr<float>(), 
+        bias.data_ptr<float>(), 
+        running_mean.data_ptr<float>(), 
+        running_var.data_ptr<float>(), 
+        output.data_ptr<float>(), 
+        batch_size, 
+        in_channels, 
+        out_channels, 
+        kernel_h, 
+        kernel_w, 
+        stride_h, 
+        stride_w, 
+        pad_h, 
+        pad_w, 
+        height_in, 
+        width_in, 
+        height_out, 
+        width_out
+    );
+    
+    return output;
+}
+
+torch::Tensor depthwise_conv_bn_relu_cuda(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    torch::Tensor bias, 
+    torch::Tensor running_mean, 
+    torch::Tensor running_var, 
+    int stride_h, 
+    int stride_w, 
+    int pad_h, 
+    int pad_w
+) {
+    auto batch_size = input.size(0);
+    auto channels = input.size(1);
+    auto height_in = input.size(2);
+    auto width_in = input.size(3);
+    
+    auto kernel_h = weight.size(2);
+    auto kernel_w = weight.size(3);
+    
+    auto height_out = (height_in + 2 * pad_h - kernel_h) / stride_h + 1;
+    auto width_out = (width_in + 2 * pad_w - kernel_w) / stride_w + 1;
+    
+    auto output = torch::zeros({batch_size, channels, height_out, width_out}, input.options());
+    
+    const int block_size = 256;
+    int total_elements = batch_size * channels * height_out * width_out;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    depthwise_conv_bn_relu_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(), 
+        weight.data_ptr<float>(), 
+        bias.data_ptr<float>(), 
+        running_mean.data_ptr<float>(), 
+        running_var.data_ptr<float>(), 
+        output.data_ptr<float>(), 
+        batch_size, 
+        channels, 
+        kernel_h, 
+        kernel_w, 
+        stride_h, 
+        stride_w, 
+        pad_h, 
+        pad_w, 
+        height_in, 
+        width_in, 
+        height_out, 
+        width_out
+    );
+    
+    return output;
+}
+
+torch::Tensor pointwise_conv_bn_relu_cuda(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    torch::Tensor bias, 
+    torch::Tensor running_mean, 
+    torch::Tensor running_var
+) {
+    auto batch_size = input.size(0);
+    auto in_channels = input.size(1);
+    auto height_in = input.size(2);
+    auto width_in = input.size(3);
+    
+    auto out_channels = weight.size(0);
+    
+    auto output = torch::zeros({batch_size, out_channels, height_in, width_in}, input.options());
+    
+    const int block_size = 256;
+    int total_elements = batch_size * out_channels * height_in * width_in;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    pointwise_conv_bn_relu_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(), 
+        weight.data_ptr<float>(), 
+        bias.data_ptr<float>(), 
+        running_mean.data_ptr<float>(), 
+        running_var.data_ptr<float>(), 
+        output.data_ptr<float>(), 
+        batch_size, 
+        in_channels, 
+        out_channels, 
+        height_in, 
+        width_in
+    );
+    
+    return output;
+}
+
+torch::Tensor gap_fc_cuda(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    torch::Tensor bias
+) {
+    auto batch_size = input.size(0);
+    auto in_features = input.size(1);
+    auto height_in = input.size(2);
+    auto width_in = input.size(3);
+    
+    auto out_features = weight.size(0);
+    
+    auto output = torch::zeros({batch_size, out_features}, input.options());
+    
+    const int block_size = 256;
+    int total_elements = batch_size * out_features;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    gap_fc_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(), 
+        weight.data_ptr<float>(), 
+        bias.data_ptr<float>(), 
+        output.data_ptr<float>(), 
+        batch_size, 
+        in_features, 
+        out_features, 
+        height_in, 
+        width_in
+    );
+    
+    return output;
+}
+"""
+
+custom_cpp_source = """
+torch::Tensor conv_bn_relu_cuda(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    torch::Tensor bias, 
+    torch::Tensor running_mean, 
+    torch::Tensor running_var, 
+    int stride_h, 
+    int stride_w, 
+    int pad_h, 
+    int pad_w
+);
+
+torch::Tensor depthwise_conv_bn_relu_cuda(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    torch::Tensor bias, 
+    torch::Tensor running_mean, 
+    torch::Tensor running_var, 
+    int stride_h, 
+    int stride_w, 
+    int pad_h, 
+    int pad_w
+);
+
+torch::Tensor pointwise_conv_bn_relu_cuda(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    torch::Tensor bias, 
+    torch::Tensor running_mean, 
+    torch::Tensor running_var
+);
+
+torch::Tensor gap_fc_cuda(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    torch::Tensor bias
+);
+"""
+
+# Compile the inline CUDA code
+mobile_net_ops = load_inline(
+    name="mobile_net_ops",
+    cpp_sources=custom_cpp_source,
+    cuda_sources=custom_cuda_source,
+    functions=[
+        "conv_bn_relu_cuda",
+        "depthwise_conv_bn_relu_cuda", 
+        "pointwise_conv_bn_relu_cuda",
+        "gap_fc_cuda"
+    ],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000, input_channels=3, alpha=1.0):
+        """
+        Optimized MobileNetV1 architecture implementation using custom CUDA operators.
+        
+        :param num_classes: The number of output classes (default: 1000)
+        :param input_channels: The number of input channels (default: 3 for RGB images)
+        :param alpha: Width multiplier (default: 1.0)
+        """
+        super(ModelNew, self).__init__()
+        
+        self.num_classes = num_classes
+        self.alpha = alpha
+        
+        # Helper to create Conv2d + BN + ReLU layers with custom CUDA backend
+        def conv_bn(inp, oup, stride):
+            return nn.Sequential(
+                nn.Conv2d(inp, oup, 3, stride, 1, bias=False),
+                nn.BatchNorm2d(oup)
+            )
+        
+        # Helper to create Depthwise Separable Convolution layers with custom CUDA backend
+        def conv_dw(inp, oup, stride):
+            return nn.Sequential(
+                # Depthwise Conv
+                nn.Conv2d(inp, inp, 3, stride, 1, groups=inp, bias=False),
+                nn.BatchNorm2d(inp),
+                # Pointwise Conv
+                nn.Conv2d(inp, oup, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(oup)
+            )
+        
+        self.model = nn.Sequential(
+            conv_bn(input_channels, int(32 * alpha), 2),
+            conv_dw(int(32 * alpha), int(64 * alpha), 1),
+            conv_dw(int(64 * alpha), int(128 * alpha), 2),
+            conv_dw(int(128 * alpha), int(128 * alpha), 1),
+            conv_dw(int(128 * alpha), int(256 * alpha), 2),
+            conv_dw(int(256 * alpha), int(256 * alpha), 1),
+            conv_dw(int(256 * alpha), int(512 * alpha), 2),
+            conv_dw(int(512 * alpha), int(512 * alpha), 1),
+            conv_dw(int(512 * alpha), int(512 * alpha), 1),
+            conv_dw(int(512 * alpha), int(512 * alpha), 1),
+            conv_dw(int(512 * alpha), int(512 * alpha), 1),
+            conv_dw(int(512 * alpha), int(512 * alpha), 1),
+            conv_dw(int(512 * alpha), int(1024 * alpha), 2),
+            conv_dw(int(1024 * alpha), int(1024 * alpha), 1)
+        )
+        
+        self.fc = nn.Linear(int(1024 * alpha), num_classes)
+
+    def forward(self, x):
+        """
+        Optimized forward pass using custom CUDA kernels.
+        
+        :param x: The input tensor, shape (batch_size, input_channels, height, width)
+        :return: The output tensor, shape (batch_size, num_classes)
+        """
+        # Process the main model layers
+        for layer in self.model:
+            if isinstance(layer, nn.Sequential):
+                # Each sequential block contains Conv2d -> BatchNorm2d
+                # We need to extract weights and biases from these layers to pass to CUDA kernels
+                
+                # Determine if this is a standard conv or depthwise conv based on groups
+                first_conv = layer[0]
+                second_conv = layer[2]
+                
+                bn1 = layer[1]
+                bn2 = layer[3]
+                
+                # Get parameters
+                w1 = first_conv.weight
+                b1 = first_conv.bias if first_conv.bias is not None else torch.zeros_like(bn1.running_mean)
+                rm1 = bn1.running_mean
+                rv1 = bn1.running_var
+                
+                w2 = second_conv.weight
+                b2 = second_conv.bias if second_conv.bias is not None else torch.zeros_like(bn2.running_mean)
+                rm2 = bn2.running_mean
+                rv2 = bn2.running_var
+                
+                stride = first_conv.stride[0]
+                pad = first_conv.padding[0]
+                
+                # Apply Depthwise Conv + BN + ReLU if groups == in_channels, else Standard Conv + BN + ReLU
+                if first_conv.groups == first_conv.in_channels:
+                    x = mobile_net_ops.depthwise_conv_bn_relu_cuda(
+                        x, w1, b1, rm1, rv2, stride, stride, pad, pad
+                    )
+                    # Note: The second conv is 1x1 pointwise. 
+                    # We handle it in the next step or fuse if possible. 
+                    # For simplicity and correctness with varying dimensions, we process sequentially.
+                    # However, to fully optimize, we should fuse the pointwise part too.
+                    # Let's refine: The conv_dw block has two convs. 
+                    # We can treat the first as depthwise and second as pointwise.
+                    
+                    # Actually, let's restructure the forward pass logic to handle the fused blocks properly.
+                    # The current loop structure assumes standard nn.Sequential behavior.
+                    # To use custom ops effectively, we might need to call them explicitly or wrap them in a custom module.
+                    # Given the constraint of "replacing operators", let's assume we can intercept the forward pass logic.
+                    # But since we are defining ModelNew as an nn.Module, we must implement forward manually or via modules.
+                    
+                    # Let's change approach: Define custom modules that use the CUDA ops.
+                    pass 
+                else:
+                    x = mobile_net_ops.conv_bn_relu_cuda(
+                        x, w1, b1, rm1, rv1, stride, stride, pad, pad
+                    )
+                    # Then apply second conv (pointwise)
+                    x = mobile_net_ops.pointwise_conv_bn_relu_cuda(
+                        x, w2, b2, rm2, rv2
+                    )
+            
+            else:
+                # This branch shouldn't be reached with the current structure if we handle Sequential correctly
+                pass
+        
+        # The above loop is flawed because it tries to access layer[0], layer[1] etc inside a generic loop 
+        # without knowing if it's conv_bn or conv_dw. Let's rewrite the forward pass explicitly for clarity and correctness.
+        
+        return self._forward_custom(x)
+
+    def _forward_custom(self, x):
+        """Explicit forward pass using custom CUDA kernels for each block."""
+        
+        # Helper to apply Conv+BN+ReLU fusion
+        def apply_conv_bn_relu(inp, conv_layer, bn_layer, is_depthwise=False):
+            w = conv_layer.weight
+            b = conv_layer.bias if conv_layer.bias is not None else torch.zeros_like(bn_layer.running_mean)
+            rm = bn_layer.running_mean
+            rv = bn_layer.running_var
+            
+            stride = conv_layer.stride[0]
+            pad = conv_layer.padding[0]
+            
+            if is_depthwise:
+                return mobile_net_ops.depthwise_conv_bn_relu_cuda(inp, w, b, rm, rv, stride, stride, pad, pad)
+            else:
+                return mobile_net_ops.conv_bn_relu_cuda(inp, w, b, rm, rv, stride, stride, pad, pad)
+
+        # Helper to apply Pointwise Conv+BN+ReLU fusion
+        def apply_pointwise_conv_bn_relu(inp, conv_layer, bn_layer):
+            w = conv_layer.weight
+            b = conv_layer.bias if conv_layer.bias is not None else torch.zeros_like(bn_layer.running_mean)
+            rm = bn_layer.running_mean
+            rv = bn_layer.running_var
+            
+            return mobile_net_ops.pointwise_conv_bn_relu_cuda(inp, w, b, rm, rv)
+
+        # Block 1: Standard Conv2d + BN + ReLU
+        x = apply_conv_bn_relu(x, self.model[0][0], self.model[0][1])
+        
+        # Blocks 2-15: Depthwise Separable Convolutions
+        for i in range(1, len(self.model)):
+            block = self.model[i]
+            # First part: Depthwise Conv + BN + ReLU
+            x = apply_conv_bn_relu(x, block[0], block[1], is_depthwise=True)
+            # Second part: Pointwise Conv + BN + ReLU
+            x = apply_pointwise_conv_bn_relu(x, block[2], block[3])
+            
+        # Global Average Pooling and Linear Layer
+        # x shape: (N, C, 7, 7)
+        x = F.avg_pool2d(x, 7)
+        
+        # Flatten
+        x = x.view(x.size(0), -1)
+        
+        # FC Layer using custom kernel
+        fc_weight = self.fc.weight
+        fc_bias = self.fc.bias if self.fc.bias is not None else torch.zeros_like(fc_weight[:, 0])
+        
+        # Note: gap_fc_kernel expects input in NCHW format for pooling calculation, 
+        # but we already pooled. The kernel I wrote above does GAP + FC.
+        # Since we already did F.avg_pool2d, we just need the Linear part.
+        # However, to keep it consistent with the "custom operator" theme, 
+        # let's assume the previous step was raw feature map and we use a fused GAP+FC if needed.
+        # But since I already called F.avg_pool2d, I'll just use standard matmul for FC or write a simple linear kernel.
+        # Let's stick to standard PyTorch for the final Linear layer as it's highly optimized, 
+        # OR replace it with a custom one if desired. The prompt asks to replace operators for speedups.
+        # Linear is already fast. Let's just use standard matmul here to avoid complexity of passing pooled tensor to GAP+FC kernel.
+        
+        x = self.fc(x)
+        
+        return x
+
+# Re-defining ModelNew cleanly without the flawed loop logic above
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000, input_channels=3, alpha=1.0):
+        """
+        Optimized MobileNetV1 architecture implementation using custom CUDA operators.
+        
+        :param num_classes: The number of output classes (default: 1000)
+        :param input_channels: The number of input channels (default: 3 for RGB images)
+        :param alpha: Width multiplier (default: 1.0)
+        """
+        super(ModelNew, self).__init__()
+        
+        self.num_classes = num_classes
+        self.alpha = alpha
+        
+        # Helper to create Conv2d + BN layers (ReLU is fused in CUDA)
+        def conv_bn(inp, oup, stride):
+            return nn.Sequential(
+                nn.Conv2d(inp, oup, 3, stride, 1, bias=False),
+                nn.BatchNorm2d(oup)
+            )
+        
+        # Helper to create Depthwise Separable Convolution layers (ReLU is fused in CUDA)
+        def conv_dw(inp, oup, stride):
+            return nn.Sequential(
+                # Depthwise Conv
+                nn.Conv2d(inp, inp, 3, stride, 1, groups=inp, bias=False),
+                nn.BatchNorm2d(inp),
+                # Pointwise Conv
+                nn.Conv2d(inp, oup, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(oup)
+            )
+        
+        self.model = nn.Sequential(
+            conv_bn(input_channels, int(32 * alpha), 2),
+            conv_dw(int(32 * alpha), int(64 * alpha), 1),
+            conv_dw(int(64 * alpha), int(128 * alpha), 2),
+            conv_dw(int(128 * alpha), int(128 * alpha), 1),
+            conv_dw(int(128 * alpha), int(256 * alpha), 2),
+            conv_dw(int(256 * alpha), int(256 * alpha), 1),
+            conv_dw(int(256 * alpha), int(512 * alpha), 2),
+            conv_dw(int(512 * alpha), int(512 * alpha), 1),
+            conv_dw(int(512 * alpha), int(512 * alpha), 1),
+            conv_dw(int(512 * alpha), int(512 * alpha), 1),
+            conv_dw(int(512 * alpha), int(512 * alpha), 1),
+            conv_dw(int(512 * alpha), int(512 * alpha), 1),
+            conv_dw(int(512 * alpha), int(1024 * alpha), 2),
+            conv_dw(int(1024 * alpha), int(1024 * alpha), 1)
+        )
+        
+        self.fc = nn.Linear(int(1024 * alpha), num_classes)
+
+    def forward(self, x):
+        """
+        Optimized forward pass using custom CUDA kernels.
+        
+        :param x: The input tensor, shape (batch_size, input_channels, height, width)
+        :return: The output tensor, shape (batch_size, num_classes)
+        """
+        
+        # Helper to apply Conv+BN+ReLU fusion
+        def apply_conv_bn_relu(inp, conv_layer, bn_layer, is_depthwise=False):
+            w = conv_layer.weight
+            b = conv_layer.bias if conv_layer.bias is not None else torch.zeros_like(bn_layer.running_mean)
+            rm = bn_layer.running_mean
+            rv = bn_layer.running_var
+            
+            stride = conv_layer.stride[0]
+            pad = conv_layer.padding[0]
+            
+            if is_depthwise:
+                return mobile_net_ops.depthwise_conv_bn_relu_cuda(inp, w, b, rm, rv, stride, stride, pad, pad)
+            else:
+                return mobile_net_ops.conv_bn_relu_cuda(inp, w, b, rm, rv, stride, stride, pad, pad)
+
+        # Helper to apply Pointwise Conv+BN+ReLU fusion
+        def apply_pointwise_conv_bn_relu(inp, conv_layer, bn_layer):
+            w = conv_layer.weight
+            b = conv_layer.bias if conv_layer.bias is not None else torch.zeros_like(bn_layer.running_mean)
+            rm = bn_layer.running_mean
+            rv = bn_layer.running_var
+            
+            return mobile_net_ops.pointwise_conv_bn_relu_cuda(inp, w, b, rm, rv)
+
+        # Block 1: Standard Conv2d + BN + ReLU
+        x = apply_conv_bn_relu(x, self.model[0][0], self.model[0][1])
+        
+        # Blocks 2-15: Depthwise Separable Convolutions
+        for i in range(1, len(self.model)):
+            block = self.model[i]
+            # First part: Depthwise Conv + BN + ReLU
+            x = apply_conv_bn_relu(x, block[0], block[1], is_depthwise=True)
+            # Second part: Pointwise Conv + BN + ReLU
+            x = apply_pointwise_conv_bn_relu(x, block[2], block[3])
+            
+        # Global Average Pooling
+        x = F.avg_pool2d(x, 7)
+        
+        # Flatten
+        x = x.view(x.size(0), -1)
+        
+        # FC Layer
+        x = self.fc(x)
+        
+        return x
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.rand(10, 3, 224, 224).cuda()
+    return [a]
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return [1000, 3, 1.0]
+```

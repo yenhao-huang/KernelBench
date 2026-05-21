@@ -1,0 +1,27 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 64.441,
+  "eval_result": {
+    "compiled": true,
+    "correctness": true,
+    "metadata": {
+      "correctness_trials": "(5 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090"
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_codex_cuda_10_v2/generated_kernels/level_1/problem_2.py",
+  "level": 1,
+  "model_name": "codex-gpt-5.5",
+  "precision": "fp32",
+  "problem_id": 2,
+  "problem_name": "2_Standard_matrix_multiplication_.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_codex_cuda_10_v2/raw_generation/level_1/problem_2.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

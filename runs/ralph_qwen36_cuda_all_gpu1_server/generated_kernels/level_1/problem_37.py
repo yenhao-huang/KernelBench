@@ -1,0 +1,153 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for Frobenius norm normalization
+# This kernel computes the sum of squares in parallel using atomicAdd or a reduction,
+# then divides each element by the square root of that sum.
+# To maximize performance, we can fuse the computation:
+# 1. Compute global sum of squares (reduction).
+# 2. Divide input by sqrt(sum_of_squares).
+
+frobenius_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper kernel to compute the sum of squares of all elements in a tensor
+__global__ void sum_squares_kernel(const float* input, float* sum_out, int total_elements) {
+    extern __shared__ float sdata[];
+    
+    unsigned int tid = threadIdx.x;
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Load data into shared memory with striding to handle large tensors
+    float sum = 0.0f;
+    for (int i = idx; i < total_elements; i += blockDim.x * gridDim.x) {
+        float val = input[i];
+        sum += val * val;
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+
+    // Parallel reduction within the block
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    // Write the result for this block to global memory
+    if (tid == 0) {
+        atomicAdd(sum_out, sdata[0]);
+    }
+}
+
+// Kernel to normalize the tensor by dividing each element by the norm
+__global__ void normalize_kernel(const float* input, float* output, float norm_val, int total_elements) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total_elements) {
+        output[idx] = input[idx] / norm_val;
+    }
+}
+
+torch::Tensor frobenius_norm_normalize_cuda(torch::Tensor x) {
+    // Ensure input is contiguous and on CUDA
+    if (!x.is_contiguous()) {
+        x = x.contiguous();
+    }
+    
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    int total_elements = x.numel();
+    
+    // Allocate temporary tensor for the sum of squares reduction
+    // We use a small buffer, but since we are using atomicAdd, we need to initialize it to 0
+    torch::Tensor sum_buffer = torch::zeros({1}, options);
+    
+    const int block_size = 256;
+    // Calculate grid size. For large tensors, we might want more blocks.
+    // A reasonable heuristic is to have at least one block per SM, but let's keep it simple.
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+    // Cap the number of blocks to avoid excessive launch overhead for small tensors, 
+    // but ensure we cover all elements. For very large tensors, more blocks are better.
+    if (num_blocks > 1024) {
+        num_blocks = 1024;
+    }
+    
+    // Launch reduction kernel
+    sum_squares_kernel<<<num_blocks, block_size, block_size * sizeof(float)>>>(
+        x.data_ptr<float>(), 
+        sum_buffer.data_ptr<float>(), 
+        total_elements
+    );
+    
+    // Synchronize to ensure the sum is complete before reading it back to host or using it in next kernel
+    cudaDeviceSynchronize();
+    
+    // Copy the result from device to host to get the scalar value
+    float norm_sq = 0.0f;
+    cudaMemcpy(&norm_sq, sum_buffer.data_ptr<float>(), sizeof(float), cudaMemcpyDeviceToHost);
+    
+    float norm_val = sqrtf(norm_sq);
+    
+    // Handle division by zero case (though unlikely with random data)
+    if (norm_val < 1e-8f) {
+        norm_val = 1e-8f;
+    }
+    
+    // Allocate output tensor
+    torch::Tensor out = torch::empty_like(x);
+    
+    // Launch normalization kernel
+    const int norm_block_size = 256;
+    const int norm_num_blocks = (total_elements + norm_block_size - 1) / norm_block_size;
+    
+    normalize_kernel<<<norm_num_blocks, norm_block_size>>>(
+        x.data_ptr<float>(), 
+        out.data_ptr<float>(), 
+        norm_val, 
+        total_elements
+    );
+    
+    return out;
+}
+"""
+
+frobenius_norm_cpp_source = (
+    "torch::Tensor frobenius_norm_normalize_cuda(torch::Tensor x);"
+)
+
+# Compile the inline CUDA code for Frobenius norm normalization
+frobenius_norm_module = load_inline(
+    name="frobenius_norm_module",
+    cpp_sources=frobenius_norm_cpp_source,
+    cuda_sources=frobenius_norm_source,
+    functions=["frobenius_norm_normalize_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Frobenius norm normalization using custom CUDA operators.
+    """
+    def __init__(self):
+        """
+        Initializes the optimized Frobenius norm normalization layer.
+        """
+        super(ModelNew, self).__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Frobenius norm normalization to the input tensor using custom CUDA kernels.
+
+        Args:
+            x (torch.Tensor): Input tensor of arbitrary shape.
+
+        Returns:
+            torch.Tensor: Output tensor with Frobenius norm normalization applied, same shape as input.
+        """
+        return frobenius_norm_module.frobenius_norm_normalize_cuda(x)

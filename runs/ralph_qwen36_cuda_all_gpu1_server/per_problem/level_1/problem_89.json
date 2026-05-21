@@ -1,0 +1,17 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 46.684,
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server/generated_kernels/level_1/problem_89.py",
+  "level": 1,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 89,
+  "problem_name": "89_cumsum.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server/raw_generation/level_1/problem_89.txt",
+  "static_errors": [
+    "Contains 'pass' statement (inheritance bypass)"
+  ],
+  "static_warnings": [],
+  "status": "static_failed"
+}

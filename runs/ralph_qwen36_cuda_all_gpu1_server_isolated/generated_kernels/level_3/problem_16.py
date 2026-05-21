@@ -1,0 +1,293 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernels for DenseNet optimization
+# We will fuse BatchNorm + ReLU + Conv2d into a single kernel to reduce memory bandwidth and launch overhead.
+# We will also optimize the concatenation operation if possible, but standard cat is often efficient enough.
+# The main bottleneck in DenseNet is the repeated small convolutions and the accumulation of features.
+
+custom_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper macro for CUDA error checking
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            printf("CUDA error at %s:%d: %s\\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while (0)
+
+// Kernel for fused BatchNorm + ReLU + Conv2D
+// Assumes input is NHWC or NCHW. PyTorch uses NCHW.
+// This kernel performs:
+// 1. Batch Normalization (running mean/var, weight, bias)
+// 2. ReLU activation
+// 3. Convolution with 3x3 kernel, padding=1, stride=1
+// Note: This is a simplified fusion. A full production kernel would handle groups, different strides, etc.
+// Here we assume standard DenseNet layer config: in_channels, out_channels (growth_rate), 3x3 conv, no bias.
+
+__global__ void fused_bn_relu_conv_kernel(
+    const float* __restrict__ input,   // [N, C_in, H, W]
+    const float* __restrict__ bn_weight,     // [C_in]
+    const float* __restrict__ bn_bias,       // [C_in]
+    const float* __restrict__ bn_running_mean, // [C_in]
+    const float* __restrict__ bn_running_var,  // [C_in]
+    const float* __restrict__ conv_weight,   // [C_out, C_in, K, K]
+    const float* __restrict__ conv_bias,     // [C_out] (usually 0 in DenseNet)
+    float* __restrict__ output,              // [N, C_out, H, W]
+    int N, int C_in, int C_out, int H, int W, int K
+) {
+    // Each thread handles one output element
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C_out * H * W;
+
+    if (idx >= total_elements) return;
+
+    // Decompose index into N, C_out, H, W
+    int w = idx % W;
+    int h = (idx / W) % H;
+    int c_out = (idx / (W * H)) % C_out;
+    int n = idx / (W * H * C_out);
+
+    float sum = 0.0f;
+    
+    // Convolution loop
+    for (int c_in = 0; c_in < C_in; ++c_in) {
+        for (int ky = 0; ky < K; ++ky) {
+            for (int kx = 0; kx < K; ++kx) {
+                int in_h = h + ky - 1; // padding=1
+                int in_w = w + kx - 1;
+                
+                if (in_h >= 0 && in_h < H && in_w >= 0 && in_w < W) {
+                    // Get input value
+                    int input_idx = ((n * C_in + c_in) * H + in_h) * W + in_w;
+                    float val = input[input_idx];
+                    
+                    // Batch Normalization: (x - mean) / sqrt(var + eps) * weight + bias
+                    float inv_std = rsqrtf(bn_running_var[c_in] + 1e-5);
+                    val = (val - bn_running_mean[c_in]) * inv_std;
+                    val = val * bn_weight[c_in] + bn_bias[c_in];
+                    
+                    // ReLU
+                    if (val < 0.0f) val = 0.0f;
+                    
+                    // Multiply by convolution weight
+                    int weight_idx = ((c_out * C_in + c_in) * K + ky) * K + kx;
+                    sum += val * conv_weight[weight_idx];
+                }
+            }
+        }
+    }
+    
+    // Add bias (if any, though DenseNet usually sets bias=False for convs after BN)
+    if (conv_bias != nullptr) {
+        sum += conv_bias[c_out];
+    }
+    
+    output[idx] = sum;
+}
+
+// Optimized Concatenation Kernel
+// Simply copies data from multiple input tensors to a single output tensor along channel dimension.
+// This can be faster than torch.cat for many small tensors due to reduced kernel launch overhead and better memory coalescing if implemented well.
+// However, for large tensors, torch.cat is highly optimized. We'll skip this unless necessary.
+
+torch::Tensor fused_bn_relu_conv_cuda(
+    torch::Tensor input,
+    torch::Tensor bn_weight,
+    torch::Tensor bn_bias,
+    torch::Tensor bn_running_mean,
+    torch::Tensor bn_running_var,
+    torch::Tensor conv_weight,
+    torch::Tensor conv_bias
+) {
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(bn_weight.is_cuda(), "bn_weight must be a CUDA tensor");
+    TORCH_CHECK(bn_bias.is_cuda(), "bn_bias must be a CUDA tensor");
+    TORCH_CHECK(bn_running_mean.is_cuda(), "bn_running_mean must be a CUDA tensor");
+    TORCH_CHECK(bn_running_var.is_cuda(), "bn_running_var must be a CUDA tensor");
+    TORCH_CHECK(conv_weight.is_cuda(), "conv_weight must be a CUDA tensor");
+    
+    auto N = input.size(0);
+    auto C_in = input.size(1);
+    auto H = input.size(2);
+    auto W = input.size(3);
+    auto C_out = conv_weight.size(0);
+    auto K = conv_weight.size(2); // Assuming square kernel
+
+    auto output = torch::empty({N, C_out, H, W}, input.options());
+
+    const int block_size = 256;
+    int total_elements = N * C_out * H * W;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    // Launch kernel
+    fused_bn_relu_conv_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        bn_weight.data_ptr<float>(),
+        bn_bias.data_ptr<float>(),
+        bn_running_mean.data_ptr<float>(),
+        bn_running_var.data_ptr<float>(),
+        conv_weight.data_ptr<float>(),
+        conv_bias.numel() > 0 ? conv_bias.data_ptr<float>() : nullptr,
+        output.data_ptr<float>(),
+        N, C_in, C_out, H, W, K
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+    
+    return output;
+}
+
+"""
+
+custom_cpp_source = """
+torch::Tensor fused_bn_relu_conv_cuda(
+    torch::Tensor input,
+    torch::Tensor bn_weight,
+    torch::Tensor bn_bias,
+    torch::Tensor bn_running_mean,
+    torch::Tensor bn_running_var,
+    torch::Tensor conv_weight,
+    torch::Tensor conv_bias
+);
+"""
+
+# Load the custom extension
+custom_ops = load_inline(
+    name="custom_dense_ops",
+    cpp_sources=custom_cpp_source,
+    cuda_sources=custom_cuda_source,
+    functions=["fused_bn_relu_conv_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"]
+)
+
+
+class FusedBNReLUConv2d(nn.Module):
+    """
+    A custom module that fuses BatchNorm2d, ReLU, and Conv2d into a single CUDA kernel.
+    This reduces memory bandwidth usage by avoiding intermediate tensor allocations for BN output and ReLU output.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False):
+        super(FusedBNReLUConv2d, self).__init__()
+        
+        # We need to store the parameters for the custom kernel
+        # Note: In a real scenario, you might want to handle groups, but DenseNet uses 1x1 and 3x3 with group=1 usually.
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        
+        # Initialize BatchNorm2d parameters
+        self.bn_weight = nn.Parameter(torch.ones(in_channels))
+        self.bn_bias = nn.Parameter(torch.zeros(in_channels))
+        self.register_buffer('bn_running_mean', torch.zeros(in_channels))
+        self.register_buffer('bn_running_var', torch.ones(in_channels))
+        
+        # Initialize Conv2d parameters
+        # Conv2d in PyTorch is [out_channels, in_channels, kH, kW]
+        self.conv_weight = nn.Parameter(torch.randn(out_channels, in_channels, kernel_size, kernel_size) * 0.01)
+        if bias:
+            self.conv_bias = nn.Parameter(torch.zeros(out_channels))
+        else:
+            self.register_buffer('conv_bias', torch.zeros(out_channels))
+
+    def forward(self, x):
+        # Use the custom CUDA kernel
+        return custom_ops.fused_bn_relu_conv_cuda(
+            x,
+            self.bn_weight,
+            self.bn_bias,
+            self.bn_running_mean,
+            self.bn_running_var,
+            self.conv_weight,
+            self.conv_bias
+        )
+
+
+class DenseBlockNew(nn.Module):
+    def __init__(self, num_layers: int, num_input_features: int, growth_rate: int):
+        super(DenseBlockNew, self).__init__()
+        layers = []
+        for i in range(num_layers):
+            # Use the fused layer instead of Sequential(BN, ReLU, Conv, Dropout)
+            # Note: Dropout is 0.0 in the original code, so we can ignore it.
+            layers.append(FusedBNReLUConv2d(num_input_features + i * growth_rate, growth_rate))
+        self.layers = nn.ModuleList(layers)
+
+    def forward(self, x):
+        features = [x]
+        for layer in self.layers:
+            new_feature = layer(x)
+            features.append(new_feature)
+            x = torch.cat(features, 1)
+        return x
+
+
+class TransitionLayerNew(nn.Module):
+    def __init__(self, num_input_features: int, num_output_features: int):
+        super(TransitionLayerNew, self).__init__()
+        # The transition layer has BN, ReLU, Conv1x1, AvgPool2d.
+        # We can fuse BN+ReLU+Conv1x1 similarly.
+        self.fused_conv = FusedBNReLUConv2d(num_input_features, num_output_features, kernel_size=1, padding=0)
+        self.avg_pool = nn.AvgPool2d(kernel_size=2, stride=2)
+
+    def forward(self, x):
+        x = self.fused_conv(x)
+        x = self.avg_pool(x)
+        return x
+
+
+class ModelNew(nn.Module):
+    def __init__(self, growth_rate: int = 32, num_classes: int = 1000):
+        super(ModelNew, self).__init__()
+
+        # Initial convolution and pooling
+        # We can also fuse the initial BN+ReLU+Conv if desired, but let's keep it simple for the first layer
+        # or apply the same fusion. Let's apply fusion to the first conv too for consistency.
+        self.features = nn.Sequential(
+            FusedBNReLUConv2d(3, 64, kernel_size=7, stride=2, padding=3),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        )
+
+        num_features = 64
+        block_layers = [6, 12, 48, 32]
+
+        self.dense_blocks = nn.ModuleList()
+        self.transition_layers = nn.ModuleList()
+
+        for i, num_layers in enumerate(block_layers):
+            block = DenseBlockNew(num_layers=num_layers, num_input_features=num_features, growth_rate=growth_rate)
+            self.dense_blocks.append(block)
+            num_features = num_features + num_layers * growth_rate
+
+            if i != len(block_layers) - 1:
+                transition = TransitionLayerNew(num_input_features=num_features, num_output_features=num_features // 2)
+                self.transition_layers.append(transition)
+                num_features = num_features // 2
+
+        # Final batch norm and classifier
+        # We can fuse the final BN+ReLU as well, but it's just one layer.
+        # Let's keep it standard for simplicity or fuse it.
+        self.final_bn = nn.BatchNorm2d(num_features)
+        self.classifier = nn.Linear(num_features, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+
+        for i, block in enumerate(self.dense_blocks):
+            x = block(x)
+            if i != len(self.dense_blocks) - 1:
+                x = self.transition_layers[i](x)
+
+        x = self.final_bn(x)
+        x = F.relu(x, inplace=True)
+        x = F.adaptive_avg_pool2d(x, (1, 1)).view(x.size(0), -1)
+        x = self.classifier(x)
+        return x

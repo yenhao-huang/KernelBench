@@ -1,0 +1,19 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 59.433,
+  "generated_kernel_path": "runs/ralph_gemma4_cuda_all/generated_kernels/level_3/problem_24.py",
+  "level": 3,
+  "model_name": "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
+  "precision": "fp32",
+  "problem_id": 24,
+  "problem_name": "24_EfficientNetB2.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_gemma4_cuda_all/raw_generation/level_3/problem_24.txt",
+  "static_errors": [
+    "Missing __global__ kernel definition"
+  ],
+  "static_warnings": [
+    "Uses torch.nn compute layer (only containers, Parameter, init allowed)"
+  ],
+  "status": "static_failed"
+}

@@ -1,0 +1,102 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernel to fuse Swish activation and Bias addition.
+# This reduces memory bandwidth by performing two element-wise operations in one pass.
+fused_swish_bias_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_swish_bias_kernel(const float* x, const float* bias, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float val = x[idx];
+        // Swish: x * sigmoid(x) = x / (1 + exp(-x))
+        float swish = val / (1.0f + expf(-val));
+        out[idx] = swish + bias[idx % (size / (size / (size/1)) == 0 ? 1 : 1)]; // Placeholder logic for bias indexing
+    }
+}
+
+// Corrected kernel for 2D shape (batch_size, out_features)
+__global__ void fused_swish_bias_kernel_2d(const float* x, const float* bias, float* out, int batch_size, int out_features) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < out_features) {
+        int idx = row * out_features + col;
+        float val = x[idx];
+        float swish = val / (1.0f + expf(-val));
+        out[idx] = swish + bias[col];
+    }
+}
+
+torch::Tensor fused_swish_bias_cuda(torch::Tensor x, torch::Tensor bias) {
+    auto batch_size = x.size(0);
+    auto out_features = x.size(1);
+    auto out = torch::empty_like(x);
+
+    dim3 block_size(16, 16);
+    dim3 num_blocks((out_features + block_size.x - 1) / block_size.x, 
+                    (batch_size + block_size.y - 1) / block_size.y);
+
+    fused_swish_bias_kernel_2d<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(), 
+        bias.data_ptr<float>(), 
+        out.data_ptr<float>(), 
+        batch_size, 
+        out_features
+    );
+
+    return out;
+}
+"""
+
+fused_swish_bias_cpp_source = (
+    "torch::Tensor fused_swish_bias_cuda(torch::Tensor x, torch::Tensor bias);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_swish_bias_cpp_source,
+    cuda_sources=fused_swish_bias_source,
+    functions=["fused_swish_bias_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized version of the Model.
+    Fuses Swish activation and Bias addition into a single CUDA kernel to minimize 
+    global memory R/W operations.
+    """
+    def __init__(self, in_features, out_features, num_groups, bias_shape):
+        super(ModelNew, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_groups = num_groups
+        
+        self.matmul = nn.Linear(in_features, out_features)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.group_norm = nn.GroupNorm(num_groups, out_features)
+        self.fused_ops = fused_ops
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        # 1. Matrix Multiplication (Standard highly optimized cuBLAS)
+        x = self.matmul(x)
+        
+        # 2. Fused Swish + Bias (Custom CUDA kernel)
+        # Original: x = torch.sigmoid(x) * x; x = x + self.bias
+        x = self.fused_ops.fused_swish_bias_cuda(x, self.bias)
+        
+        # 3. GroupNorm (Standard highly optimized cuDNN)
+        x = self.group_norm(x)
+        
+        return x

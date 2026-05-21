@@ -1,0 +1,19 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 22.411,
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_4/problem_13.py",
+  "level": 4,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 13,
+  "problem_name": "13_google-reformer-enwik8_bs32_seq256.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_4/problem_13.txt",
+  "static_errors": [
+    "Contains 'pass' statement (inheritance bypass)"
+  ],
+  "static_warnings": [
+    "Uses torch.nn compute layer (only containers, Parameter, init allowed)"
+  ],
+  "status": "static_failed"
+}

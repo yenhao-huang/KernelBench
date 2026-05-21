@@ -1,0 +1,161 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# The custom CUDA kernel implements a fused Depthwise and Pointwise convolution.
+# To maximize efficiency, we use a single kernel that performs the depthwise 
+# convolution for a specific spatial location and then immediately performs 
+# the pointwise (1x1) convolution for that location.
+# This reduces memory bandwidth by avoiding the intermediate storage of the 
+# depthwise output.
+
+fused_conv_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_depthwise_pointwise_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ dw_weight,
+    const float* __restrict__ pw_weight,
+    const float* __restrict__ bias, // bias for pointwise
+    float* __restrict__ output,
+    int batch_size, int in_channels, int in_h, int in_w,
+    int out_channels, int k_size, int stride, int padding, int dilation,
+    int out_h, int out_w) 
+{
+    // Each thread handles one output element (b, oc, oh, ow)
+    int ow = blockIdx.x * blockDim.x + threadIdx.x;
+    int oh = blockIdx.y * blockDim.y + threadIdx.y;
+    int oc = blockIdx.z;
+    int b = blockIdx.w;
+
+    if (oh < out_h && ow < out_w && oc < out_channels && b < batch_size) {
+        float sum = 0.0f;
+
+        // The pointwise part: sum_{ic} (depthwise_result_{ic} * pw_weight_{oc, ic})
+        // To avoid storing depthwise_result, we compute depthwise on the fly for each ic.
+        for (int ic = 0; ic < in_channels; ++ic) {
+            float dw_val = 0.0f;
+            
+            // Depthwise convolution for channel ic
+            for (int kh = 0; kh < k_size; ++kh) {
+                for (int kw = 0; kw < k_size; ++kw) {
+                    int ih = oh * stride - padding + kh * dilation;
+                    int iw = ow * stride - padding + kw * dilation;
+
+                    if (ih >= 0 && ih < in_h && iw >= 0 && iw < in_w) {
+                        // dw_weight shape: [in_channels, 1, k_size, k_size]
+                        // input shape: [batch, in_channels, in_h, in_w]
+                        float w = dw_weight[((ic * k_size + kh) * k_size) + kw];
+                        float val = input[((b * in_channels + ic) * in_h + ih) * in_w + iw];
+                        dw_val += val * w;
+                    }
+                }
+            }
+            // pw_weight shape: [out_channels, in_channels, 1, 1]
+            sum += dw_val * pw_weight[((oc * in_channels) + ic)];
+        }
+
+        if (bias != nullptr) {
+            sum += bias[oc];
+        }
+
+        output[((b * out_channels + oc) * out_h + oh) * out_w + ow] = sum;
+    }
+}
+
+torch::Tensor fused_depthwise_pointwise_cuda(
+    torch::Tensor input,
+    torch::Tensor dw_weight,
+    torch::Tensor pw_weight,
+    torch::Tensor bias,
+    int stride, int padding, int dilation) 
+{
+    const int batch_size = input.size(0);
+    const int in_channels = input.size(1);
+    const int in_h = input.size(2);
+    const int in_w = input.size(3);
+    const int out_channels = pw_weight.size(0);
+    const int k_size = dw_weight.size(2);
+    
+    const int out_h = (in_h + 2 * padding - dilation * (k_size - 1) - 1) / stride + 1;
+    const int out_w = (in_w + 2 * padding - dilation * (k_size - 1) - 1) / stride + 1;
+
+    auto output = torch::empty({batch_size, out_channels, out_h, out_w}, input.options());
+
+    dim3 block(16, 16, 1);
+    dim3 grid((out_w + block.x - 1) / block.x, 
+              (out_h + block.y - 1) / block.y, 
+              out_channels, 
+              batch_size);
+
+    fused_depthwise_pointwise_kernel<<<grid, block>>>(
+        input.data_ptr<float>(),
+        dw_weight.data_ptr<float>(),
+        pw_weight.data_ptr<float>(),
+        bias.defined() ? bias.data_ptr<float>() : nullptr,
+        output.data_ptr<float>(),
+        batch_size, in_channels, in_h, in_w,
+        out_channels, k_size, stride, padding, dilation,
+        out_h, out_w
+    );
+
+    return output;
+}
+"""
+
+fused_conv_cpp_source = """
+torch::Tensor fused_depthwise_pointwise_cuda(
+    torch::Tensor input,
+    torch::Tensor dw_weight,
+    torch::Tensor pw_weight,
+    torch::Tensor bias,
+    int stride, int padding, int dilation);
+"""
+
+fused_conv_lib = load_inline(
+    name="fused_conv_lib",
+    cpp_sources=fused_conv_cpp_source,
+    cuda_sources=fused_conv_source,
+    functions=["fused_depthwise_pointwise_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, bias: bool = False):
+        super(ModelNew, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.bias_val = bias
+
+        # We keep the parameters in standard nn.Parameter to allow optimizer to work
+        self.dw_weight = nn.Parameter(torch.randn(in_channels, 1, kernel_size, kernel_size))
+        self.pw_weight = nn.Parameter(torch.randn(out_channels, in_channels, 1, 1))
+        if bias:
+            self.bias = nn.Parameter(torch.randn(out_channels))
+        else:
+            self.register_parameter('bias', None)
+            
+        self.fused_op = fused_conv_lib
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure inputs are contiguous for the CUDA kernel
+        x = x.contiguous()
+        dw_w = self.dw_weight.contiguous()
+        pw_w = self.pw_weight.contiguous()
+        
+        bias_tensor = self.bias if self.bias is not None else torch.empty(0, device=x.device)
+        
+        return self.fused_op.fused_depthwise_pointwise_cuda(
+            x, 
+            dw_w, 
+            pw_w, 
+            bias_tensor, 
+            self.stride, 
+            self.padding, 
+            self.dilation
+        )

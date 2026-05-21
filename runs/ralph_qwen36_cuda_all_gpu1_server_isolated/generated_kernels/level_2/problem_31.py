@@ -1,0 +1,154 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel source
+# We fuse: Conv2d -> Min(const) -> Add(bias) -> Mul(scalar)
+# Note: Standard Conv2d is complex to implement from scratch efficiently in a single inline block without cuDNN.
+# However, the prompt asks to replace operators to get speedups. 
+# The most significant bottleneck here is likely the Conv2d if not using cuDNN, but replacing it with a naive CUDA conv is often slower than cuDNN for large tensors.
+# Instead, we will focus on fusing the post-processing operations (Min, Add, Mul) which are memory-bound and can be fused into a single kernel to reduce global memory traffic.
+# We will keep nn.Conv2d as it is highly optimized via cuDNN in PyTorch, but we will replace the subsequent element-wise ops with a fused custom kernel.
+
+custom_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+__global__ void fused_post_process_kernel(
+    const float* input, 
+    const float* bias, 
+    float* output, 
+    int batch_size, 
+    int channels, 
+    int height, 
+    int width, 
+    float constant_value, 
+    float scaling_factor
+) {
+    // Total number of elements in the spatial/batch dimension excluding channels for broadcasting logic
+    // The tensor shape is (N, C, H, W). Bias is (C, 1, 1).
+    // We iterate over all elements.
+    
+    int total_elements = batch_size * channels * height * width;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < total_elements) {
+        // Calculate coordinates from linear index
+        int temp_idx = idx;
+        int w = temp_idx % width;
+        temp_idx /= width;
+        int h = temp_idx % height;
+        temp_idx /= height;
+        int c = temp_idx % channels;
+        int n = temp_idx / channels;
+
+        // Load input value
+        float val = input[idx];
+
+        // Apply min(constant_value)
+        if (val > constant_value) {
+            val = constant_value;
+        }
+
+        // Add bias. Bias is broadcasted over N, H, W.
+        // Bias index is just c because shape is (C, 1, 1)
+        float b_val = bias[c];
+        val += b_val;
+
+        // Multiply by scaling factor
+        val *= scaling_factor;
+
+        output[idx] = val;
+    }
+}
+
+torch::Tensor fused_post_process_cuda(
+    torch::Tensor input, 
+    torch::Tensor bias, 
+    float constant_value, 
+    float scaling_factor
+) {
+    auto batch_size = input.size(0);
+    auto channels = input.size(1);
+    auto height = input.size(2);
+    auto width = input.size(3);
+
+    auto output = torch::empty_like(input);
+
+    int total_elements = batch_size * channels * height * width;
+    
+    if (total_elements == 0) {
+        return output;
+    }
+
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    fused_post_process_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        channels,
+        height,
+        width,
+        constant_value,
+        scaling_factor
+    );
+
+    return output;
+}
+"""
+
+custom_ops_cpp_source = (
+    "torch::Tensor fused_post_process_cuda(torch::Tensor input, torch::Tensor bias, float constant_value, float scaling_factor);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_post_process",
+    cpp_sources=custom_ops_cpp_source,
+    cuda_sources=custom_ops_source,
+    functions=["fused_post_process_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs a convolution, then fuses min, add bias, and multiply scaling factor into a single CUDA kernel.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, constant_value, bias_shape, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.constant_value = constant_value
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        # Convolution is handled by PyTorch's optimized cuDNN backend
+        x = self.conv(x)
+        
+        # Fused operation: min(const), add bias, mul scalar
+        x = fused_ops.fused_post_process_cuda(x, self.bias, self.constant_value, self.scaling_factor)
+        
+        return x
+
+# Re-defining the helper functions to match the expected interface for testing/context
+batch_size = 128
+in_channels = 64
+out_channels = 128
+height = width = 128
+kernel_size = 3
+constant_value = 0.5
+bias_shape = (out_channels, 1, 1)
+scaling_factor = 2.0
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, constant_value, bias_shape, scaling_factor]

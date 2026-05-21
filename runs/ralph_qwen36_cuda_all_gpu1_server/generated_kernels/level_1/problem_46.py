@@ -1,0 +1,183 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for 3D Average Pooling
+avg_pool_3d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Kernel to compute sum of elements in a 3D window
+__global__ void avg_pool_3d_sum_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int batch_size,
+    int channels,
+    int depth_in,
+    int height_in,
+    int width_in,
+    int kernel_size,
+    int stride,
+    int padding,
+    int depth_out,
+    int height_out,
+    int width_out
+) {
+    // Each thread handles one output element (b, c, d, h, w)
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    int total_elements = batch_size * channels * depth_out * height_out * width_out;
+    
+    if (idx >= total_elements) return;
+
+    // Decode linear index to 5D coordinates
+    int temp = idx;
+    int w_out = temp % width_out;
+    temp /= width_out;
+    int h_out = temp % height_out;
+    temp /= height_out;
+    int d_out = temp % depth_out;
+    temp /= depth_out;
+    int c = temp % channels;
+    int b = temp / channels;
+
+    // Calculate input coordinates for the top-left corner of the window
+    // Formula: in_pos = out_pos * stride - padding
+    int d_in_start = d_out * stride - padding;
+    int h_in_start = h_out * stride - padding;
+    int w_in_start = w_out * stride - padding;
+
+    float sum = 0.0f;
+    int count = 0;
+
+    // Iterate over the kernel volume
+    for (int k_d = 0; k_d < kernel_size; ++k_d) {
+        int d_in = d_in_start + k_d;
+        if (d_in < 0 || d_in >= depth_in) continue;
+
+        for (int k_h = 0; k_h < kernel_size; ++k_h) {
+            int h_in = h_in_start + k_h;
+            if (h_in < 0 || h_in >= height_in) continue;
+
+            for (int k_w = 0; k_w < kernel_size; ++k_w) {
+                int w_in = w_in_start + k_w;
+                if (w_in < 0 || w_in >= width_in) continue;
+
+                // Linear index in input tensor: NCHW layout
+                // Index = b * C * D * H * W + c * D * H * W + d * H * W + h * W + w
+                int input_idx = b * channels * depth_in * height_in * width_in 
+                              + c * depth_in * height_in * width_in 
+                              + d_in * height_in * width_in 
+                              + h_in * width_in 
+                              + w_in;
+                
+                sum += input[input_idx];
+                count++;
+            }
+        }
+    }
+
+    // Calculate output index
+    int output_idx = idx;
+    
+    if (count > 0) {
+        output[output_idx] = sum / static_cast<float>(count);
+    } else {
+        output[output_idx] = 0.0f;
+    }
+}
+
+torch::Tensor avg_pool_3d_cuda(torch::Tensor input, int kernel_size, int stride, int padding) {
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(input.dim() == 5, "Input must be 5D (N, C, D, H, W)");
+
+    auto batch_size = input.size(0);
+    auto channels = input.size(1);
+    auto depth_in = input.size(2);
+    auto height_in = input.size(3);
+    auto width_in = input.size(4);
+
+    // Calculate output dimensions
+    auto depth_out = (depth_in + 2 * padding - kernel_size) / stride + 1;
+    auto height_out = (height_in + 2 * padding - kernel_size) / stride + 1;
+    auto width_out = (width_in + 2 * padding - kernel_size) / stride + 1;
+
+    auto output = torch::zeros({batch_size, channels, depth_out, height_out, width_out}, 
+                               at::device(input.device()).dtype(input.dtype()));
+
+    const int block_size = 256;
+    int total_elements = batch_size * channels * depth_out * height_out * width_out;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    avg_pool_3d_sum_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        channels,
+        depth_in,
+        height_in,
+        width_in,
+        kernel_size,
+        stride,
+        padding,
+        depth_out,
+        height_out,
+        width_out
+    );
+
+    // Check for launch errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA kernel launch failed: ") + cudaGetErrorString(err));
+    }
+
+    return output;
+}
+"""
+
+avg_pool_3d_cpp_source = (
+    "torch::Tensor avg_pool_3d_cuda(torch::Tensor input, int kernel_size, int stride, int padding);"
+)
+
+# Compile the inline CUDA code for 3D Average Pooling
+avg_pool_3d_module = load_inline(
+    name="avg_pool_3d_custom",
+    cpp_sources=avg_pool_3d_cpp_source,
+    cuda_sources=avg_pool_3d_source,
+    functions=["avg_pool_3d_cuda"],
+    verbose=False,
+    extra_cflags=["-O2"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Simple model that performs 3D Average Pooling using a custom CUDA operator.
+    """
+    def __init__(self, kernel_size: int, stride: int = None, padding: int = 0):
+        """
+        Initializes the Average Pooling layer.
+
+        Args:
+            kernel_size (int): Size of the kernel to apply pooling.
+            stride (int, optional): Stride of the pooling operation. Defaults to None, which uses the kernel size.
+            padding (int, optional): Padding to apply before pooling. Defaults to 0.
+        """
+        super(ModelNew, self).__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+        self.padding = padding
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Average Pooling to the input tensor using custom CUDA implementation.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, channels, depth, height, width).
+
+        Returns:
+            torch.Tensor: Output tensor with Average Pooling applied.
+        """
+        return avg_pool_3d_module.avg_pool_3d_cuda(x, self.kernel_size, self.stride, self.padding)

@@ -1,0 +1,27 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 86.998,
+  "eval_result": {
+    "compiled": true,
+    "correctness": true,
+    "metadata": {
+      "correctness_trials": "(5 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090"
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu0_chat/generated_kernels/level_1/problem_1.py",
+  "level": 1,
+  "model_name": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "precision": "fp32",
+  "problem_id": 1,
+  "problem_name": "1_Square_matrix_multiplication_.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu0_chat/raw_generation/level_1/problem_1.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

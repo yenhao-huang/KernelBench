@@ -1,0 +1,161 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel that fuses Linear (MatMul + Bias), Subtraction, Multiplication, and ReLU.
+# This avoids multiple memory reads/writes between operations.
+optimized_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Kernel for fused operation: y = max(0, (x @ W^T + b - subtract) * multiply)
+__global__ void fused_linear_relu_kernel(
+    const float* __restrict__ x,      // Input: [batch, in_features]
+    const float* __restrict__ w,      // Weights: [out_features, in_features] (transposed for efficient access if needed, but here we assume standard layout)
+    const float* __restrict__ b,      // Bias: [out_features]
+    float* __restrict__ out,          // Output: [batch, out_features]
+    int batch_size,
+    int in_features,
+    int out_features,
+    float subtract_value,
+    float multiply_value
+) {
+    // Each thread handles one output element (one neuron for one sample)
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < batch_size * out_features) {
+        int b_idx = idx / out_features;
+        int o_idx = idx % out_features;
+
+        float sum = 0.0f;
+        
+        // Perform dot product for this output neuron
+        // x[b_idx] is row b_idx of input
+        // w[o_idx] is row o_idx of weights (which corresponds to the weights for output neuron o_idx)
+        // Note: In PyTorch nn.Linear, weight shape is [out_features, in_features].
+        // The operation is out = x @ W^T + b. 
+        // So out[b][o] = sum_k(x[b][k] * W[o][k]) + b[o]
+        
+        const float* x_row = x + b_idx * in_features;
+        const float* w_row = w + o_idx * in_features;
+
+        for (int k = 0; k < in_features; ++k) {
+            sum += x_row[k] * w_row[k];
+        }
+
+        // Apply bias, subtract, multiply, and ReLU
+        sum += b[o_idx];
+        sum -= subtract_value;
+        sum *= multiply_value;
+        
+        // ReLU: max(0, sum)
+        if (sum < 0.0f) {
+            sum = 0.0f;
+        }
+
+        out[idx] = sum;
+    }
+}
+
+torch::Tensor fused_linear_relu_cuda(
+    torch::Tensor x,
+    torch::Tensor w,
+    torch::Tensor b,
+    float subtract_value,
+    float multiply_value
+) {
+    TORCH_CHECK(x.is_cuda(), "Input must be on CUDA");
+    TORCH_CHECK(w.is_cuda(), "Weights must be on CUDA");
+    TORCH_CHECK(b.is_cuda(), "Bias must be on CUDA");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "Input must be FP32");
+    TORCH_CHECK(w.scalar_type() == torch::kFloat32, "Weights must be FP32");
+    TORCH_CHECK(b.scalar_type() == torch::kFloat32, "Bias must be FP32");
+
+    int batch_size = x.size(0);
+    int in_features = x.size(1);
+    int out_features = w.size(0);
+
+    auto out = torch::zeros({batch_size, out_features}, x.options());
+
+    const int block_size = 256;
+    int total_elements = batch_size * out_features;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    fused_linear_relu_kernel<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(),
+        w.data_ptr<float>(),
+        b.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        in_features,
+        out_features,
+        subtract_value,
+        multiply_value
+    );
+
+    return out;
+}
+"""
+
+optimized_ops_cpp_source = (
+    "torch::Tensor fused_linear_relu_cuda("
+    "torch::Tensor x,"
+    "torch::Tensor w,"
+    "torch::Tensor b,"
+    "float subtract_value,"
+    "float multiply_value"
+    ");"
+)
+
+# Compile the inline CUDA code
+optimized_ops = load_inline(
+    name="fused_linear_relu",
+    cpp_sources=optimized_ops_cpp_source,
+    cuda_sources=optimized_ops_source,
+    functions=["fused_linear_relu_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using a custom fused CUDA operator for Linear + Subtract + Multiply + ReLU.
+    """
+    def __init__(self, in_features, out_features, subtract_value, multiply_value):
+        super(ModelNew, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.subtract_value = subtract_value
+        self.multiply_value = multiply_value
+        
+        # Initialize weights and bias manually to match nn.Linear behavior
+        # nn.Linear uses Kaiming uniform initialization by default for training, 
+        # but for optimization comparison, we often just need the structure. 
+        # However, to ensure functional equivalence with a standard nn.Linear initialized similarly,
+        # we can use torch.nn.init.kaiming_uniform_ or similar. 
+        # For this specific task, we assume the weights/bias are passed or initialized externally 
+        # if we were comparing against a pre-trained model, but here we create them.
+        # To match nn.Linear default init:
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+        
+        # Initialize weights similar to PyTorch's default Linear init (Kaiming Uniform)
+        nn.init.kaiming_uniform_(self.weight, a=0.0, nonlinearity='linear')
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        # Use the custom fused operator
+        return optimized_ops.fused_linear_relu_cuda(
+            x, 
+            self.weight, 
+            self.bias, 
+            self.subtract_value, 
+            self.multiply_value
+        )
+
+import math

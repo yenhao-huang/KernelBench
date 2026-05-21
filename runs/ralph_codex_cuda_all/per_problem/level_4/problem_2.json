@@ -1,0 +1,28 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 123.127,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "runtime_error": "CUDA out of memory. Tried to allocate 394.00 MiB. GPU 0 has a total capacity of 23.52 GiB of which 4.44 MiB is free. Including non-PyTorch memory, this process has 16.62 GiB memory in use. Of the allocated memory 16.16 GiB is allocated by PyTorch, and 10.34 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)",
+      "runtime_error_name": "torch.OutOfMemoryError"
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_codex_cuda_all/generated_kernels/level_4/problem_2.py",
+  "level": 4,
+  "model_name": "codex-gpt-5.5",
+  "precision": "fp32",
+  "problem_id": 2,
+  "problem_name": "2_facebook-opt-1p3b_bs1_seq2047.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_codex_cuda_all/raw_generation/level_4/problem_2.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

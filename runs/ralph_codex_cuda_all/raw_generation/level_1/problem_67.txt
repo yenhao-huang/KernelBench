@@ -1,0 +1,145 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+conv1d_cpp_source = """
+torch::Tensor conv1d_forward_cuda(torch::Tensor x, torch::Tensor w, c10::optional<torch::Tensor> b,
+                                  int64_t stride, int64_t padding, int64_t dilation, int64_t groups);
+"""
+
+conv1d_cuda_source = """
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+
+__global__ void conv1d_k3s1p0_kernel(const float* __restrict__ x,
+                                      const float* __restrict__ w,
+                                      const float* __restrict__ b,
+                                      float* __restrict__ y,
+                                      int N, int C, int L, int O, int Lo,
+                                      int has_bias) {
+    int l = blockIdx.x * blockDim.x + threadIdx.x;
+    int oc = blockIdx.y;
+    int n = blockIdx.z;
+    if (l >= Lo) return;
+
+    float acc = has_bias ? b[oc] : 0.0f;
+    const float* xn = x + ((long long)n * C * L);
+    const float* wo = w + ((long long)oc * C * 3);
+
+    #pragma unroll 4
+    for (int c = 0; c < C; ++c) {
+        const float* xp = xn + (long long)c * L + l;
+        const float* wp = wo + c * 3;
+        acc = fmaf(xp[0], wp[0], acc);
+        acc = fmaf(xp[1], wp[1], acc);
+        acc = fmaf(xp[2], wp[2], acc);
+    }
+
+    y[((long long)n * O + oc) * Lo + l] = acc;
+}
+
+__global__ void conv1d_generic_kernel(const float* __restrict__ x,
+                                      const float* __restrict__ w,
+                                      const float* __restrict__ b,
+                                      float* __restrict__ y,
+                                      int N, int C, int L, int O, int K, int Lo,
+                                      int stride, int padding, int dilation,
+                                      int groups, int has_bias) {
+    int l = blockIdx.x * blockDim.x + threadIdx.x;
+    int oc = blockIdx.y;
+    int n = blockIdx.z;
+    if (l >= Lo) return;
+
+    int ocpg = O / groups;
+    int icpg = C / groups;
+    int g = oc / ocpg;
+    int ic0 = g * icpg;
+
+    float acc = has_bias ? b[oc] : 0.0f;
+
+    for (int ci = 0; ci < icpg; ++ci) {
+        int c = ic0 + ci;
+        for (int k = 0; k < K; ++k) {
+            int xi = l * stride - padding + k * dilation;
+            if ((unsigned)xi < (unsigned)L) {
+                float xv = x[((long long)n * C + c) * L + xi];
+                float wv = w[((long long)oc * icpg + ci) * K + k];
+                acc = fmaf(xv, wv, acc);
+            }
+        }
+    }
+
+    y[((long long)n * O + oc) * Lo + l] = acc;
+}
+
+torch::Tensor conv1d_forward_cuda(torch::Tensor x, torch::Tensor w, c10::optional<torch::Tensor> b,
+                                  int64_t stride, int64_t padding, int64_t dilation, int64_t groups) {
+    int N = (int)x.size(0);
+    int C = (int)x.size(1);
+    int L = (int)x.size(2);
+    int O = (int)w.size(0);
+    int K = (int)w.size(2);
+    int Lo = (L + 2 * (int)padding - (int)dilation * (K - 1) - 1) / (int)stride + 1;
+
+    auto y = torch::empty({N, O, Lo}, x.options());
+    const float* bp = b.has_value() ? b.value().data_ptr<float>() : nullptr;
+    int has_bias = b.has_value() ? 1 : 0;
+
+    const int threads = 256;
+    dim3 block(threads);
+    dim3 grid((Lo + threads - 1) / threads, O, N);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    if (K == 3 && stride == 1 && padding == 0 && dilation == 1 && groups == 1) {
+        conv1d_k3s1p0_kernel<<<grid, block, 0, stream>>>(
+            x.data_ptr<float>(), w.data_ptr<float>(), bp, y.data_ptr<float>(),
+            N, C, L, O, Lo, has_bias
+        );
+    } else {
+        conv1d_generic_kernel<<<grid, block, 0, stream>>>(
+            x.data_ptr<float>(), w.data_ptr<float>(), bp, y.data_ptr<float>(),
+            N, C, L, O, K, Lo, (int)stride, (int)padding, (int)dilation,
+            (int)groups, has_bias
+        );
+    }
+
+    return y;
+}
+"""
+
+_conv1d_cuda = load_inline(
+    name="kb_conv1d_cuda",
+    cpp_sources=conv1d_cpp_source,
+    cuda_sources=conv1d_cuda_source,
+    functions=["conv1d_forward_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int,
+                 stride: int = 1, padding: int = 0, dilation: int = 1,
+                 groups: int = 1, bias: bool = False):
+        super().__init__()
+        self.conv1d = nn.Conv1d(in_channels, out_channels, kernel_size,
+                                stride=stride, padding=padding, dilation=dilation,
+                                groups=groups, bias=bias)
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _conv1d_cuda.conv1d_forward_cuda(
+            x.contiguous(),
+            self.conv1d.weight.contiguous(),
+            self.conv1d.bias,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+        )
+```

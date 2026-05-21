@@ -1,0 +1,101 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+#define TILE 16
+
+__global__ void upper_tri_matmul_kernel(const float* __restrict__ A,
+                                        const float* __restrict__ B,
+                                        float* __restrict__ C,
+                                        int N) {
+    __shared__ float As[TILE][TILE];
+    __shared__ float Bs[TILE][TILE];
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int col = blockIdx.x * TILE + tx;
+    int row = blockIdx.y * TILE + ty;
+
+    if (row >= N || col >= N) {
+        return;
+    }
+
+    if (col < row) {
+        C[row * N + col] = 0.0f;
+        return;
+    }
+
+    float acc = 0.0f;
+
+    int k_start = (row / TILE) * TILE;
+    int k_end = (col / TILE) * TILE;
+
+    for (int kk = k_start; kk <= k_end; kk += TILE) {
+        int a_col = kk + tx;
+        int b_row = kk + ty;
+
+        float av = 0.0f;
+        float bv = 0.0f;
+
+        if (a_col < N && a_col >= row) {
+            av = A[row * N + a_col];
+        }
+        if (b_row < N && b_row <= col) {
+            bv = B[b_row * N + col];
+        }
+
+        As[ty][tx] = av;
+        Bs[ty][tx] = bv;
+        __syncthreads();
+
+        #pragma unroll
+        for (int k = 0; k < TILE; ++k) {
+            acc += As[ty][k] * Bs[k][tx];
+        }
+
+        __syncthreads();
+    }
+
+    C[row * N + col] = acc;
+}
+
+torch::Tensor upper_tri_matmul_cuda(torch::Tensor A, torch::Tensor B) {
+    int N = A.size(0);
+    auto C = torch::empty_like(A);
+
+    dim3 block(TILE, TILE);
+    dim3 grid((N + TILE - 1) / TILE, (N + TILE - 1) / TILE);
+
+    upper_tri_matmul_kernel<<<grid, block>>>(A.data_ptr<float>(),
+                                             B.data_ptr<float>(),
+                                             C.data_ptr<float>(),
+                                             N);
+    return C;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor upper_tri_matmul_cuda(torch::Tensor A, torch::Tensor B);
+"""
+
+upper_tri_matmul_ext = load_inline(
+    name="upper_tri_matmul_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["upper_tri_matmul_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.upper_tri_matmul_ext = upper_tri_matmul_ext
+
+    def forward(self, A, B):
+        return self.upper_tri_matmul_ext.upper_tri_matmul_cuda(A, B)

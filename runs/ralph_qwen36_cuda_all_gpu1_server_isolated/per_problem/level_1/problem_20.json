@@ -1,0 +1,29 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 38.845,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "runtime_error": "CUDA out of memory. Tried to allocate 1.50 GiB. GPU 0 has a total capacity of 23.52 GiB of which 1.30 GiB is free. Including non-PyTorch memory, this process has 18.44 GiB memory in use. Of the all...",
+      "runtime_error_name": "torch.OutOfMemoryError",
+      "runtime_error_traceback": "Traceback (most recent call last):\n  File \"/workspace/external/KernelBench/src/kernelbench/eval.py\", line 804, in run_and_check_correctness\n    if not torch.allclose(\ntorch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1.50 GiB. GPU 0 has a total capacity of 23.52 GiB of which 1.30 GiB is free. Including non-PyTorch memory, this process has 18.44 GiB memory in use. Of the allocated memory 18.00 GiB is allocated by PyTorch, and 0 bytes is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)\n"
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_1/problem_20.py",
+  "level": 1,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 20,
+  "problem_name": "20_LeakyReLU.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_1/problem_20.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

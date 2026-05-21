@@ -1,0 +1,212 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+import os
+
+# We will replace the core Linear layer (Matmul + Bias Add) with a fused CUDA kernel.
+# This is often the bottleneck in Transformer models.
+# We also replace the Softmax operation used in attention or final projection if applicable, 
+# but for CausalLM logits, it's usually just a linear projection. 
+# However, to demonstrate significant optimization and fusion, we will fuse:
+# 1. Matrix Multiplication (Matmul)
+# 2. Bias Addition
+# into a single kernel.
+
+# Note: For the specific model "google/bigbird-roberta-base", the forward pass involves 
+# embedding lookup, transformer layers (Attention + MLP), and a final Linear layer for logits.
+# Replacing every single operator is complex due to the graph structure. 
+# The most impactful and standard optimization in this context is fusing the Matmul+Add+Bias 
+# in the linear layers, or specifically the final projection if we assume the rest is handled by optimized PyTorch ops (like FlashAttention).
+# However, since we need to provide a self-contained solution that replaces operators in the architecture, 
+# and we cannot easily intercept internal calls of `AutoModelForCausalLM` without monkey-patching or rewriting the whole model,
+# the most robust way to "replace" operators in the given architecture snippet is to assume we are optimizing the 
+# underlying Linear operations. 
+
+# Since we cannot easily inject custom CUDA kernels into the middle of a pre-trained HuggingFace model's internal graph 
+# without significant refactoring (which might break compatibility), we will take a different approach:
+# We will create a custom `FusedLinear` module that replaces the standard `nn.Linear` in a hypothetical optimized wrapper,
+# BUT the prompt asks to optimize the *given* architecture. The given architecture uses `AutoModelForCausalLM`.
+# To truly "replace" operators inside `self.model`, we would need to modify the model's internal layers.
+# Let's assume we can replace the final linear layer and potentially inject fused kernels if we were building from scratch.
+# However, a more practical interpretation for this specific prompt format (which often appears in benchmarks) is that 
+# we should provide a `ModelNew` that mimics the interface but uses custom CUDA ops for the heavy lifting.
+
+# Given the constraint of "replacing pytorch operators in the given architecture", and the fact that `AutoModelForCausalLM` 
+# is a black box, the most feasible optimization that fits the "inline CUDA" pattern while maintaining the exact same 
+# input/output signature and leveraging the pre-trained weights is to replace the **final Linear layer** with a custom fused kernel,
+# OR to assume we are replacing the `nn.Linear` layers inside the model if we were constructing it.
+
+# Let's look at the example again. The example replaces `a + b`.
+# In the provided architecture, `self.model(x).logits` is returned.
+# The logits come from a final Linear layer: `hidden_states @ weight.T + bias`.
+
+# We will create a custom CUDA kernel for Fused Matmul + Bias Add.
+# We will then modify the `ModelNew` to use this custom kernel for the final projection.
+# To do this cleanly, we can replace the `lm_head` (linear layer) of the model with our custom implementation 
+# or simply call the custom kernel directly in the forward pass if we extract the weights.
+
+# However, to be safe and fully functional with the pre-trained weights, we will:
+# 1. Define the fused matmul+bias CUDA kernel.
+# 2. In `ModelNew`, we will load the model as before.
+# 3. We will replace the final linear layer's forward pass logic with our custom CUDA call.
+
+fused_linear_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Kernel for Fused Matmul (A @ B^T) + Bias
+// A: [batch, seq_len, in_features]
+// B: [out_features, in_features] (transposed internally or passed as is)
+// Bias: [out_features]
+// Out: [batch, seq_len, out_features]
+
+__global__ void fused_linear_kernel(
+    const float* __restrict__ input, 
+    const float* __restrict__ weight, 
+    const float* __restrict__ bias, 
+    float* __restrict__ output,
+    int batch_size,
+    int seq_len,
+    int in_features,
+    int out_features) {
+    
+    // Each thread handles one element of the output matrix for a specific (batch, seq) position?
+    // No, that's too many threads. 
+    // Better: Each block computes one row of the output for a specific (batch, seq) pair?
+    // Or each thread computes one output element.
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * seq_len * out_features;
+    
+    if (idx < total_elements) {
+        int bs_idx = idx / (seq_len * out_features);
+        int rem = idx % (seq_len * out_features);
+        int sl_idx = rem / out_features;
+        int of_idx = rem % out_features;
+        
+        float sum = 0.0f;
+        const float* input_row = input + bs_idx * seq_len * in_features + sl_idx * in_features;
+        const float* weight_col = weight + of_idx * in_features; // Weight is [out, in]
+        
+        #pragma unroll
+        for (int i = 0; i < in_features; ++i) {
+            sum += input_row[i] * weight_col[i];
+        }
+        
+        if (bias != nullptr) {
+            sum += bias[of_idx];
+        }
+        
+        output[idx] = sum;
+    }
+}
+
+torch::Tensor fused_linear_cuda(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    torch::Tensor bias) {
+    
+    auto batch_size = input.size(0);
+    auto seq_len = input.size(1);
+    auto in_features = input.size(2);
+    auto out_features = weight.size(0);
+    
+    auto output = torch::zeros({batch_size, seq_len, out_features}, input.options());
+    
+    const int block_size = 256;
+    int total_elements = batch_size * seq_len * out_features;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    // If the number of blocks is too large, we might need a grid-stride loop or multiple passes.
+    // For typical sizes, this should be fine. 
+    // However, for very large sequences, launching millions of blocks can be inefficient.
+    // A better approach for Matmul is using shared memory tiling, but for simplicity and correctness in inline code:
+    
+    if (num_blocks > 65535) {
+        // Fallback to a simpler grid-stride loop within the kernel or use multiple launches?
+        // Let's stick to the simple launch but ensure we handle large grids.
+        // Actually, blockIdx.x can go up to 2^31-1 in modern CUDA, so it's fine.
+    }
+
+    fused_linear_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.numel() > 0 ? bias.data_ptr<float>() : nullptr,
+        output.data_ptr<float>(),
+        batch_size,
+        seq_len,
+        in_features,
+        out_features
+    );
+    
+    return output;
+}
+"""
+
+fused_linear_cpp_source = (
+    "torch::Tensor fused_linear_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias);"
+)
+
+# Compile the inline CUDA code
+fused_linear_lib = load_inline(
+    name="fused_linear",
+    cpp_sources=fused_linear_cpp_source,
+    cuda_sources=fused_linear_source,
+    functions=["fused_linear_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"]
+)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, model_name, config):
+        super().__init__()
+        self.model_name = model_name
+        self.config = config
+        # Load the original model to get weights
+        from transformers import AutoModelForCausalLM, AutoConfig
+        self.base_model = AutoModelForCausalLM.from_pretrained(self.model_name, config=self.config)
+        
+        # We will replace the final linear layer's forward pass.
+        # The logits are generated by: self.lm_head(hidden_states)
+        # In Roberta/Bert based models, this is usually a Linear layer.
+        self.lm_head = self.base_model.lm_head
+        
+        # Store weights and bias for the custom kernel
+        self.register_buffer("lm_weight", self.lm_head.weight.data.clone())
+        self.register_buffer("lm_bias", self.lm_head.bias.data.clone() if self.lm_head.bias is not None else torch.zeros(0))
+
+    def forward(self, x):
+        # Run the base model to get hidden states
+        outputs = self.base_model(x)
+        hidden_states = outputs.last_hidden_state
+        
+        # Apply custom fused linear kernel
+        # hidden_states: [batch, seq_len, hidden_size]
+        # lm_weight: [vocab_size, hidden_size]
+        
+        logits = fused_linear_lib.fused_linear_cuda(
+            hidden_states, 
+            self.lm_weight, 
+            self.lm_bias
+        )
+        
+        return type(outputs)(logits=logits)
+
+def get_inputs():
+    from transformers import AutoConfig
+    model_name = "google/bigbird-roberta-base"
+    config = AutoConfig.from_pretrained(model_name)
+    vocab_size = config.vocab_size
+    sequence_length = 256
+    batch_size = 32
+    inputs = torch.randint(0, vocab_size, (batch_size, sequence_length))
+    return [inputs]
+
+def get_init_inputs():
+    from transformers import AutoConfig
+    model_name = "google/bigbird-roberta-base"
+    config = AutoConfig.from_pretrained(model_name)
+    return [model_name, config]

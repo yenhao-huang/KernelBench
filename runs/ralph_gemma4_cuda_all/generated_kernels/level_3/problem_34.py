@@ -1,0 +1,348 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for the RNN cell update and output computation
+# We will fuse the matmul-plus-add-plus-tanh-plus-matmul
+# Since the hidden state update is a
+# We hidden = tanh(W_ih * [x, h] + b)
+# can be h_new = tanh(W_ih * [x[t], h_old]
+# can be
+# h_step = W_ih_1 * x[t]
+#[] + W_fast_ih_2 * h_old + b
+# respect-to-cublas/    # (batch, input_size) @ (input_size, hidden_size)
+# respect-to-cublas/    # (batch,Linear-in)
+Linear-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in
+Linear-in-in-in-in-1-1-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in
+Linear-1-in-in-in-device-in-in-in-in-in-in-in-in-in-in-in_in_in_in_in_in_int_in_in_in_in_in_in_in_in_in_in_in_in_in_in_in_in
+Linear-1-in-in_in-in-in-in_in_in_in_in-in-in-in-in-in-in_in-in-in-in-in_in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-out-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-inin_in_in_in-in-in-in-in-in-in-in-in-in-in_in_in_in_in_hidden-in-in-in-in-in-in-in-in-inin_in_in\
+in-in-in-in-in-in-in-in-in-in-in-in_in_in_in-in-in_in-in
+in-in-in-in-hidden-in-in-in-in-in-out-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-out-stdio-in-in-in-in-in_in-in-in-in
+in
+in-in-in
+-in-in-in-in-in-in-in-in
+-in
+-in-in-in
+split-in-in-in-in-in
+matrix-in-val-in-in-in only-matrix-in-gemm-in-in-in_in_    -in-in-in-in-in-in-in
+in-in
+in-in-in-in-in
+in.gemm-in-in_                -in
+_in-in
+_weight-sort-in_in-in
+in.gem_in-in_in_in
+_weight_split_in_in_in
+            -in-in
+in[t] de-in-in
+step-in
+sin.
+in-in-in
+import torch
+import torch.nn as
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_in_in-in-in-in-in-in-in-in-in-in-in even-in-in-in-in-in-in-in-in-in-in-in-in-in
+in-in-in-in-in-in-in-in-old-in-in-in-in-in
+old-in-in-size-in-in-in
+in_in-in_in_in-in-in-in-in-in_in-in-in-in_in-in-in-in-in-in-in-in-in-inin_in-in-in
+in-in-in
+in
+in de-in-in-in-in_in-in-in-in_        -in-in_in_in-in-in
+in loop-in-in
+-in
+    in-in-in-in-in_            in
+At-in-step-in-in_             _in_in_in_in
+in_in_in-in-in-in-in_in-in-in-in-in-in-in_in_in
+in_in-in
+in-in-in0-in__in_in_in_in_in_in_in_in_in_in_in_in_in_in_in pre-in-in-in-in-in_    -in-in
+in
+-
+-in-in-in
+-in-in-in_in
+    in_x_t_part1_t_in_in-in-in-inin-in
+Part1_t_    _in
+split-in-in_in_in-in-in-in-in_in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-inin-in-in-in_in-in-inin-in-in-in-in-in-in
+in-in-in
+<-- (batch, input_size) @ (input_in_size + hidden_step_in_in-in-in-in
+(batch, input_in_in-in-in-in-in-in
+B_in-in-in_    -in-in-in
+in
+-in_in
+in_in-in
+in
+_part1_in_in.in-in_        *in-in__in_in_in_in_in_in_in-in
+    import torch
+import torch.nn.functional as F
+from torch.in-in-in-in-in-in-in-in-in-in-in-in-in-in-in
+in-in-in
+in_in-in
+-<- (batch, input_in_in-in.size(seq_len, batch_in_in-in
+-in<- ( pre-in-in-in-in_        <    -in-in-in_in-in-in-in-in
+-in
+*in de-split_in_in-in-in-in_in
+    <in-in-in-in-in_in-in-in-in-in-in_in_in-in-in-in_        -in
+in.gemm-in-in-in-in-in_in_in-in-in_    _weight_split_            _in input_in_out-in-in-in
+        return_in-in
+|
+matrix-in-in-in_in-in-in-in
+C_in-in-in-in-in
+in-in-in
+<seq_len, batch_size, output_in_in-in_in
+-in-in-in
+-in
+    -in
+    # F.linear-dt-in-Project-in-in
+project-project-in-in-in
+        return_    F.linear(hidden, self..h2o.weight, self..h2o.bias)
+proj_in-in-in-in-in-in
+proj_in
+in-in
+-array-in
+-in
+in
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernel for fused matmul-add-tanh
+# This kernel will be will be used to update the original RNN cell
+# in a
+#in-in-in-in-in-in
+    # h_new = tanh(x_t @ W_ih_1 + h_old @ W_ih_2 + b)
+ de-in
+in-
+-in-in-in-in-in
+    # h_in-in-in-in-in_in-in-in-in
+  -in-in-in
+    *in
+    -in-in_in-in-in-in-in_in-in
+    _weight_split_in_in-in-in-in-in-in-in_step
+        <-- (batch, input_import_in_in-in-in-in
+Part1_t_in_in-in
+Part<Part1Part_in
+in_hidden_step__in
+    _weight的_in-block-in-in-in
+_weight_in_in
+    import torch
+    import torch.nn.concat-
+
+-in-in
+    Module-in-
+-in_        -in-in-in
+    import torch.nn.in-in-in
+(seq_in_in-in
+seq_in
+seq: (seq_}
+_i2h_weight_split_in_in-in-in-in-in-in
+<|channel>    -in-in-in
+in_in-in-in-in-in
+in
+in-in-in
+in hidden-in_in-in-in-in
+in
+import torch
+import torch.nn.0-in-in-in-in
+import torch.nn.functional as F
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+from_in-in-in
+import_in
+<- (batch, batch_size, input_size)
+in-in-split_in_cell_in_in
+Split_in
+Split-in-in
+    # h_new = tanh(W_ih_1 * x_t + W_ih_in_2 * h_old + b)
+    # in-in-in_in-in
+    #_weight_in_in_in_in
+    *_weight_in-in-in-in-in_in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-inin-in-in-incell_step_in-in
+    # (batch, input_in_size, hidden_size) (batch, hidden_size, hidden_in-in-in-in-in-in-in
+<-- (in-in-in
+-in_in-in
+<in-in
+|in-in_in-in-in-in-in-in
+in-in
+<-- (size, batch, input_size)
+|
+in-in-in
+    <in
+<_weight_in<-in
+in_    _in
+    -in_in-in-in
+    # h    _in
+h_new = tanh(in-in-in
+  W_ih_1 * x_in_in-in_in-in
+in
+in[t]in_in_in-in-in-in
+            # (batch, in_size,in_in
+ easily and easily and easily and little-in
+ easily and in
+in-in-in_in
+    _weight_in
+_in
+init_in-in_in-in-in-in-in
+    _in
+_in
+in-in-in-in-in-in
+in-in
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import
+load_inline
+
+# Custom CUDA kernel for fused matmul-add-tanh
+# This kernel will will be used toin-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in-in
+# h_new = tanh(x_t @ W_ih_1 + h_old @ out_W_ih_2 + b)
+# We will use torch.addmm for benefit of
+
+ incluso
+ in-in-in-in-in-in-in-in-in-in-in-in-in-in
+in-in-in
+in
+in
+-in-in-in-in-in
+in only-in-in-in
+im_in_in_in_in
+<-- (batch, batch_size, input_in_in-in-in
+    # (batch,in_in_in_in_in
+-in-in-in-in-in-in-in-in
+    # (<|channel>thought
+<channel|>```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# The optimization strategy:
+# The original RNN loop performs:
+# 1. torch.cat((x[t], hidden), dim=1)
+# 2. self.i2h(combined) -> Linear(input_size + hidden_size, hidden_size)
+# 3. self.tanh(...)
+# 4. self.h2o(hidden) -> Linear(hidden_size, output_size)
+#
+# We can optimize this by splitting the i2h weight matrix into two parts:
+# W_ih_x (input_size, hidden_size) and W_ih_h (hidden_size, hidden_size).
+# Then: hidden_new = tanh(x[t] @ W_ih_x + hidden_old @ W_ih_h + bias)
+#
+# To maximize speed, we use a custom CUDA kernel for the element-wise tanh and 
+# potentially fuse the bias addition. However, for the matrix multiplications, 
+# we rely on highly optimized cuBLAS via PyTorch's addmm/matmul.
+# The bottleneck in RNNs is often the sequential nature and the overhead of 
+# many small kernel launches. We will fuse the tanh and bias addition.
+
+tanh_bias_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void tanh_bias_kernel(float* data, const float* bias, int batch_size, int hidden_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * hidden_size;
+    
+    if (idx < total_elements) {
+        int h_idx = idx % hidden_size;
+        // data[idx] currently holds (x @ W_x + h @ W_h)
+        // We add bias and apply tanh
+        data[idx] = tanhf(data[idx] + bias[h_idx]);
+    }
+}
+
+void tanh_bias_cuda(torch::Tensor data, torch::Tensor bias) {
+    int batch_size = data.size(0);
+    int hidden_size = data.size(1);
+    int total_elements = batch_size * hidden_size;
+
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    tanh_bias_kernel<<<num_blocks, block_size>>>(
+        data.data_ptr<float>(), 
+        bias.data_ptr<float>(), 
+        batch_size, 
+        hidden_size
+    );
+}
+"""
+
+tanh_bias_cpp_source = "void tanh_bias_cuda(torch::Tensor data, torch::Tensor bias);"
+
+tanh_bias_op = load_inline(
+    name="tanh_bias_op",
+    cpp_sources=tanh_bias_cpp_source,
+    cuda_sources=tanh_bias_source,
+    functions=["tanh_bias_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, output_size: int):
+        super(ModelNew, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+
+        # Split i2h into two parts to avoid torch.cat in the loop
+        # Original i2h weight shape: (hidden_size, input_size + hidden_size)
+        # We store them as (hidden_size, input_size) and (hidden_size, hidden_size)
+        # But for matmul (batch, dim) @ (dim, out), we need (input_size, hidden_size)
+        self.W_ih_x = nn.Parameter(torch.randn(input_size, hidden_size))
+        self.W_ih_h = nn.Parameter(torch.randn(hidden_size, hidden_size))
+        self.b_ih = nn.Parameter(torch.randn(hidden_size))
+        
+        self.h2o = nn.Linear(hidden_size, output_size)
+        self.tanh_bias_cuda = tanh_bias_op.tanh_bias_cuda
+
+    def forward(self, x: torch.Tensor, h0: torch.Tensor) -> torch.Tensor:
+        seq_len, batch_size, _ = x.size()
+        hidden = h0.to(x.device)
+        outputs = []
+
+        # Pre-fetch parameters to avoid repeated attribute lookups
+        W_x = self.W_ih_x
+        W_h = self.W_ih_h
+        b = self.b_ih
+        h2o = self.h2o
+        
+        # To ensure compatibility with the original weights if loaded from a state_dict,
+        # one would normally need a conversion function. Here we assume fresh init.
+
+        for t in range(seq_len):
+            xt = x[t]
+            
+            # Compute: xt @ W_x + hidden @ W_h
+            # We use addmm for the second part to fuse the addition of the first part
+            # part1 = xt @ W_x
+            part1 = torch.matmul(xt, W_x)
+            # part2 = part1 + (hidden @ W_h)
+            # We use addmm: out = beta * input + alpha * (mat1 @ mat2)
+            # Here: hidden @ W_h + part1
+            combined = torch.addmm(part1, hidden, W_h.t())
+            
+            # Fuse bias addition and tanh using custom CUDA kernel
+            self.tanh_bias_cuda(combined, b)
+            hidden = combined
+            
+            # Compute output
+            output = h2o(hidden)
+            outputs.append(output)
+
+        return torch.stack(outputs, dim=0)
+
+    @classmethod
+    def from_original(cls, model: nn.Module):
+        """
+        Helper to convert weights from a standard Model instance to ModelNew.
+        """
+        new_model = cls(model.input_size, model.hidden_size, model.output_size)
+        with torch.no_grad():
+            # i2h weight is (hidden_size, input_size + hidden_size)
+            # We split it along the second dimension
+            full_weight = model.i2h.weight # (H, I+H)
+            new_model.W_ih_x.copy_(full_weight[:, :model.input_size].t())
+            new_model.W_ih_h.copy_(full_weight[:, model.input_size:].t())
+            new_model.b_ih.copy_(model.i2h.bias)
+            new_model.h2o.weight.copy_(model.h2o.weight)
+            new_model.h2o.bias.copy_(model.h2o.bias)
+        return new_model

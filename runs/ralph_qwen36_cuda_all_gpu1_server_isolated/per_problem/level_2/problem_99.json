@@ -1,0 +1,15 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 35.305,
+  "error": "KernelBench evaluator returned None.",
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_2/problem_99.py",
+  "level": 2,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 99,
+  "problem_name": "99_Matmul_GELU_Softmax.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_2/problem_99.txt",
+  "static_warnings": [],
+  "status": "evaluation_error"
+}

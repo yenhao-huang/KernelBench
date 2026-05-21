@@ -1,0 +1,241 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for Group Normalization
+# This implementation fuses the mean/variance calculation, normalization, and affine transformation
+group_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper to get number of elements per group
+__device__ inline float atomicAddFloat(float* address, float val) {
+    unsigned int* address_as_uint = (unsigned int*)address;
+    unsigned int old = *address_as_uint, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(address_as_uint, assumed, __float_as_int(val + __int_as_float(assumed)));
+    } while (assumed != old);
+    return __int_as_float(old);
+}
+
+__global__ void group_norm_kernel(
+    const float* input,
+    const float* weight,
+    const float* bias,
+    float* output,
+    int batch_size,
+    int num_groups,
+    int channels_per_group,
+    int spatial_size,
+    float eps
+) {
+    // Each thread block handles one group in one sample of the batch
+    // However, to maximize occupancy and handle varying spatial sizes efficiently,
+    // we often assign one thread per element or use a grid-stride loop.
+    // Given the structure of GN, calculating mean/var requires reduction over the group dimension.
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * num_groups * channels_per_group * spatial_size;
+    
+    if (idx >= total_elements) return;
+
+    // Determine which sample, group, and local index this thread corresponds to
+    // Layout: [batch, groups, channels_per_group, spatial] -> flattened
+    // Let's map idx back to coordinates.
+    // Total elements per group = channels_per_group * spatial_size
+    int elements_per_group = channels_per_group * spatial_size;
+    
+    int sample_idx = idx / (num_groups * elements_per_group);
+    int remainder = idx % (num_groups * elements_per_group);
+    int group_idx = remainder / elements_per_group;
+    int local_idx = remainder % elements_per_group;
+
+    // Pointer to the start of this specific group's data in the input tensor
+    const float* group_data = input + (sample_idx * num_groups + group_idx) * elements_per_group;
+
+    // 1. Calculate Mean
+    float sum = 0.0f;
+    for (int i = 0; i < elements_per_group; ++i) {
+        sum += group_data[i];
+    }
+    float mean = sum / elements_per_group;
+
+    // 2. Calculate Variance
+    float var_sum = 0.0f;
+    for (int i = 0; i < elements_per_group; ++i) {
+        float diff = group_data[i] - mean;
+        var_sum += diff * diff;
+    }
+    float variance = var_sum / elements_per_group;
+    
+    // Add epsilon and invert sqrt
+    float inv_std = rsqrtf(variance + eps);
+
+    // 3. Normalize and Apply Affine Transformation
+    // The output index is the same as input index because shape doesn't change
+    float normalized_val = (group_data[local_idx] - mean) * inv_std;
+    
+    // Weight and Bias are applied per channel, not per group element directly in a simple way?
+    // Wait, GroupNorm applies gamma/beta per channel. 
+    // The input tensor shape is [N, C, H, W]. GN divides C into G groups.
+    // Within a group, there are C/G channels.
+    // The affine parameters (weight, bias) have shape [C].
+    // We need to map 'local_idx' back to the specific channel index to fetch weight/bias.
+    
+    // local_idx = c_local * spatial_size + h_w_idx
+    // c_local is the index within the group (0 to channels_per_group - 1)
+    int c_local = local_idx / spatial_size;
+    int global_channel_idx = sample_idx * num_features_placeholder + group_idx * channels_per_group + c_local; 
+    // Note: We don't have num_features directly in kernel args easily without passing it or calculating it.
+    // Let's pass num_features or calculate it from other params.
+    // Actually, we can just pass the weight/bias pointers offset by channel index.
+    
+    // To avoid passing too many args, let's assume we pass the global channel index calculation logic or just pass num_features.
+    // Let's add num_features to the kernel arguments.
+}
+
+// Redefining with necessary parameters passed
+__global__ void group_norm_kernel_v2(
+    const float* input,
+    const float* weight,
+    const float* bias,
+    float* output,
+    int batch_size,
+    int num_groups,
+    int channels_per_group,
+    int spatial_size,
+    int num_features, // Total channels C
+    float eps
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * num_groups * channels_per_group * spatial_size;
+    
+    if (idx >= total_elements) return;
+
+    int elements_per_group = channels_per_group * spatial_size;
+    
+    int sample_idx = idx / (num_groups * elements_per_group);
+    int remainder = idx % (num_groups * elements_per_group);
+    int group_idx = remainder / elements_per_group;
+    int local_idx = remainder % elements_per_group;
+
+    const float* group_data = input + (sample_idx * num_groups + group_idx) * elements_per_group;
+
+    // 1. Calculate Mean
+    float sum = 0.0f;
+    for (int i = 0; i < elements_per_group; ++i) {
+        sum += group_data[i];
+    }
+    float mean = sum / elements_per_group;
+
+    // 2. Calculate Variance
+    float var_sum = 0.0f;
+    for (int i = 0; i < elements_per_group; ++i) {
+        float diff = group_data[i] - mean;
+        var_sum += diff * diff;
+    }
+    float variance = var_sum / elements_per_group;
+    
+    float inv_std = rsqrtf(variance + eps);
+
+    // 3. Normalize and Apply Affine Transformation
+    int c_local = local_idx / spatial_size;
+    int global_channel_idx = sample_idx * num_features + group_idx * channels_per_group + c_local;
+    
+    float normalized_val = (group_data[local_idx] - mean) * inv_std;
+    output[idx] = normalized_val * weight[global_channel_idx] + bias[global_channel_idx];
+}
+
+torch::Tensor group_norm_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, float eps) {
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(weight.is_cuda(), "Weight must be a CUDA tensor");
+    TORCH_CHECK(bias.is_cuda(), "Bias must be a CUDA tensor");
+    
+    auto x = input.contiguous();
+    auto w = weight.contiguous();
+    auto b = bias.contiguous();
+    
+    int batch_size = x.size(0);
+    int num_features = x.size(1);
+    // Calculate spatial size from remaining dimensions
+    int spatial_size = 1;
+    for (int i = 2; i < x.dim(); ++i) {
+        spatial_size *= x.size(i);
+    }
+    
+    int num_groups = x.size(1) / w.size(0); // Assuming num_features == w.size(0)
+    int channels_per_group = num_features / num_groups;
+    
+    auto output = torch::empty_like(x);
+    
+    int elements_per_group = channels_per_group * spatial_size;
+    int total_elements = batch_size * num_groups * elements_per_group;
+    
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    group_norm_kernel_v2<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(),
+        w.data_ptr<float>(),
+        b.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        num_groups,
+        channels_per_group,
+        spatial_size,
+        num_features,
+        eps
+    );
+    
+    return output;
+}
+"""
+
+group_norm_cpp_source = (
+    "torch::Tensor group_norm_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, float eps);"
+)
+
+# Compile the inline CUDA code for Group Normalization
+group_norm = load_inline(
+    name="group_norm",
+    cpp_sources=group_norm_cpp_source,
+    cuda_sources=group_norm_source,
+    functions=["group_norm_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Group Normalization using custom CUDA operators.
+    """
+    def __init__(self, num_features: int, num_groups: int) -> None:
+        super(ModelNew, self).__init__()
+        # Store parameters for the forward pass
+        self.num_features = num_features
+        self.num_groups = num_groups
+        
+        # Initialize learnable parameters
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias = nn.Parameter(torch.zeros(num_features))
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Group Normalization to the input tensor using custom CUDA kernel.
+        """
+        # PyTorch's GroupNorm uses eps=1e-5 by default
+        return group_norm.group_norm_cuda(x, self.weight, self.bias, 1e-5)
+
+
+def get_inputs():
+    x = torch.rand(112, 64, 512, 512).cuda()
+    return [x]
+
+def get_init_inputs():
+    return [64, 8] # num_features, num_groups
+```

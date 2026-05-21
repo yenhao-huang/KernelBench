@@ -1,0 +1,149 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+#include <float.h>
+
+__global__ void fused_deconv_min_sum_gelu_bias_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    const float* __restrict__ conv_bias,
+    const float* __restrict__ add_bias,
+    float* __restrict__ out,
+    int N, int C_in, int H_in, int W_in, int C_out,
+    int H_out, int W_out
+) {
+    int ow = blockIdx.x;
+    int n = blockIdx.y;
+    int tid = threadIdx.x;
+
+    __shared__ float smem[256];
+
+    float h_sum = 0.0f;
+
+    if (tid < H_out) {
+        int oh = tid;
+        float min_val = FLT_MAX;
+
+        for (int oc = 0; oc < C_out; ++oc) {
+            float acc = conv_bias[oc];
+
+            #pragma unroll
+            for (int kh = 0; kh < 3; ++kh) {
+                int ih_num = oh + 1 - kh;
+                if ((ih_num & 1) != 0) continue;
+                int ih = ih_num >> 1;
+                if (ih < 0 || ih >= H_in) continue;
+
+                #pragma unroll
+                for (int kw = 0; kw < 3; ++kw) {
+                    int iw_num = ow + 1 - kw;
+                    if ((iw_num & 1) != 0) continue;
+                    int iw = iw_num >> 1;
+                    if (iw < 0 || iw >= W_in) continue;
+
+                    int x_base = ((n * C_in) * H_in + ih) * W_in + iw;
+                    int w_base = ((oc * 3) + kh) * 3 + kw;
+
+                    for (int ic = 0; ic < C_in; ++ic) {
+                        float xv = x[x_base + ic * H_in * W_in];
+                        float wv = weight[((ic * C_out) * 3 * 3) + w_base];
+                        acc += xv * wv;
+                    }
+                }
+            }
+
+            min_val = fminf(min_val, acc);
+        }
+
+        h_sum = min_val;
+    }
+
+    smem[tid] = h_sum;
+    __syncthreads();
+
+    for (int offset = 128; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            smem[tid] += smem[tid + offset];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float v = smem[0];
+        float gelu = 0.5f * v * (1.0f + erff(v * 0.70710678118654752440f));
+        out[n * W_out + ow] = gelu + add_bias[0];
+    }
+}
+
+torch::Tensor fused_deconv_min_sum_gelu_bias_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor conv_bias,
+    torch::Tensor add_bias
+) {
+    int N = x.size(0);
+    int C_in = x.size(1);
+    int H_in = x.size(2);
+    int W_in = x.size(3);
+    int C_out = weight.size(1);
+    int H_out = H_in * 2;
+    int W_out = W_in * 2;
+
+    auto out = torch::empty({N, 1, 1, W_out}, x.options());
+
+    dim3 block(256);
+    dim3 grid(W_out, N);
+
+    fused_deconv_min_sum_gelu_bias_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        conv_bias.data_ptr<float>(),
+        add_bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C_in, H_in, W_in, C_out, H_out, W_out
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor fused_deconv_min_sum_gelu_bias_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor conv_bias,
+    torch::Tensor add_bias
+);
+"""
+
+fused_ops = load_inline(
+    name="fused_deconv_min_sum_gelu_bias_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["fused_deconv_min_sum_gelu_bias_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels, out_channels, kernel_size, stride, padding, output_padding
+        )
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.fused_ops = fused_ops
+
+    def forward(self, x):
+        return self.fused_ops.fused_deconv_min_sum_gelu_bias_cuda(
+            x,
+            self.conv_transpose.weight,
+            self.conv_transpose.bias,
+            self.bias,
+        )

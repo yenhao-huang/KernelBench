@@ -1,0 +1,45 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 24.013,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "3.957255",
+        "3.957613",
+        "3.956190",
+        "3.957083",
+        "3.956822"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "25.989784",
+        "26.731462",
+        "26.770752",
+        "25.787575",
+        "26.791698"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_gemma4_cuda_all/generated_kernels/level_1/problem_54.py",
+  "level": 1,
+  "model_name": "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
+  "precision": "fp32",
+  "problem_id": 54,
+  "problem_name": "54_conv_standard_3D__square_input__square_kernel.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_gemma4_cuda_all/raw_generation/level_1/problem_54.txt",
+  "static_warnings": [
+    "Uses torch.nn compute layer (only containers, Parameter, init allowed)",
+    "Uses torch.nn.functional op: torch.nn.functional.conv3d"
+  ],
+  "status": "evaluated"
+}

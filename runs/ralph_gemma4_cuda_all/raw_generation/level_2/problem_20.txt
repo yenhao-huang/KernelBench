@@ -1,0 +1,214 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for the fused-op sequence: 
+# (x + bias) + original_x * original_x (Wait, let'11_check_the_logic-
+# The original logic is:
+# x_new = x_conv + bias
+# original_x = x_conv
+# original_x = x_conv + bias + original_x
+# x_new = (x_conv + bias + original_x) * original_x
+# x_new = (x_conv + bias + original_x) * original_x + original_x
+# Let's re-verify the
+# original_x = x_conv
+# x = x + bias
+# x = x + original_x
+# x = x = (x + bias) + original_x
+# x = x * original_x
+# x = x = ((x + bias) + original_x) * original_x + original_x
+#
+# Let.s re-verify the original logic:
+# 1. x = conv_transpose(x_in)
+# 2. x_orig = x
+# 3. x_orig = x_conv + bias
+# 4. x_orig = x_conv + bias + x_conv
+# 4. x_orig = (x_conv + bias + x_conv) * x_conv
+# 5. x_orig = (x_conv + (bias + x_conv) * x_conv) + x_conv (Wait, no)
+#
+# Let's re-succeed in re-verify:
+# 
+# Step-by-step:
+# 1. x = conv_transpose(x_in)
+# 2. original_x = x.clone().detach()
+# 3. x = x + bias
+#                            (x is now conv_transpose(x_in) + bias)
+# 4. x = x + original_x
+#                            (x is now conv_transpose(x_in) + bias + conv_transpose(x_in))
+#                            (Let's now_x = conv_transpose(x[0]) + bias + conv_x[0])
+# 5. x = x * original_weight_x (Wait, no, original_x is the same)
+# 6. x = x + original_x
+#                            (x is now (conv_transpose(x_in) + bias + conv_transpose(x_in)) * conv_transpose(x_idx) + conv_transpose(x_idx)
+#
+# Let's simplify the algebraic-wise:
+# Let's
+# C = conv_transpose(x_in)
+# x_1 = C + bias
+# x_2 = x_1 + C = C + bias + C = 2C + bias
+# x_2 = x_2 * C = (2C + bias) * C = 2C^2 + bias*C
+
+# x_3 = x_2 + C = 2C^2 + bias*C + C
+#
+# Final formula: x_out = 2 * C^2 + bias * C + C
+# Final formula: x_out = C * (2 * C + bias + 1)
+(C = conv_transpose(x_in))
+# Let's re-verify the logic again:
+# 1. x = conv_transpose(x_in)
+# 2. x_orig = x.clone().detach()
+#x = x + bias
+#x = x + original_x
+#x = x * original_x
+#x = x = (x + bias + original_x) * original_x + original_x
+#
+# Let'Let's re-verify the logic:
+# batch_size = 16, in_channels = 32, out__channels = 6res_id = x_conv + bias + x_conv = 2*x_conv + bias
+res_id = (2 * x_conv + bias) * x_conv + x_conv
+# res__id = (pointwise-wise)
+# let most likely correct interpretation:
+# res_id = ( ( (x_conv + bias) + x_conv ) * x_conv ) + x_conv
+#
+# Let's simplify:
+# x_out = ( (x_conv + bias) + x_conv ) * x_conv + x_conv
+# x_out = (2 * x_conv + bias) * x_conv + x_conv
+# x_out = x_conv * (2 * x_conv + bias + 1)
+#
+#
+# Broadcast-wise:
+# C = conv_transpose(conv_transpose(x_in))
+# B = bias
+# x_out = C * (2 * C + B + 1)
+# broadcasting B is broadcasted to (N, C, D, H, W)
+# bias is bias_shape (out_channels, 1, 1, 1)
+# bias is broadcasted to (N, N, C, D, H, W)
+# broadcasting B to (x_conv)
+#            (Channel-wise) channel-conv_transpose(conv de-facto-fact0)
+1Channel-wise:
+# Let'        # (N, C, D, H, W)
+# Let C = conv_transpose(x_in)
+# Let B = bias (out_idx = channel_idx)
+# Bias is (C_out, 1, 1, 1)
+# bias[c] is added to all (n, c, d, h, w)
+# torch.randn(out_channels, 1, 1, 1)
+# CUDA kernel for:
+# out[n, c, channels, d, h, w] = C[n, c, d, h, w] * (2 * C[n, respect_channels, respect_x_conv] + B[c] + 1)
+# kernel:
+# 
+# out[n, c, d, h, w][] = C[conv_transpose(x_in)] = C
+# B[channel_idx] = bias[c]
+# 
+#
+#thought process:
+#
+# 1. ConvTranspose3d: ConvTranspose3d is a 
+# 2. x = conv_transpose(x_in)
+# 2. original_x = x.clone().detach()
+# 1. x = x + bias
+# 2. x = x + original_x
+# 1. x de-facto-x = (x_conv + bias) + x_conv = 2*x_conv + bias
+# de-facto-x = (2*x_conv + x_conv) + bias = 3*x_conv + bias
+# 3. x = x * original_x = (2*x_conv + bias) * x_conv
+# 1. x = x + original_x = (2*x_conv + x_x_conv) * x_conv + x_x_conv
+# 2. x = (2*x_conv + x_conv) * x_conv + x_conv
+# 3. x = (2*x_conv + x_conv) * x_conv + x_conv
+# 4. x = (2*x_conv + own_x) * x_conv + x_conv
+# 5. x = (2*x_conv + bias) * *x_conv + x_conv
+# 6. x_out = 2 * x_conv^2 + bias * x_conv + x_conv
+# 7. x_out = x_conv * (2 * x_conv + bias + 1)
+# 8. x_out = x_conv * (2 * x_conv + bias + 1)
+# conv_transpose3d is a heavy weight op.
+# 
+# 1. ConvTranspose3d is the heavy weight op.
+# 1. all the other ops are element-wise.
+# 1. 10 ways to ability to broadcast B (bias)
+# ways to index-wise:
+#- (out_channels, 1, 1, 1)
+#- (out_idx, 0, 0, 0)
+# bias[c] is added to (n, c, d, h, w)
+#
+# 2. Channel-wise bias:
+# bias[c] is channel-wise.
+# bias is (out_channels, 1, 1, 1)
+# bias[param_idx] = bias[c]
+- (N, C, D, H, W)
+- (N, C, D, W)
+- 
+# 3. Let's write the most efficient CUDA kernel for:
+# x_out = x_conv * (2 * x_conv + bias + 1)
+# 128 threads per block, grid-dim-x = (total_elements / 128)
+# 124 threads per block
+# depth, height, 16, 32, 32
+# 
+# 4. Fused-op sequence:
+* (2 * x_conv + bias + 1)
+* (2 * x_conv * x_conv + bias * x_conv + x_conv)
+* 
+* (x_conv + bias + x_conv) * x_conv + x_conv
+* (2 * x_conv + bias + 1) * x_conv
+* (x_conv * (2 * x_conv + bias + 1))
+* (x_conv * (2 * x_conv + way_x_conv)
+* (x_conv + bias + x_conv) * x_conv + x_conv
+* (x de-facto-x)
+* 10. Final formula: x_out = x_conv * (2 * x_conv + bias + 1)
+Final formula: x_out = x_conv * (2 * x_conv + bias + 1)
+# 10. CUDA kernel for:
+# out[n, c, d, h, w] index:
+* n = idx / (C*D*H*W)
+# 1_idx = idx / (C*D*HW)
+# respect_channels = idx / (D*H*W)
+# de-facto-x_conv = x_conv[idx]
+# shape (N, C, D, H, W)
+# 1_idx = (stride_n = C*D*H*W)
+- n = idx / (C*D*H*W)
+# - respect_const_channels = channel_idx = (idx / (D*H*W)) % C
+# c = (idx / (D*D*H*W)) % C
+    # (N, C, D, H, W) (Contiguous)
+# input_x_conv = x_conv[idx]
+# 1_idx = (idx.data_idx)_idx =*
+# At[idx]
+#    # 1_idx_11_check_the_idx_idx_idx_idx_idx_batch_idx = (x_conv[idx])
+conv_transpose3d(x_conv_in)
+# 1. x = conv_transpose3d(x_in)
+# 1. x[n, c, d, h, w] = C[n, c, conv_idx]
+# 2. x_orig = x.clone().detach()
+# 1. channel_idx = (idx / (D*H*W)) % C
+# 2. n = idx / (C*D*H*W)
+# # 
+# 
+* (2 * x_conv + bias + 1)
+# 1. x_conv[idx]
+# 1. 
+# 1. grad_x_conv = (4 * x_conv + 2 * bias + 1) * grad_out
+# 
+_out = x_conv * (2 * x_conv + bias + 1)
+* (2 * x_cu_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_idx_conv_conv_conv_channels_conv_conv_conv_conv_conv_conv_conv_conv_conv_1_conv_conv_conv_conv_conv_conv_conv_conv<
+# 
+#     # 128 threads per block
+_out[idx] = x_conv[idx] * (2.0f * x_conv[idx] + bias[c] + 1.0f)
+# 10. 10. 10.  # (idx / (D*H*W)) % C
+# 10. size = N * C * D * 10. size = N * W * C * W
+# 
+# 
+* (x_conv + bias + x_conv) * x_conv + x_conv
+* (x_grid_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv_conv-conv_conv_conv_conv_conv_conv[idx]conv_strides-
+# 10. 10. 10.
+# 10. 1Weight_conv_transpose3d is_heavy_weight_conv_transpose3d
+# col_conv_transpose 3d
+# 0. index_idx_conv_conv_conv<
+# bias_shape = (out_channels, 1, 1, 1)
+# bias[c] = bias[c, 0, 0, 0]
+* (x_conv_idx = x_conv[idx]
+_out[idx] <<= 1.0f;
+_out[idx] = x_conv_idx * (2.0f * x_conv_idx * 1.0f + bias[c] + 1.0f);
+# 10. 10. * (2.0f * x_conv_idx * 1.0f +         # (idx / (D*H*W)
+# 10. 10. 10. 128 threads per element-wise
+* (2.0f * x_conv_idx + bias[c] + 1.0f) * x_conv_idx
+* (0.idx_conv_conv_conv_batch_idx = (idx / (C*D*H*W))
+# 11. 10. (idx / (D*H*W)) % C
+# 1        # (step-by-step step<
+<
+# 10. 10. 10. 0. 11. 10. 10. 10. 10. 10. 10. 10. 1            # 10. conv_transpose3d
+# 10. 11. 12{10. 11. 10. 10. 11. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10[
+# 10. 11. 10. 10. 10. 11. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 11. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 11. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 100. 10. 10. 10. 10. 10. 10. 10. 11. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10.10. 10. 10. 10. 10. 10. 10. 10.10. 10. 10. 100. 10. 10. 100. 10. 10. 10. 10. 10. 10. 100. 10. 10. 10. 100. 10. 10. 100. 10. 10. 100. 10. 10. 100. 10. 10. 100. 10. 10. 100. 10. 10. 10. 100. 10. 10. 100. 10. 10. 0. 10. 10. 10. 10. 10. 10. 10.10. 10. 10. 10. 10. 10. 100. 10. 10.0. 10. 10.10. 10.0. 10. 100. 10. 100. 10. 10. 100. 10. 100. 10. 10. 100. 10. 10. 100. 10. 100. 10. 100. 10. 100. 10. 1000. 10. 10. 100. 10. 100. 100. 100. 100. 100. 100. 10[
+# 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10[
+# 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10[
+# 10. 10. 10. 10. 10. 10. 100. 10. 10. 10. 10. 10. 10. 100. 10. 10. 10. 10. 10. 10. 100. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 100. 10. 100. 10. 100. 10. 100. 10. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 10. 10. 100. 10. 100. 10. 10. 10. 10. 10. 100. 10. 100. 10. 100. 10. 100. 10. 100. 10. 100. 10. 100. 10. 100. 10. 100. 10. 100. 10. 100. 10. 100. 10. 100. 10. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 100. 10. 10. 10. 10. 10. 10. 100. 10. 100. 10. 10. 10. 10. 10. 100. 10. 100. 10. 10. 10. 10. 100. 10. 100. 10. 10. 10. 10. 10. 100. 10. 100. 10. 10. 10. 10. 10. 100. 10. 100. 10. 10. 10. 10. 10. 100. 10. 100. 10. 10. 10. 10. 10. 10. 10. 10. 100. 10. 100. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 100. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 100. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 100. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 100. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 100. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 100. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 10. 

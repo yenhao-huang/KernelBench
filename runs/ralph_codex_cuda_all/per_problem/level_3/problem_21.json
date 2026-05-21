@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 148.595,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "0.786940",
+        "0.786867",
+        "0.786928",
+        "0.786847",
+        "0.786870"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "5.454406",
+        "6.062438",
+        "5.628694",
+        "5.587235",
+        "5.505147"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_codex_cuda_all/generated_kernels/level_3/problem_21.py",
+  "level": 3,
+  "model_name": "codex-gpt-5.5",
+  "precision": "fp32",
+  "problem_id": 21,
+  "problem_name": "21_EfficientNetMBConv.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_codex_cuda_all/raw_generation/level_3/problem_21.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

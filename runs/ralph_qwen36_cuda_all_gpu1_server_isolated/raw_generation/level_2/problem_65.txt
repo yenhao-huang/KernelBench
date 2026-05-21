@@ -1,0 +1,282 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for the fused operation: Conv2d -> AvgPool2d -> Sigmoid -> Sum
+# This kernel performs the entire pipeline in a single pass to minimize memory bandwidth usage.
+fused_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper for 2D convolution with padding and dilation=1, stride=1
+// We assume standard valid or same padding logic handled by the caller or implicit in geometry.
+// However, to keep it generic and correct for nn.Conv2d, we will implement a standard im2col-like 
+// or direct convolution kernel. Given the constraints of inline code, a direct 3x3 conv is efficient.
+
+__device__ float sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+__global__ void fused_conv_pool_sigmoid_sum_kernel(
+    const float* __restrict__ input,      // [N, C_in, H, W]
+    const float* __restrict__ weight,     // [C_out, C_in, K, K]
+    const float* __restrict__ bias,       // [C_out]
+    float* __restrict__ output,           // [N, C_out] (summed result)
+    int N, int C_in, int C_out, int H, int W, int K, int P_H, int P_W, int S_H, int S_W
+) {
+    // Each thread block handles one sample in the batch and potentially multiple output channels?
+    // Or simpler: One thread per (N, C_out) pair to compute the final sum.
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C_out;
+    
+    if (idx >= total_elements) return;
+    
+    int n = idx / C_out;
+    int c_out = idx % C_out;
+    
+    // Calculate input spatial dimensions after padding
+    // nn.Conv2d default padding is 0. Let's assume padding=0 for simplicity unless specified.
+    // The prompt doesn't specify padding, so we assume default (0).
+    // Output height/width of conv: H_out = H - K + 1, W_out = W - K + 1
+    
+    int H_in = H;
+    int W_in = W;
+    int H_conv_out = H_in - K + 1;
+    int W_conv_out = W_in - K + 1;
+    
+    // AvgPool parameters
+    // pool_kernel_size is passed as K_pool? No, we need to pass it. 
+    // Let's assume pool_kernel_size is a constant or passed via args. 
+    // For this kernel signature, let's add pool size.
+    // Actually, let's redefine the kernel signature to include pool parameters.
+}
+
+// Redefining with explicit pool parameters
+__global__ void fused_conv_pool_sigmoid_sum_kernel_v2(
+    const float* __restrict__ input,      // [N, C_in, H, W]
+    const float* __restrict__ weight,     // [C_out, C_in, K, K]
+    const float* __restrict__ bias,       // [C_out]
+    float* __restrict__ output,           // [N, C_out] (summed result)
+    int N, int C_in, int C_out, int H, int W, int K, 
+    int P_H, int P_W, int S_H, int S_W, // Conv params (assuming stride 1, padding 0 for now)
+    int pool_k, int pool_s                 // Pool kernel size and stride
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C_out;
+    
+    if (idx >= total_elements) return;
+    
+    int n = idx / C_out;
+    int c_out = idx % C_out;
+    
+    // Conv Output Dimensions
+    int H_conv_out = (H + 2 * P_H - K) / S_H + 1;
+    int W_conv_out = (W + 2 * P_W - K) / S_W + 1;
+    
+    // Pool Output Dimensions
+    int H_pool_out = (H_conv_out + 2 * 0 - pool_k) / pool_s + 1; // Assuming padding 0 for AvgPool
+    int W_pool_out = (W_conv_out + 2 * 0 - pool_k) / pool_s + 1;
+    
+    float sum_val = 0.0f;
+    
+    // Iterate over all spatial positions in the pooled output feature map
+    for (int ph = 0; ph < H_pool_out; ++ph) {
+        for (int pw = 0; pw < W_pool_out; ++pw) {
+            
+            // Calculate the corresponding region in the conv output space
+            int h_start_conv = ph * pool_s;
+            int w_start_conv = pw * pool_s;
+            
+            // Sum over the pooling window in the conv output space
+            float pool_sum = 0.0f;
+            int count = 0;
+            
+            for (int kh = 0; kh < pool_k; ++kh) {
+                for (int kw = 0; kw < pool_k; ++kw) {
+                    int h_conv = h_start_conv + kh;
+                    int w_conv = w_start_conv + kw;
+                    
+                    if (h_conv < H_conv_out && w_conv < W_conv_out) {
+                        // Compute the value at this conv output position for channel c_out
+                        float val = 0.0f;
+                        
+                        // Perform Convolution for this specific pixel and channel
+                        int h_in_start = h_conv; // Assuming padding 0
+                        int w_in_start = w_conv;
+                        
+                        for (int ci = 0; ci < C_in; ++ci) {
+                            for (int ki = 0; ki < K; ++ki) {
+                                for (int kj = 0; kj < K; ++kj) {
+                                    int h_in = h_in_start + ki;
+                                    int w_in = w_in_start + kj;
+                                    
+                                    if (h_in >= 0 && h_in < H && w_in >= 0 && w_in < W) {
+                                        // Weight index: [c_out, ci, ki, kj]
+                                        float w_val = weight[c_out * C_in * K * K + ci * K * K + ki * K + kj];
+                                        // Input index: [n, ci, h_in, w_in]
+                                        float x_val = input[n * C_in * H * W + ci * H * W + h_in * W + w_in];
+                                        val += w_val * x_val;
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Add bias
+                        val += bias[c_out];
+                        
+                        // Apply Sigmoid
+                        val = sigmoid(val);
+                        
+                        pool_sum += val;
+                        count++;
+                    }
+                }
+            }
+            
+            // Average Pooling
+            if (count > 0) {
+                pool_sum /= count;
+            }
+            
+            sum_val += pool_sum;
+        }
+    }
+    
+    output[idx] = sum_val;
+}
+
+torch::Tensor fused_conv_pool_sigmoid_sum_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int kernel_size,
+    int padding_h,
+    int padding_w,
+    int stride_h,
+    int stride_w,
+    int pool_kernel_size,
+    int pool_stride
+) {
+    auto N = input.size(0);
+    auto C_in = input.size(1);
+    auto H = input.size(2);
+    auto W = input.size(3);
+    
+    auto C_out = weight.size(0);
+    
+    // Output tensor: [N, C_out]
+    auto output = torch::zeros({N, C_out}, input.options());
+    
+    const int block_size = 256;
+    const int total_elements = N * C_out;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    fused_conv_pool_sigmoid_sum_kernel_v2<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        N, C_in, C_out, H, W, kernel_size,
+        padding_h, padding_w, stride_h, stride_w,
+        pool_kernel_size, pool_stride
+    );
+    
+    return output;
+}
+"""
+
+fused_ops_cpp_source = (
+    "torch::Tensor fused_conv_pool_sigmoid_sum_cuda("
+    "torch::Tensor input,"
+    "torch::Tensor weight,"
+    "torch::Tensor bias,"
+    "int kernel_size,"
+    "int padding_h,"
+    "int padding_w,"
+    "int stride_h,"
+    "int stride_w,"
+    "int pool_kernel_size,"
+    "int pool_stride"
+    ");"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_source,
+    functions=["fused_conv_pool_sigmoid_sum_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using a custom fused CUDA operator.
+    Combines Conv2d, AvgPool2d, Sigmoid, and Sum into a single kernel launch.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        # Store parameters for the forward pass
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.pool_kernel_size = pool_kernel_size
+        
+        # Initialize weights and biases manually to match nn.Conv2d behavior
+        # nn.Conv2d uses Kaiming uniform initialization by default for conv layers
+        self.weight = nn.Parameter(torch.empty(out_channels, in_channels, kernel_size, kernel_size))
+        self.bias = nn.Parameter(torch.empty(out_channels))
+        
+        # Initialize weights using Kaiming Uniform (default for Conv2d)
+        nn.init.kaiming_uniform_(self.weight, a=0.0)
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        # Extract dimensions
+        N, C_in, H, W = x.shape
+        
+        # Default Conv2d parameters in PyTorch: stride=1, padding=0
+        stride_h = 1
+        stride_w = 1
+        padding_h = 0
+        padding_w = 0
+        
+        # Default AvgPool2d parameters: stride=None (defaults to kernel_size), padding=0
+        pool_stride = self.pool_kernel_size
+        
+        # Call the custom fused CUDA operator
+        out = fused_ops.fused_conv_pool_sigmoid_sum_cuda(
+            x,
+            self.weight,
+            self.bias,
+            self.kernel_size,
+            padding_h,
+            padding_w,
+            stride_h,
+            stride_w,
+            self.pool_kernel_size,
+            pool_stride
+        )
+        
+        return out
+
+import math
+
+# Re-define get_inputs and get_init_inputs to match the required interface if needed, 
+# but the prompt asks for ModelNew code. The example included them, so I will include them 
+# to ensure the "output architecture" is complete and runnable in the same context.
+
+def get_inputs():
+    return [torch.rand(128, 8, 384, 384)]
+
+def get_init_inputs():
+    return [8, 64, 3, 4]
+```

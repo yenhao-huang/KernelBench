@@ -1,0 +1,173 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for 2D Average Pooling
+avg_pool_2d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+__global__ void avg_pool_2d_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int batch_size,
+    int channels,
+    int in_height,
+    int in_width,
+    int out_height,
+    int out_width,
+    int kernel_size,
+    int stride,
+    int padding) {
+    
+    // Calculate global thread index
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Total number of elements to process: batch * channels * out_height * out_width
+    int total_elements = batch_size * channels * out_height * out_width;
+    
+    if (idx >= total_elements) {
+        return;
+    }
+    
+    // Decompose linear index into dimensions
+    int temp = idx;
+    int w_idx = temp % out_width;
+    temp /= out_width;
+    int h_idx = temp % out_height;
+    temp /= out_height;
+    int c_idx = temp % channels;
+    int b_idx = temp / channels;
+    
+    // Calculate the starting position in the input tensor for this output element
+    // Input layout: [N, C, H, W]
+    // Output layout: [N, C, H', W']
+    
+    int in_h_start = h_idx * stride - padding;
+    int in_w_start = w_idx * stride - padding;
+    
+    float sum = 0.0f;
+    int count = 0;
+    
+    // Iterate over the kernel window
+    for (int kh = 0; kh < kernel_size; ++kh) {
+        int in_h = in_h_start + kh;
+        if (in_h < 0 || in_h >= in_height) continue;
+        
+        for (int kw = 0; kw < kernel_size; ++kw) {
+            int in_w = in_w_start + kw;
+            if (in_w < 0 || in_w >= in_width) continue;
+            
+            // Access input tensor: [N, C, H, W]
+            int input_idx = ((b_idx * channels + c_idx) * in_height + in_h) * in_width + in_w;
+            sum += input[input_idx];
+            count++;
+        }
+    }
+    
+    // Calculate output index
+    int output_idx = ((b_idx * channels + c_idx) * out_height + h_idx) * out_width + w_idx;
+    
+    if (count > 0) {
+        output[output_idx] = sum / count;
+    } else {
+        output[output_idx] = 0.0f;
+    }
+}
+
+torch::Tensor avg_pool_2d_cuda(
+    torch::Tensor input,
+    int kernel_size,
+    int stride,
+    int padding) {
+    
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(input.dim() == 4, "Input must be a 4D tensor [N, C, H, W]");
+    
+    auto batch_size = input.size(0);
+    auto channels = input.size(1);
+    auto in_height = input.size(2);
+    auto in_width = input.size(3);
+    
+    // Calculate output dimensions
+    int out_height = (in_height + 2 * padding - kernel_size) / stride + 1;
+    int out_width = (in_width + 2 * padding - kernel_size) / stride + 1;
+    
+    TORCH_CHECK(out_height > 0 && out_width > 0, "Output dimensions must be positive");
+
+    auto output = torch::zeros({batch_size, channels, out_height, out_width}, input.options());
+    
+    const int block_size = 256;
+    int total_elements = batch_size * channels * out_height * out_width;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    avg_pool_2d_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        channels,
+        in_height,
+        in_width,
+        out_height,
+        out_width,
+        kernel_size,
+        stride,
+        padding
+    );
+    
+    // Check for launch errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA kernel launch failed: ") + cudaGetErrorString(err));
+    }
+    
+    return output;
+}
+"""
+
+avg_pool_2d_cpp_source = (
+    "torch::Tensor avg_pool_2d_cuda(torch::Tensor input, int kernel_size, int stride, int padding);"
+)
+
+# Compile the inline CUDA code for 2D Average Pooling
+avg_pool_2d_module = load_inline(
+    name="avg_pool_2d_cuda",
+    cpp_sources=avg_pool_2d_cpp_source,
+    cuda_sources=avg_pool_2d_source,
+    functions=["avg_pool_2d_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs 2D Average Pooling using a custom CUDA operator.
+    """
+    def __init__(self, kernel_size: int, stride: int = None, padding: int = 0):
+        """
+        Initializes the Average Pooling layer with custom CUDA implementation.
+
+        Args:
+            kernel_size (int): Size of the pooling window.
+            stride (int, optional): Stride of the pooling operation. Defaults to None (same as kernel_size).
+            padding (int, optional): Padding applied to the input tensor. Defaults to 0.
+        """
+        super(ModelNew, self).__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+        self.padding = padding
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies 2D Average Pooling to the input tensor using custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, channels, height, width).
+
+        Returns:
+            torch.Tensor: Output tensor with Average Pooling applied.
+        """
+        return avg_pool_2d_module.avg_pool_2d_cuda(x, self.kernel_size, self.stride, self.padding)

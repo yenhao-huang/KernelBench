@@ -1,0 +1,2193 @@
+{
+    "5": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_issue": "Output shape mismatch: Expected torch.Size([32, 64, 513, 513]), got torch.Size([32, 64, 512, 512])",
+                "correctness_issue_name": "correctness_issue"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "6": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 2.49,
+            "runtime_stats": {
+                "mean": 2.49,
+                "std": 0.084,
+                "min": 2.41,
+                "max": 2.6,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "7": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 9.01,
+            "runtime_stats": {
+                "mean": 9.01,
+                "std": 0.0684,
+                "min": 8.98,
+                "max": 9.24,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "8": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 8.43,
+            "runtime_stats": {
+                "mean": 8.43,
+                "std": 0.0616,
+                "min": 8.39,
+                "max": 8.63,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "9": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 36.8,
+            "runtime_stats": {
+                "mean": 36.8,
+                "std": 0.0176,
+                "min": 36.8,
+                "max": 36.9,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "10": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 21.0,
+            "runtime_stats": {
+                "mean": 21.0,
+                "std": 0.0614,
+                "min": 20.9,
+                "max": 21.4,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "11": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "4.353149",
+                    "4.372564",
+                    "4.358785",
+                    "4.350707",
+                    "4.374363"
+                ],
+                "avg_difference": [
+                    "0.806997",
+                    "0.807006",
+                    "0.806785",
+                    "0.807042",
+                    "0.807007"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "12": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 37.5,
+            "runtime_stats": {
+                "mean": 37.5,
+                "std": 0.017,
+                "min": 37.4,
+                "max": 37.5,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "13": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.137676",
+                    "0.137048",
+                    "0.138090",
+                    "0.138062",
+                    "0.139269"
+                ],
+                "avg_difference": [
+                    "0.000493",
+                    "0.000502",
+                    "0.000500",
+                    "0.000505",
+                    "0.000497"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "14": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.018311",
+                    "0.018799",
+                    "0.020691",
+                    "0.023254",
+                    "0.020264"
+                ],
+                "avg_difference": [
+                    "0.004603",
+                    "0.004604",
+                    "0.004636",
+                    "0.004522",
+                    "0.004683"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "15": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 7.75,
+            "runtime_stats": {
+                "mean": 7.75,
+                "std": 0.0247,
+                "min": 7.72,
+                "max": 7.98,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "16": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 20.7,
+            "runtime_stats": {
+                "mean": 20.7,
+                "std": 5.72,
+                "min": 20.0,
+                "max": 77.5,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "17": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 10.6,
+            "runtime_stats": {
+                "mean": 10.6,
+                "std": 0.113,
+                "min": 10.5,
+                "max": 11.0,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "18": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 1.03,
+            "runtime_stats": {
+                "mean": 1.03,
+                "std": 0.0086,
+                "min": 1.01,
+                "max": 1.05,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "19": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 286.0,
+            "runtime_stats": {
+                "mean": 286.0,
+                "std": 1.12,
+                "min": 281.0,
+                "max": 288.0,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "20": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 82.7,
+            "runtime_stats": {
+                "mean": 82.7,
+                "std": 0.0436,
+                "min": 82.6,
+                "max": 82.8,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "21": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 9.0,
+            "runtime_stats": {
+                "mean": 9.0,
+                "std": 0.15,
+                "min": 8.91,
+                "max": 9.47,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "22": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 36.0,
+            "runtime_stats": {
+                "mean": 36.0,
+                "std": 0.026,
+                "min": 36.0,
+                "max": 36.1,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "23": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 77.0,
+            "runtime_stats": {
+                "mean": 77.0,
+                "std": 0.0303,
+                "min": 76.9,
+                "max": 77.1,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "24": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 1.78,
+            "runtime_stats": {
+                "mean": 1.78,
+                "std": 0.0394,
+                "min": 1.72,
+                "max": 1.82,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "25": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 13.6,
+            "runtime_stats": {
+                "mean": 13.6,
+                "std": 0.0768,
+                "min": 13.6,
+                "max": 14.3,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "26": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 64.5,
+            "runtime_stats": {
+                "mean": 64.5,
+                "std": 0.13,
+                "min": 64.4,
+                "max": 65.8,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "27": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 14.3,
+            "runtime_stats": {
+                "mean": 14.3,
+                "std": 0.256,
+                "min": 13.9,
+                "max": 14.6,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "28": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 36.1,
+            "runtime_stats": {
+                "mean": 36.1,
+                "std": 0.0343,
+                "min": 36.0,
+                "max": 36.2,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "29": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 36.3,
+            "runtime_stats": {
+                "mean": 36.3,
+                "std": 0.0176,
+                "min": 36.2,
+                "max": 36.3,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "30": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 36.0,
+            "runtime_stats": {
+                "mean": 36.0,
+                "std": 0.0314,
+                "min": 35.9,
+                "max": 36.1,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "31": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.001116",
+                    "0.001099",
+                    "0.001130",
+                    "0.001139",
+                    "0.001135"
+                ],
+                "avg_difference": [
+                    "0.000140",
+                    "0.000140",
+                    "0.000140",
+                    "0.000140",
+                    "0.000140"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "32": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.000827",
+                    "0.000889",
+                    "0.000880",
+                    "0.000876",
+                    "0.000865"
+                ],
+                "avg_difference": [
+                    "0.000138",
+                    "0.000137",
+                    "0.000137",
+                    "0.000137",
+                    "0.000138"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "33": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 36.1,
+            "runtime_stats": {
+                "mean": 36.1,
+                "std": 0.0322,
+                "min": 36.0,
+                "max": 36.2,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "34": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 41.6,
+            "runtime_stats": {
+                "mean": 41.6,
+                "std": 0.119,
+                "min": 41.5,
+                "max": 42.7,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "35": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 8.82,
+            "runtime_stats": {
+                "mean": 8.82,
+                "std": 0.261,
+                "min": 8.75,
+                "max": 11.1,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "36": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 248.0,
+            "runtime_stats": {
+                "mean": 248.0,
+                "std": 0.689,
+                "min": 246.0,
+                "max": 250.0,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "37": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "builtins.RuntimeError",
+                "compilation_error": "Error building extension 'kb_fused_linear_swish_bias_groupnorm_fp32': [1/3] c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=kb_fused_linear_swish_bias_groupnorm_fp32 -DTORCH_API_INCLUDE_EXTENSION_H -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/include -isystem /home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -fPIC -std=c++17 -c /workspace/external/KernelBench/cache/codex_gpt55_retime_l2/37/0/kb_fused_linear_swish_bias_groupnorm_fp32/main.cpp -o main.o \n[2/3] /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=kb_fused_linear_swish_bias_groupnorm_fp32 -DTORCH_API_INCLUDE_EXTENSION_H -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/include -isystem /home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 --compiler-options '-fPIC' -O3 --use_fast_math -std=c++17 -c /workspace/external/KernelBench/cache/codex_gpt55_retime_l2/37/0/kb_fused_linear_swish_bias_groupnorm_fp32/cuda.cu -o cuda.cuda.o \nFAILED: [code=255] cuda.cuda.o \n/workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=kb_fused_linear_swish_bias_groupnorm_fp32 -DTORCH_API_INCLUDE_EXTENSION_H -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/include -isystem /home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 --compiler-options '-fPIC' -O3 --use_fast_math -std=c++17 -c /workspace/external/KernelBench/cache/codex_gpt55_retime_l2/37/0/kb_fused_linear_swish_bias_groupnorm_fp32/cuda.cu -o cuda.cuda.o \nptxas error   : Entry function '_Z40fused_linear_swish_bias_groupnorm_kernelPKfS0_S0_S0_S0_S0_Pfiiii' uses too much shared data (0x10108 bytes, 0xc000 max)\nninja: build stopped: subcommand failed.\n"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "38": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 24.0,
+            "runtime_stats": {
+                "mean": 24.0,
+                "std": 0.165,
+                "min": 23.9,
+                "max": 25.0,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "39": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "130.637650",
+                    "130.563278",
+                    "130.426392",
+                    "130.633224",
+                    "130.326584"
+                ],
+                "avg_difference": [
+                    "0.824674",
+                    "0.828925",
+                    "0.825574",
+                    "0.827134",
+                    "0.829333"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "40": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 133.0,
+            "runtime_stats": {
+                "mean": 133.0,
+                "std": 0.182,
+                "min": 132.0,
+                "max": 133.0,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "41": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "5.059337",
+                    "5.065406",
+                    "4.817122",
+                    "5.130314",
+                    "5.077822"
+                ],
+                "avg_difference": [
+                    "0.309541",
+                    "0.309544",
+                    "0.309543",
+                    "0.309524",
+                    "0.309536"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "42": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)",
+                "excessive_speedup": true
+            },
+            "runtime": 1.29,
+            "runtime_stats": {
+                "mean": 1.29,
+                "std": 0.0487,
+                "min": 1.26,
+                "max": 1.4,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "43": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 6.01,
+            "runtime_stats": {
+                "mean": 6.01,
+                "std": 0.0508,
+                "min": 5.98,
+                "max": 6.19,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "44": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 7.01,
+            "runtime_stats": {
+                "mean": 7.01,
+                "std": 0.142,
+                "min": 6.94,
+                "max": 7.57,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "45": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 430.0,
+            "runtime_stats": {
+                "mean": 430.0,
+                "std": 0.687,
+                "min": 429.0,
+                "max": 432.0,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "46": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.000340",
+                    "0.000340",
+                    "0.000335",
+                    "0.000360",
+                    "0.000343"
+                ],
+                "avg_difference": [
+                    "0.000044",
+                    "0.000044",
+                    "0.000044",
+                    "0.000044",
+                    "0.000044"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "47": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 5.37,
+            "runtime_stats": {
+                "mean": 5.37,
+                "std": 0.0772,
+                "min": 5.33,
+                "max": 5.67,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "48": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 5.72,
+            "runtime_stats": {
+                "mean": 5.72,
+                "std": 0.145,
+                "min": 5.65,
+                "max": 7.04,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "49": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.001390"
+                ],
+                "avg_difference": [
+                    "0.000000"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(4 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "50": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 12.3,
+            "runtime_stats": {
+                "mean": 12.3,
+                "std": 0.0141,
+                "min": 12.2,
+                "max": 12.3,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "51": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 1.1,
+            "runtime_stats": {
+                "mean": 1.1,
+                "std": 0.00991,
+                "min": 1.08,
+                "max": 1.13,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "52": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 7.32,
+            "runtime_stats": {
+                "mean": 7.32,
+                "std": 0.207,
+                "min": 7.25,
+                "max": 9.17,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "53": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 112.0,
+            "runtime_stats": {
+                "mean": 112.0,
+                "std": 0.069,
+                "min": 112.0,
+                "max": 112.0,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "54": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.000849",
+                    "0.000780",
+                    "0.000768",
+                    "0.000782",
+                    "0.000804"
+                ],
+                "avg_difference": [
+                    "0.000024",
+                    "0.000024",
+                    "0.000024",
+                    "0.000024",
+                    "0.000024"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "55": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 573.0,
+            "runtime_stats": {
+                "mean": 573.0,
+                "std": 0.00371,
+                "min": 573.0,
+                "max": 573.0,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "56": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 573.0,
+            "runtime_stats": {
+                "mean": 573.0,
+                "std": 0.00381,
+                "min": 573.0,
+                "max": 573.0,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "57": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "cuda_error": "CUDA Error: CUDA error: an illegal memory access was encountered\nSearch for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n",
+                "cuda_error_name": "torch.AcceleratorError",
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "58": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 20.2,
+            "runtime_stats": {
+                "mean": 20.2,
+                "std": 0.0599,
+                "min": 20.2,
+                "max": 20.8,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "59": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 406.0,
+            "runtime_stats": {
+                "mean": 406.0,
+                "std": 0.0619,
+                "min": 406.0,
+                "max": 406.0,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "60": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 18.7,
+            "runtime_stats": {
+                "mean": 18.7,
+                "std": 0.199,
+                "min": 18.6,
+                "max": 20.7,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "61": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 5.75,
+            "runtime_stats": {
+                "mean": 5.75,
+                "std": 0.163,
+                "min": 5.68,
+                "max": 7.03,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "62": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 36.2,
+            "runtime_stats": {
+                "mean": 36.2,
+                "std": 0.0306,
+                "min": 36.2,
+                "max": 36.3,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "63": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 56.8,
+            "runtime_stats": {
+                "mean": 56.8,
+                "std": 0.00943,
+                "min": 56.8,
+                "max": 56.9,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "64": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 36.0,
+            "runtime_stats": {
+                "mean": 36.0,
+                "std": 0.0282,
+                "min": 35.9,
+                "max": 36.1,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "65": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 26.4,
+            "runtime_stats": {
+                "mean": 26.4,
+                "std": 0.0332,
+                "min": 26.4,
+                "max": 26.6,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "66": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.999966",
+                    "0.999977",
+                    "0.999974",
+                    "0.999978",
+                    "0.999973"
+                ],
+                "avg_difference": [
+                    "0.000070",
+                    "0.000070",
+                    "0.000070",
+                    "0.000070",
+                    "0.000070"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "67": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 16.1,
+            "runtime_stats": {
+                "mean": 16.1,
+                "std": 0.343,
+                "min": 15.7,
+                "max": 16.7,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "68": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 30.8,
+            "runtime_stats": {
+                "mean": 30.8,
+                "std": 0.0176,
+                "min": 30.8,
+                "max": 30.8,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "69": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 3.62,
+            "runtime_stats": {
+                "mean": 3.62,
+                "std": 0.171,
+                "min": 3.52,
+                "max": 4.94,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "70": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 28.9,
+            "runtime_stats": {
+                "mean": 28.9,
+                "std": 0.059,
+                "min": 28.7,
+                "max": 29.0,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "71": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 5.71,
+            "runtime_stats": {
+                "mean": 5.71,
+                "std": 0.142,
+                "min": 5.66,
+                "max": 7.03,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "72": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.492769",
+                    "0.453001",
+                    "0.455475",
+                    "0.491379",
+                    "0.451376"
+                ],
+                "avg_difference": [
+                    "0.052123",
+                    "0.052214",
+                    "0.052214",
+                    "0.052186",
+                    "0.052301"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "73": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "10.510287",
+                    "10.216706",
+                    "10.087121",
+                    "9.799793",
+                    "10.140302"
+                ],
+                "avg_difference": [
+                    "1.424503",
+                    "1.424612",
+                    "1.424524",
+                    "1.424542",
+                    "1.424462"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "74": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 5.05,
+            "runtime_stats": {
+                "mean": 5.05,
+                "std": 0.0993,
+                "min": 4.96,
+                "max": 5.24,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "75": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 36.1,
+            "runtime_stats": {
+                "mean": 36.1,
+                "std": 0.0286,
+                "min": 36.0,
+                "max": 36.1,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "76": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 39.3,
+            "runtime_stats": {
+                "mean": 39.3,
+                "std": 0.0102,
+                "min": 39.3,
+                "max": 39.3,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "77": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.849895",
+                    "0.849833",
+                    "0.850125",
+                    "0.850686",
+                    "0.849866"
+                ],
+                "avg_difference": [
+                    "0.218342",
+                    "0.218385",
+                    "0.218234",
+                    "0.218310",
+                    "0.218341"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "78": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.004966",
+                    "0.004967",
+                    "0.004967",
+                    "0.004966",
+                    "0.004966"
+                ],
+                "avg_difference": [
+                    "0.004959",
+                    "0.004959",
+                    "0.004959",
+                    "0.004959",
+                    "0.004959"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "79": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 1.32,
+            "runtime_stats": {
+                "mean": 1.32,
+                "std": 0.00203,
+                "min": 1.32,
+                "max": 1.33,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "80": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)",
+                "excessive_speedup": true
+            },
+            "runtime": 0.00269,
+            "runtime_stats": {
+                "mean": 0.00269,
+                "std": 0.000589,
+                "min": 0.00205,
+                "max": 0.00512,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "81": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 36.1,
+            "runtime_stats": {
+                "mean": 36.1,
+                "std": 0.0275,
+                "min": 36.0,
+                "max": 36.1,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "82": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 28.9,
+            "runtime_stats": {
+                "mean": 28.9,
+                "std": 0.291,
+                "min": 28.6,
+                "max": 30.6,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "83": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)",
+                "excessive_speedup": true
+            },
+            "runtime": 0.482,
+            "runtime_stats": {
+                "mean": 0.482,
+                "std": 0.13,
+                "min": 0.457,
+                "max": 1.77,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "84": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.999045",
+                    "0.999962",
+                    "0.999948",
+                    "0.999360",
+                    "0.999708"
+                ],
+                "avg_difference": [
+                    "0.000110",
+                    "0.000111",
+                    "0.000110",
+                    "0.000110",
+                    "0.000109"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "85": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 4.81,
+            "runtime_stats": {
+                "mean": 4.81,
+                "std": 0.11,
+                "min": 4.72,
+                "max": 5.05,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "86": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 37.4,
+            "runtime_stats": {
+                "mean": 37.4,
+                "std": 0.0123,
+                "min": 37.4,
+                "max": 37.4,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "87": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 25.0,
+            "runtime_stats": {
+                "mean": 25.0,
+                "std": 0.423,
+                "min": 24.4,
+                "max": 25.6,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "88": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 36.3,
+            "runtime_stats": {
+                "mean": 36.3,
+                "std": 0.0335,
+                "min": 36.2,
+                "max": 36.4,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "89": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 12.7,
+            "runtime_stats": {
+                "mean": 12.7,
+                "std": 0.0229,
+                "min": 12.7,
+                "max": 12.8,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "90": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 16.9,
+            "runtime_stats": {
+                "mean": 16.9,
+                "std": 0.134,
+                "min": 16.8,
+                "max": 17.4,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "91": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.001500",
+                    "0.001813",
+                    "0.001218",
+                    "0.001576",
+                    "0.001649"
+                ],
+                "avg_difference": [
+                    "0.000000",
+                    "0.000000",
+                    "0.000000",
+                    "0.000000",
+                    "0.000000"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "92": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 4.76,
+            "runtime_stats": {
+                "mean": 4.76,
+                "std": 0.0751,
+                "min": 4.72,
+                "max": 5.08,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "93": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.000105",
+                    "0.000105"
+                ],
+                "avg_difference": [
+                    "0.000000",
+                    "0.000000"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(3 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "94": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 36.3,
+            "runtime_stats": {
+                "mean": 36.3,
+                "std": 0.029,
+                "min": 36.2,
+                "max": 36.4,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "95": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 23.7,
+            "runtime_stats": {
+                "mean": 23.7,
+                "std": 0.0234,
+                "min": 23.6,
+                "max": 23.7,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "96": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 12.7,
+            "runtime_stats": {
+                "mean": 12.7,
+                "std": 0.0158,
+                "min": 12.7,
+                "max": 12.8,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "97": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 37.9,
+            "runtime_stats": {
+                "mean": 37.9,
+                "std": 0.0319,
+                "min": 37.8,
+                "max": 38.1,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "98": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "1.101793",
+                    "1.163759",
+                    "1.203238",
+                    "1.292872",
+                    "1.145361"
+                ],
+                "avg_difference": [
+                    "0.537648",
+                    "0.521789",
+                    "0.554992",
+                    "0.535002",
+                    "0.541623"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "99": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 36.4,
+            "runtime_stats": {
+                "mean": 36.4,
+                "std": 0.0257,
+                "min": 36.3,
+                "max": 36.5,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ]
+}

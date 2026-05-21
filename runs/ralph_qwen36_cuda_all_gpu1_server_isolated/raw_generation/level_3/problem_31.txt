@@ -1,0 +1,586 @@
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernels for fused operations to replace standard PyTorch ops
+# We will fuse: Linear Projection (Q, K, V), Scaled Dot-Product Attention, Output Projection, LayerNorm, and Add.
+# However, to keep it manageable and effective, we will focus on the core bottleneck: 
+# The Multihead Attention mechanism itself, specifically replacing the internal matmuls and softmax with a fused kernel.
+
+custom_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper for atomic max (not strictly needed here but good practice)
+#define WARP_SIZE 32
+
+__device__ float warpReduceMax(float val) {
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+    }
+    return val;
+}
+
+__device__ float warpReduceSum(float val) {
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+// Kernel for Fused Multi-Head Attention
+// Inputs: 
+//   q: (seq_len, batch, num_heads, head_dim)
+//   k: (seq_len, batch, num_heads, head_dim)
+//   v: (seq_len, batch, num_heads, head_dim)
+// Output:
+//   out: (seq_len, batch, num_heads * head_dim)
+__global__ void fused_mha_kernel(
+    const float* __restrict__ q, 
+    const float* __restrict__ k, 
+    const float* __restrict__ v, 
+    float* __restrict__ out,
+    int seq_len,
+    int batch_size,
+    int num_heads,
+    int head_dim
+) {
+    // Each thread block handles one (batch, head) pair
+    int batch_idx = blockIdx.y;
+    int head_idx = blockIdx.x;
+    
+    if (batch_idx >= batch_size || head_idx >= num_heads) return;
+
+    int total_seq = seq_len;
+    int dim = head_dim;
+    
+    // Shared memory for K and V tiles to optimize global memory access
+    // We use a tile size that fits in shared memory. 
+    // Let's assume head_dim is small (e.g., 32, 64). 
+    // We can load chunks of K and V into shared memory.
+    
+    extern __shared__ float sdata[];
+    
+    // Layout in shared memory:
+    // s_k: [tile_size][head_dim]
+    // s_v: [tile_size][head_dim]
+    // We'll use a simple tiling strategy where threads load elements.
+    
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    
+    // Calculate base pointers for this batch/head
+    const float* q_ptr = q + (batch_idx * num_heads + head_idx) * total_seq * dim;
+    const float* k_ptr = k + (batch_idx * num_heads + head_idx) * total_seq * dim;
+    const float* v_ptr = v + (batch_idx * num_heads + head_idx) * total_seq * dim;
+    
+    // Output pointer
+    float* out_ptr = out + (batch_idx * num_heads + head_idx) * total_seq * dim;
+
+    // We will process the sequence dimension. 
+    // To optimize, we can have each thread compute one output element (one position in seq_len).
+    // But for attention, we need to reduce over the key dimension and then softmax over seq_len.
+    
+    // Strategy: Each thread computes the attention score for one query position against all keys.
+    // This requires loading all K into shared memory or accessing it repeatedly. 
+    // Given seq_len=128*128=16384, we cannot fit all K in shared memory if head_dim is large.
+    // However, 16384 * 64 bytes = ~1MB, which is too big for shared mem (usually 48-96KB).
+    
+    // Alternative Strategy: 
+    // Use a grid-stride loop or tile the sequence dimension if possible.
+    // Or, simpler: Since we want speedup, let's use a standard optimized approach:
+    // Each thread block handles one query position? No, that's inefficient for large seq_len.
+    
+    // Let's try a different mapping: 
+    // Block dim: (head_dim, 1) ? No.
+    // Let's stick to: Block = (batch, head). Threads = seq_len * head_dim? Too many threads.
+    
+    // Better approach for large seq_len:
+    // Use a 2D grid or 1D grid with stride.
+    // Let's map each thread to one element of the output tensor (seq_len * batch * num_heads * head_dim).
+    // Total elements = seq_len * batch * num_heads * head_dim.
+    
+    int total_elements = seq_len * batch_size * num_heads * dim;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= total_elements) return;
+    
+    // Decode index to (seq, batch, head, dim)
+    int d_idx = idx % dim;
+    int temp = idx / dim;
+    int h_idx = temp % num_heads;
+    temp /= num_heads;
+    int b_idx = temp % batch_size;
+    int s_idx = temp / batch_size; // This is seq_len index
+    
+    // Load Query element
+    float q_val = q_ptr[s_idx * dim + d_idx];
+    
+    // Compute attention scores for this query against all keys
+    // We need to sum over the sequence dimension for softmax denominator
+    float max_score = -1e9;
+    float sum_scores = 0.0f;
+    
+    // To avoid loading K repeatedly from global memory, we can't easily tile without shared mem complexity.
+    // However, for speedup, we can at least optimize the matmul part if we were doing linear layers.
+    // Here, let's just implement a highly optimized standard attention kernel that minimizes overhead.
+    
+    // Actually, for 16k seq_len, the bottleneck is memory bandwidth. 
+    // Let's use a simple but efficient loop.
+    
+    for (int i = 0; i < total_seq; ++i) {
+        float k_val = k_ptr[i * dim + d_idx];
+        float score = q_val * k_val;
+        
+        // We need to accumulate scores for softmax. 
+        // Doing this in a loop per thread is slow due to global memory access.
+    }
+    
+    // Let's restart with a more standard "FlashAttention-lite" or tiled approach if possible, 
+    // but given constraints, let's use a simpler optimization:
+    // Replace the explicit matmuls and softmax with a custom kernel that does it in one pass per block.
+    
+    // Re-mapping: Each thread block computes one row of the attention matrix (one query position).
+    // Block size = head_dim. Grid = (seq_len * batch * num_heads, 1, 1).
+    // This is feasible if seq_len*batch*num_heads is not too huge. 
+    // 16384 * 2 * 4 = 131072 blocks. This is fine.
+    
+    // Let's use this mapping:
+    // blockIdx.x -> index in (seq, batch, head) space
+    // threadIdx.x -> index in head_dim space
+    
+    int total_qkv_pairs = seq_len * batch_size * num_heads;
+    int q_idx = blockIdx.x;
+    
+    if (q_idx >= total_qkv_pairs) return;
+    
+    int s_idx_new = q_idx / (batch_size * num_heads);
+    int temp_new = q_idx % (batch_size * num_heads);
+    int b_idx_new = temp_new / num_heads;
+    int h_idx_new = temp_new % num_heads;
+    
+    const float* q_row_ptr = q + (b_idx_new * num_heads + h_idx_new) * total_seq * dim + s_idx_new * dim;
+    const float* k_ptr_base = k + (b_idx_new * num_heads + h_idx_new) * total_seq * dim;
+    const float* v_ptr_base = v + (b_idx_new * num_heads + h_idx_new) * total_seq * dim;
+    
+    // Shared memory for scores and values
+    // We need to store scores for all keys to do softmax. 
+    // seq_len=16384 is too big for shared mem per block if we store floats.
+    // 16384 * 4 bytes = 64KB. This fits in 96KB shared memory!
+    
+    extern __shared__ float s_scores[];
+    extern __shared__ float s_v_tile[]; // Not needed if we accumulate directly
+    
+    // Actually, let's just use global memory for scores but optimize the access pattern?
+    // No, let's try to fit scores in shared memory.
+    
+    // If seq_len is large, we might need two-pass softmax.
+    // Pass 1: Find max and sum exp(score - max)
+    // Pass 2: Compute weights and accumulate V
+    
+    // Let's assume head_dim is small enough that we can load the query into registers.
+    
+    float q_vals[64]; // Assume head_dim <= 64 for simplicity, or use dynamic allocation if needed. 
+                      // For this example, let's assume head_dim is a multiple of 32 and <= 64.
+                      // If head_dim > 64, this code needs adjustment. 
+                      // Given embed_dim=128, num_heads=4 -> head_dim=32. Perfect.
+    
+    for (int i = 0; i < dim; ++i) {
+        q_vals[i] = q_row_ptr[i];
+    }
+    
+    // Load K into shared memory? 
+    // If we load all K into shared memory, we can do fast dot products.
+    // But we have many threads (dim=32). Each thread loads one element of Q and contributes to computing scores against all K.
+    
+    // Let's use a simple approach: 
+    // Each thread computes the score for its dimension part? No.
+    
+    // Standard optimized pattern:
+    // 1. Load Q into registers (done).
+    // 2. Loop over K sequence positions.
+    //    For each K position, load all head_dim elements from global memory.
+    //    Compute dot product with Q.
+    //    Store score in shared memory array s_scores[i].
+    
+    // This is memory bound but simple.
+    
+    float local_max = -1e9;
+    
+    for (int i = 0; i < total_seq; ++i) {
+        float dot = 0.0f;
+        const float* k_row_ptr = k_ptr_base + i * dim;
+        
+        // Unroll or loop for dot product
+        for (int j = 0; j < dim; ++j) {
+            dot += q_vals[j] * k_row_ptr[j];
+        }
+        
+        // Scale by sqrt(head_dim)
+        dot /= sqrtf((float)dim);
+        
+        s_scores[i] = dot;
+        
+        if (dot > local_max) {
+            local_max = dot;
+        }
+    }
+    
+    __syncthreads();
+    
+    // Parallel reduction to find max in shared memory
+    for (int stride = total_seq / 2; stride > 0; stride /= 2) {
+        if (threadIdx.x < stride) {
+            s_scores[threadIdx.x] = fmaxf(s_scores[threadIdx.x], s_scores[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    
+    float global_max = s_scores[0];
+    __syncthreads();
+    
+    // Compute exp(score - max) and sum
+    float local_sum = 0.0f;
+    for (int i = 0; i < total_seq; ++i) {
+        float exp_val = expf(s_scores[i] - global_max);
+        s_scores[i] = exp_val; // Store normalized weights temporarily? No, store exp values.
+        local_sum += exp_val;
+    }
+    
+    __syncthreads();
+    
+    // Parallel reduction to find sum in shared memory
+    for (int stride = total_seq / 2; stride > 0; stride /= 2) {
+        if (threadIdx.x < stride) {
+            s_scores[threadIdx.x] += s_scores[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    
+    float global_sum = s_scores[0];
+    __syncthreads();
+    
+    // Compute output: sum(exp(score - max) / sum * V)
+    float out_vals[64] = {0.0f};
+    
+    for (int i = 0; i < total_seq; ++i) {
+        float weight = s_scores[i] / global_sum;
+        const float* v_row_ptr = v_ptr_base + i * dim;
+        
+        for (int j = 0; j < dim; ++j) {
+            out_vals[j] += weight * v_row_ptr[j];
+        }
+    }
+    
+    // Write output
+    float* out_row_ptr = out_ptr + s_idx_new * dim;
+    for (int j = 0; j < dim; ++j) {
+        out_row_ptr[j] = out_vals[j];
+    }
+}
+
+torch::Tensor fused_mha_cuda(
+    torch::Tensor q, 
+    torch::Tensor k, 
+    torch::Tensor v
+) {
+    // Inputs shape: (seq_len, batch, num_heads * head_dim)
+    // We need to reshape them to (seq_len, batch, num_heads, head_dim) for the kernel
+    
+    auto seq_len = q.size(0);
+    auto batch_size = q.size(1);
+    auto embed_dim = q.size(2);
+    
+    int num_heads;
+    int head_dim;
+    
+    // Determine heads and dim. 
+    // The input to this function will be pre-split or we split it inside.
+    // Let's assume the caller passes Q, K, V already shaped as (seq_len, batch, num_heads * head_dim)
+    // We need to know num_heads. Let's pass it as an argument or infer from a standard config.
+    // For this example, let's assume we pass num_heads as a separate arg or hardcode logic.
+    // To make the API clean, let's add num_heads to the function signature.
+    
+    return q; // Placeholder
+}
+
+// Wrapper function that handles reshaping and calls the kernel
+torch::Tensor fused_mha_wrapper(
+    torch::Tensor x_q, 
+    torch::Tensor x_k, 
+    torch::Tensor x_v, 
+    int num_heads
+) {
+    auto seq_len = x_q.size(0);
+    auto batch_size = x_q.size(1);
+    auto embed_dim = x_q.size(2);
+    
+    TORCH_CHECK(x_k.size(0) == seq_len && x_k.size(1) == batch_size && x_k.size(2) == embed_dim, "K shape mismatch");
+    TORCH_CHECK(x_v.size(0) == seq_len && x_v.size(1) == batch_size && x_v.size(2) == embed_dim, "V shape mismatch");
+    
+    head_dim = embed_dim / num_heads;
+    
+    auto q = x_q.reshape({seq_len, batch_size, num_heads, head_dim}).transpose(0, 1).contiguous(); // (batch, seq, heads, dim) -> wait, standard is (seq, batch, heads, dim) for some implementations.
+    // Let's stick to the kernel expectation: (seq, batch, heads, dim)
+    
+    q = x_q.reshape({seq_len, batch_size, num_heads, head_dim}).transpose(1, 2).contiguous(); // (seq, heads, batch, dim) ? No.
+    
+    // Let's reshape to (seq_len, batch * num_heads, head_dim) for the kernel if we want to simplify grid mapping.
+    // Or just use the complex grid mapping above.
+    
+    // Reshape to (seq_len, batch, num_heads, head_dim)
+    auto q_reshaped = x_q.reshape({seq_len, batch_size, num_heads, head_dim});
+    auto k_reshaped = x_k.reshape({seq_len, batch_size, num_heads, head_dim});
+    auto v_reshaped = x_v.reshape({seq_len, batch_size, num_heads, head_dim});
+    
+    // Make contiguous in the order (seq, batch, heads, dim)
+    q_reshaped = q_reshaped.contiguous();
+    k_reshaped = k_reshaped.contiguous();
+    v_reshaped = v_reshaped.contiguous();
+    
+    auto out = torch::zeros_like(q_reshaped);
+    
+    int total_qkv_pairs = seq_len * batch_size * num_heads;
+    int threads_per_block = head_dim; // Use head_dim threads per block
+    
+    // Ensure we have enough threads
+    if (threads_per_block > 1024) threads_per_block = 1024;
+    
+    const int block_size = threads_per_block;
+    const int grid_size = total_qkv_pairs;
+    
+    // Shared memory size: seq_len * sizeof(float) for scores
+    // This can be large. For seq_len=16384, that's 64KB.
+    // We need to pass shared mem size dynamically or use extern __shared__.
+    
+    fused_mha_kernel<<<grid_size, block_size, seq_len * sizeof(float)>>>(
+        q_reshaped.data_ptr<float>(),
+        k_reshaped.data_ptr<float>(),
+        v_reshaped.data_ptr<float>(),
+        out.data_ptr<float>(),
+        seq_len,
+        batch_size,
+        num_heads,
+        head_dim
+    );
+    
+    // Reshape output back to (seq_len, batch, embed_dim)
+    out = out.reshape({seq_len, batch_size, embed_dim});
+    
+    return out;
+}
+
+// LayerNorm Kernel
+__global__ void layer_norm_kernel(
+    const float* __restrict__ input, 
+    float* __restrict__ output, 
+    const float* __restrict__ weight, 
+    const float* __restrict__ bias, 
+    int size, 
+    int channels
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    
+    // Each block handles one sample (one row of the matrix input[size/channels][channels])
+    // But here we assume input is flattened. We need to know which sample we are on.
+    // Let's assume each thread block processes one sample.
+    
+    int sample_idx = blockIdx.x;
+    int num_samples = size / channels;
+    
+    if (sample_idx >= num_samples) return;
+    
+    const float* sample_ptr = input + sample_idx * channels;
+    float* out_sample_ptr = output + sample_idx * channels;
+    
+    // Compute mean
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < channels; i += blockDim.x) {
+        sum += sample_ptr[i];
+    }
+    
+    // Block reduction for sum
+    extern __shared__ float sdata[];
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (threadIdx.x < stride) {
+            sdata[threadIdx.x] += sdata[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    
+    float mean = sdata[0] / channels;
+    
+    // Compute variance
+    sum = 0.0f;
+    for (int i = threadIdx.x; i < channels; i += blockDim.x) {
+        float diff = sample_ptr[i] - mean;
+        sum += diff * diff;
+    }
+    
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (threadIdx.x < stride) {
+            sdata[threadIdx.x] += sdata[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    
+    float var = sdata[0] / channels;
+    float inv_std = rsqrtf(var + 1e-5);
+    
+    // Normalize and apply weight/bias
+    for (int i = threadIdx.x; i < channels; i += blockDim.x) {
+        float val = (sample_ptr[i] - mean) * inv_std;
+        if (weight != nullptr) {
+            val = val * weight[i];
+        }
+        if (bias != nullptr) {
+            val = val + bias[i];
+        }
+        out_sample_ptr[i] = val;
+    }
+}
+
+torch::Tensor layer_norm_cuda(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    torch::Tensor bias
+) {
+    auto size = input.numel();
+    auto channels = input.size(-1);
+    auto num_samples = size / channels;
+    
+    auto output = torch::zeros_like(input);
+    
+    const int block_size = 256; // Or channels if smaller? Usually 256 or 512 is good.
+    // If channels > block_size, we need grid-stride loop in the kernel. 
+    // The kernel above uses grid-stride for the inner loop over channels.
+    
+    layer_norm_kernel<<<num_samples, block_size, block_size * sizeof(float)>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        size,
+        channels
+    );
+    
+    return output;
+}
+
+// Add Kernel
+__global__ void add_kernel(const float* a, const float* b, float* out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        out[idx] = a[idx] + b[idx];
+    }
+}
+
+torch::Tensor add_cuda(torch::Tensor a, torch::Tensor b) {
+    auto size = a.numel();
+    auto out = torch::zeros_like(a);
+    
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+    
+    add_kernel<<<num_blocks, block_size>>>(a.data_ptr<float>(), b.data_ptr<float>(), out.data_ptr<float>(), size);
+    
+    return out;
+}
+
+"""
+
+custom_cpp_source = """
+torch::Tensor fused_mha_wrapper(torch::Tensor x_q, torch::Tensor x_k, torch::Tensor x_v, int num_heads);
+torch::Tensor layer_norm_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias);
+torch::Tensor add_cuda(torch::Tensor a, torch::Tensor b);
+"""
+
+# Compile the inline CUDA code
+custom_ops = load_inline(
+    name="custom_ops",
+    cpp_sources=custom_cpp_source,
+    cuda_sources=custom_cuda_source,
+    functions=["fused_mha_wrapper", "layer_norm_cuda", "add_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, embed_dim, num_heads) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        
+        # Standard Linear layers for Q, K, V projections and Output projection
+        self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        
+        # LayerNorm parameters
+        self.norm_weight = nn.Parameter(torch.ones(embed_dim))
+        self.norm_bias = nn.Parameter(torch.zeros(embed_dim))
+        
+        self.custom_ops = custom_ops
+
+    def forward(self, x):
+        """
+        Forward pass of the AttentionBlock.
+        :param x: Input tensor of shape (B, C, H, W)
+        :return: Output tensor of the same shape (B, C, H, W)
+        """
+        B, C, H, W = x.shape
+        
+        # Reshape to (seq_len, batch, embed_dim)
+        x_flat = x.view(B, C, H * W).permute(2, 0, 1)  # (seq_len, batch, embed_dim)
+        
+        seq_len = x_flat.size(0)
+        batch_size = x_flat.size(1)
+        
+        # Project Q, K, V
+        qkv = self.qkv_proj(x_flat)  # (seq_len, batch, 3 * embed_dim)
+        
+        # Split into Q, K, V
+        # qkv shape: (seq_len, batch, num_heads * 3 * head_dim)
+        # We need to reshape to (seq_len, batch, num_heads, 3 * head_dim) then split
+        head_dim = self.embed_dim // self.num_heads
+        
+        qkv_reshaped = qkv.view(seq_len, batch_size, self.num_heads, 3 * head_dim)
+        
+        # Split the last dimension into Q, K, V
+        q = qkv_reshaped[:, :, :, :head_dim]      # (seq_len, batch, num_heads, head_dim)
+        k = qkv_reshaped[:, :, :, head_dim:2*head_dim] # (seq_len, batch, num_heads, head_dim)
+        v = qkv_reshaped[:, :, :, 2*head_dim:]    # (seq_len, batch, num_heads, head_dim)
+        
+        # Apply Fused Multi-Head Attention
+        attn_output = self.custom_ops.fused_mha_wrapper(q, k, v, self.num_heads)
+        # attn_output shape: (seq_len, batch, embed_dim)
+        
+        # Output Projection
+        attn_output = self.out_proj(attn_output)
+        
+        # Residual Connection and LayerNorm using custom CUDA ops
+        # x_flat is the original input (seq_len, batch, embed_dim)
+        residual = x_flat
+        
+        # Add
+        added = self.custom_ops.add_cuda(attn_output, residual)
+        
+        # LayerNorm
+        normed = self.custom_ops.layer_norm_cuda(added, self.norm_weight, self.norm_bias)
+        
+        # Reshape back to (B, C, H, W)
+        x_out = normed.permute(1, 2, 0).view(B, C, H, W)
+        
+        return x_out
+```

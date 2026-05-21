@@ -1,0 +1,122 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+#define BM 8
+#define BN 32
+#define BK 32
+
+__global__ void linear_min_sub_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    const float* __restrict__ cptr,
+    float* __restrict__ out,
+    int M,
+    int K,
+    int N
+) {
+    __shared__ float As[BM][BK];
+    __shared__ float Bs[BN][BK];
+
+    int tx = threadIdx.x;
+    int row_local = tx / BN;
+    int col_local = tx % BN;
+
+    int row = blockIdx.y * BM + row_local;
+    int col = blockIdx.x * BN + col_local;
+
+    float acc = 0.0f;
+
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        int a_index = tx;
+        while (a_index < BM * BK) {
+            int ar = a_index / BK;
+            int ak = a_index % BK;
+            int gr = blockIdx.y * BM + ar;
+            int gk = k0 + ak;
+            As[ar][ak] = (gr < M && gk < K) ? x[gr * K + gk] : 0.0f;
+            a_index += blockDim.x;
+        }
+
+        int b_index = tx;
+        while (b_index < BN * BK) {
+            int bc = b_index / BK;
+            int bk = b_index % BK;
+            int gc = blockIdx.x * BN + bc;
+            int gk = k0 + bk;
+            Bs[bc][bk] = (gc < N && gk < K) ? w[gc * K + gk] : 0.0f;
+            b_index += blockDim.x;
+        }
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int kk = 0; kk < BK; ++kk) {
+            acc += As[row_local][kk] * Bs[col_local][kk];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        float constant = cptr[0];
+        float v = acc + b[col];
+        v = fminf(v, constant) - constant;
+        out[row * N + col] = v;
+    }
+}
+
+torch::Tensor linear_min_sub_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, torch::Tensor constant) {
+    int M = (int)x.size(0);
+    int K = (int)x.size(1);
+    int N = (int)weight.size(0);
+
+    auto out = torch::empty({M, N}, x.options());
+
+    dim3 block(BM * BN);
+    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+
+    linear_min_sub_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        constant.data_ptr<float>(),
+        out.data_ptr<float>(),
+        M,
+        K,
+        N
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor linear_min_sub_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, torch::Tensor constant);
+"""
+
+linear_min_sub_ext = load_inline(
+    name="linear_min_sub_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["linear_min_sub_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, constant):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.constant = nn.Parameter(torch.tensor(constant, dtype=torch.float32))
+        self.op = linear_min_sub_ext
+
+    def forward(self, x):
+        return self.op.linear_min_sub_cuda(x, self.linear.weight, self.linear.bias, self.constant)

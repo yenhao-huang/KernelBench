@@ -1,0 +1,323 @@
+<|channel>thought
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernel to fuse: division, max pooling, global average pooling, bias addition, and summation.
+# Note: Conv3d is a heavy operation and is best left to cuDNN. 
+# We will fuse the element-wise division, the pooling, and the reduction steps.
+# However, since MaxPool3d and AdaptiveAvgPool3d are complex, a more effective fusion 
+# for a custom kernel is to fuse the division, the bias addition, and the final summation 
+# after the pooling operations have been performed by highly optimized cuDNN/ATen kernels.
+# But to truly show "custom CUDA" power, we can fuse the division and the bias addition 
+# into a single kernel that runs after the pooling.
+
+fused_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_post_pool_kernel(
+    const float* __restrict__ pool_out, 
+    const float* __restrict__ bias, 
+    float* __restrict__ out, 
+    int batch_size, 
+    int channels, 
+    float divisor, 
+    int sum_dim_size) {
+    
+    // The input 'pool_out' is expected to be (Batch, Channels, 1, 1, 1) after AdaptiveAvgPool3d
+    // The bias is (Channels, 1, 1, 1)
+    // We want to compute: sum_{dim} ( (pool_out / divisor) + bias )
+    
+    int b = blockIdx.x; // Batch index
+    int c = threadIdx.x; // Channel index
+    
+    if (b < batch_size && c < channels) {
+        // Since AdaptiveAvgPool3d(1,1,1) results in (B, C, 1, 1, 1)
+        // and we add bias (C, 1, 1, 1), the result is (B, C, 1, 1, 1)
+        // Then we sum along sum_dim.
+        
+        // If sum_dim is 1 (the channel dimension), the output shape is (B, 1, 1, 1)
+        // If sum_dim is 0 (the batch dimension), the output shape is (1, C, 1, 1, 1)
+        
+        // For the specific case in the prompt: sum_dim = 1 (Channels)
+        // Resulting shape: (Batch, 1, 1, 1)
+        
+        float val = (pool_out[b * channels + c] / divisor) + bias[c];
+        
+        // This kernel is simplified for the specific sum_dim=1 case.
+        // In a general case, we'd use atomicAdd or a reduction.
+        // Given the prompt's specific architecture:
+        out[b] = val; 
+    }
+}
+
+// A more robust version for the specific sum_dim=1 requirement:
+// Input: pool_out (B, C, 1, 1, 1), bias (C, 1, 1, 1), divisor (float)
+// Output: out (B)
+__global__ void fused_sum_dim1_kernel(
+    const float* __restrict__ pool_out,
+    const float* __restrict__ bias,
+    float* __restrict__ out,
+    int batch_size,
+    int channels,
+    float divisor) {
+    
+    int b = blockIdx.x;
+    if (b >= batch_size) return;
+
+    float sum = 0.0f;
+    for (int c = 0; c < channels; ++c) {
+        sum += (pool_out[b * channels + c] / divisor) + bias[c];
+    }
+    out[b] = sum;
+}
+
+torch::Tensor fused_post_pool_cuda(torch::Tensor pool_out, torch::Tensor bias, float divisor) {
+    int batch_size = pool_out.size(0);
+    int channels = pool_out.size(1);
+    
+    auto out = torch::empty({batch_size}, pool_out.options());
+
+    const int block_size = 1;
+    const int num_blocks = batch_size;
+
+    fused_sum_dim1_kernel<<<num_blocks, block_size>>>(
+        pool_out.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        channels,
+        divisor
+    );
+
+    return out;
+}
+"""
+
+fused_ops_cpp_source = "torch::Tensor fused_post_pool_cuda(torch::Tensor pool_out, torch::Tensor bias, float divisor);"
+
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_source,
+    functions=["fused_post_pool_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, divisor, pool_size, bias_shape, sum_dim):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.divisor = divisor
+        self.max_pool = nn.MaxPool3d(pool_size)
+        self.global_avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.sum_dim = sum_dim
+        self.fused_ops = fused_ops
+
+    def forward(self, x):
+        # Conv3d is best handled by cuDNN
+        x = self.conv(x)
+        
+        # Division and MaxPool are standard, but we can't easily fuse 
+        # MaxPool with a custom kernel without re-implementing MaxPool.
+        # However, we can fuse the division, bias, and sum after the pooling.
+        
+        # We apply division here to keep the logic clean, 
+        # or we can pass the divisor to the fused kernel.
+        # Let's apply division and maxpool normally, then fuse the rest.
+        
+        x = x / self.divisor
+        x = self.max_pool(x)
+        x = self.global_avg_pool(x)
+        
+        # x is now (B, C, 1, 1, 1)
+        # bias is (C, 1, 1, 1)
+        # sum_dim is 1
+        
+        # We use our custom kernel to perform: (x + bias).sum(dim=1)
+        # Note: the division was already done above, so we pass divisor=1.0 
+        # or just adjust the kernel. Let's adjust the kernel to take the 
+        # already divided x and just do bias + sum.
+        
+        # To be most efficient, we'll pass the original x (after maxpool) 
+        # and the divisor to the kernel.
+        
+        # Re-calculating to match the original logic:
+        # x_after_conv = conv(x)
+        # x_after_div = x_after_conv / divisor
+        # x_after_maxpool = max_pool(x_after_div)
+        # x_after_avgpool = avg_pool(x_after_maxpool)
+        # result = sum(x_after_avgpool + bias, dim=1)
+        
+        # Let's re-run the sequence to ensure correctness:
+        x = self.conv(x)
+        x = x / self.divisor
+        x = self.max_pool(x)
+        x = self.global_avg_pool(x)
+        
+        # Now x is (B, C, 1, 1, 1). We need to add bias (C, 1, 1, 1) and sum dim 1.
+        # Since we already divided by divisor, we pass divisor=1.0 to the kernel.
+        # Or better, let's just pass the x and the bias.
+        
+        # To make the kernel truly useful, let's assume the input to the kernel 
+        # is the output of global_avg_pool.
+        
+        # We'll use a slightly modified kernel call:
+        # We'll pass divisor=1.0 because division was already done.
+        # But to be more "optimized", let's do the division inside the kernel.
+        
+        # Let's re-do the forward to be efficient:
+        # 1. Conv
+        # 2. Div (elementwise)
+        # 3. MaxPool
+        # 4. AvgPool
+        # 5. Fused (Bias + Sum)
+        
+        # Wait, the original code is:
+        # x = conv(x)
+        # x = x / divisor
+        # x = max_pool(x)
+        # x = global_avg_pool(x)
+        # x = x + bias
+        # x = sum(x, dim=sum_dim)
+        
+        # My kernel 'fused_sum_dim1_kernel' does: sum( (pool_out / divisor) + bias )
+        # So I should pass the output of max_pool (which is already divided) 
+        # and set divisor=1.0, OR pass the output of max_pool 
+        # and NOT divide inside the kernel.
+        
+        # Let's refine:
+        # The most expensive parts are Conv3d and MaxPool3d.
+        # The rest are element-wise or reductions.
+        # Let's pass the output of global_avg_pool to the kernel.
+        # The kernel will take (x_after_avgpool), bias, and divisor.
+        # But x_after_avgpool is already (x_after_conv / divisor) processed by pools.
+        # So the division is already "baked in".
+        
+        # Let's simplify:
+        # x = conv(x)
+        # x = x / divisor
+        # x = max_pool(x)
+        # x = global_avg_pool(x)
+        # result = fused_kernel(x, bias, divisor=1.0)
+        
+        # Actually, let's just pass the x after global_avg_pool and the bias.
+        # The kernel will do: sum(x + bias, dim=1)
+        
+        # Let's use the kernel as: sum(x + bias, dim=1)
+        # where x is the output of global_avg_pool.
+        
+        # I will rewrite the kernel in the final code to be:
+        # sum(x + bias, dim=1)
+        
+        return self.fused_ops.fused_post_pool_cuda(x, self.bias, 1.0)
+
+# Wait, I need to provide the final code block. 
+# I will ensure the kernel and the ModelNew class are perfectly aligned.
+```
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernel to fuse: bias addition and summation along the channel dimension.
+# This is applied after the pooling operations.
+fused_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_bias_sum_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ bias,
+    float* __restrict__ out,
+    int batch_size,
+    int channels) {
+    
+    int b = blockIdx.x;
+    if (b >= batch_size) return;
+
+    float sum = 0.0f;
+    for (int c = 0; c < channels; ++c) {
+        // x is (B, C, 1, 1, 1), bias is (C, 1, 1, 1)
+        sum += x[b * channels + c] + bias[c];
+    }
+    out[b] = sum;
+}
+
+torch::Tensor fused_bias_sum_cuda(torch::Tensor x, torch::Tensor bias) {
+    int batch_size = x.size(0);
+    int channels = x.size(1);
+    
+    auto out = torch::empty({batch_size}, x.options());
+
+    const int block_size = 1;
+    const int num_blocks = batch_size;
+
+    fused_bias_sum_kernel<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        channels
+    );
+
+    return out;
+}
+"""
+
+fused_ops_cpp_source = "torch::Tensor fused_bias_sum_cuda(torch::Tensor x, torch::Tensor bias);"
+
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_source,
+    functions=["fused_bias_sum_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model using a custom CUDA kernel to fuse bias addition and summation.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, divisor, pool_size, bias_shape, sum_dim):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.divisor = divisor
+        self.max_pool = nn.MaxPool3d(pool_size)
+        self.global_avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.sum_dim = sum_dim
+        self.fused_ops = fused_ops
+
+    def forward(self, x):
+        # 1. Convolution (highly optimized via cuDNN)
+        x = self.conv(x)
+        
+        # 2. Element-wise division
+        x = x / self.divisor
+        
+        # 3. Max Pooling (highly optimized via cuDNN)
+        x = self.max_pool(x)
+        
+        # 4. Global Average Pooling
+        x = self.global_avg_pool(x)
+        
+        # x is now (Batch, Channels, 1, 1, 1)
+        # 5. Fused Bias Addition and Summation along sum_dim (dim=1)
+        # This replaces: x = x + self.bias; x = torch.sum(x, dim=self.sum_dim)
+        if self.sum_dim == 1:
+            # Flatten x to (B, C) for the kernel
+            x_flat = x.view(x.size(0), x.size(1))
+            # Flatten bias to (C) for the kernel
+            bias_flat = self.bias.view(-1)
+            x = self.fused_ops.fused_bias_sum_cuda(x_flat, bias_flat)
+        else:
+            # Fallback for other sum_dims if necessary, though the prompt specifies sum_dim=1
+            x = x + self.bias
+            x = torch.sum(x, dim=self.sum_dim)
+            
+        return x
+```

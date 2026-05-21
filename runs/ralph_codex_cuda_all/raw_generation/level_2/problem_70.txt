@@ -1,0 +1,130 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+#define TILE 16
+
+__global__ void transpose_weight_kernel(const float* __restrict__ w, float* __restrict__ wt, int n, int k) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    if (row < n && col < k) {
+        wt[col * n + row] = w[row * k + col];
+    }
+}
+
+__global__ void linear_sigmoid_residual_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ wt,
+    const float* __restrict__ bias,
+    float* __restrict__ out,
+    int m,
+    int k,
+    int n,
+    float scale
+) {
+    __shared__ float as[TILE][TILE];
+    __shared__ float bs[TILE][TILE + 1];
+
+    int row = blockIdx.y * TILE + threadIdx.y;
+    int col = blockIdx.x * TILE + threadIdx.x;
+
+    float acc = 0.0f;
+
+    for (int t = 0; t < k; t += TILE) {
+        int a_col = t + threadIdx.x;
+        int b_row = t + threadIdx.y;
+
+        as[threadIdx.y][threadIdx.x] = (row < m && a_col < k) ? x[row * k + a_col] : 0.0f;
+        bs[threadIdx.y][threadIdx.x] = (b_row < k && col < n) ? wt[b_row * n + col] : 0.0f;
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE; ++i) {
+            acc += as[threadIdx.y][i] * bs[i][threadIdx.x];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < m && col < n) {
+        float v = acc + bias[col];
+        out[row * n + col] = v + scale / (1.0f + expf(-v));
+    }
+}
+
+torch::Tensor transpose_weight_cuda(torch::Tensor w) {
+    int n = w.size(0);
+    int k = w.size(1);
+    auto wt = torch::empty({k, n}, w.options());
+
+    dim3 block(16, 16);
+    dim3 grid((k + 15) / 16, (n + 15) / 16);
+    transpose_weight_kernel<<<grid, block>>>(w.data_ptr<float>(), wt.data_ptr<float>(), n, k);
+    return wt;
+}
+
+torch::Tensor linear_sigmoid_residual_cuda(torch::Tensor x, torch::Tensor wt, torch::Tensor bias, float scale) {
+    int m = x.size(0);
+    int k = x.size(1);
+    int n = wt.size(1);
+    auto out = torch::empty({m, n}, x.options());
+
+    dim3 block(TILE, TILE);
+    dim3 grid((n + TILE - 1) / TILE, (m + TILE - 1) / TILE);
+    linear_sigmoid_residual_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        wt.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        m,
+        k,
+        n,
+        scale
+    );
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor transpose_weight_cuda(torch::Tensor w);
+torch::Tensor linear_sigmoid_residual_cuda(torch::Tensor x, torch::Tensor wt, torch::Tensor bias, float scale);
+"""
+
+gemm_sigmoid_residual = load_inline(
+    name="gemm_sigmoid_residual_inline",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["transpose_weight_cuda", "linear_sigmoid_residual_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.gemm = nn.Linear(input_size, hidden_size)
+        self.scaling_factor = float(scaling_factor)
+        self._wt = None
+        self._weight_ptr = 0
+
+    def forward(self, x):
+        weight_ptr = self.gemm.weight.data_ptr()
+        if self._wt is None or self._weight_ptr != weight_ptr:
+            self._wt = gemm_sigmoid_residual.transpose_weight_cuda(self.gemm.weight.contiguous())
+            self._weight_ptr = weight_ptr
+        return gemm_sigmoid_residual.linear_sigmoid_residual_cuda(
+            x.contiguous(),
+            self._wt,
+            self.gemm.bias.contiguous(),
+            self.scaling_factor,
+        )
+```

@@ -1,0 +1,22 @@
+{
+  "backend": "cuda",
+  "dataset_src": "local",
+  "expected_total": 270,
+  "gpu_arch": "Ada",
+  "levels": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "max_tokens": 8192,
+  "measure_performance": false,
+  "model_name": "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
+  "num_correct_trials": 5,
+  "precision": "fp32",
+  "prompt_option": "one_shot",
+  "server_address": "192.168.1.78",
+  "server_port": 3132,
+  "server_type": "local",
+  "temperature": 0.0
+}

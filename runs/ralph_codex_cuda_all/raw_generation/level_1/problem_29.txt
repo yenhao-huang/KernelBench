@@ -1,0 +1,87 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+softplus_cpp_source = """
+torch::Tensor softplus_cuda(torch::Tensor x);
+"""
+
+softplus_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdint.h>
+
+__device__ __forceinline__ float softplus_f32(float x) {
+    if (x > 20.0f) return x;
+    if (x < -20.0f) return expf(x);
+    return log1pf(expf(x));
+}
+
+__global__ void softplus_kernel_vec4(const float* __restrict__ x, float* __restrict__ y, int64_t n4) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n4) {
+        const float4 v = reinterpret_cast<const float4*>(x)[idx];
+        float4 o;
+        o.x = softplus_f32(v.x);
+        o.y = softplus_f32(v.y);
+        o.z = softplus_f32(v.z);
+        o.w = softplus_f32(v.w);
+        reinterpret_cast<float4*>(y)[idx] = o;
+    }
+}
+
+__global__ void softplus_kernel_tail(const float* __restrict__ x, float* __restrict__ y, int64_t start, int64_t n) {
+    int64_t idx = start + (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        y[idx] = softplus_f32(x[idx]);
+    }
+}
+
+torch::Tensor softplus_cuda(torch::Tensor x) {
+    auto y = torch::empty_like(x);
+    const int threads = 256;
+    const int64_t n = x.numel();
+
+    const uintptr_t xp = reinterpret_cast<uintptr_t>(x.data_ptr<float>());
+    const uintptr_t yp = reinterpret_cast<uintptr_t>(y.data_ptr<float>());
+
+    if ((xp % 16 == 0) && (yp % 16 == 0)) {
+        const int64_t n4 = n / 4;
+        if (n4 > 0) {
+            const int blocks4 = (int)((n4 + threads - 1) / threads);
+            softplus_kernel_vec4<<<blocks4, threads>>>(x.data_ptr<float>(), y.data_ptr<float>(), n4);
+        }
+        const int64_t start = n4 * 4;
+        const int64_t tail = n - start;
+        if (tail > 0) {
+            const int blocks_tail = (int)((tail + threads - 1) / threads);
+            softplus_kernel_tail<<<blocks_tail, threads>>>(x.data_ptr<float>(), y.data_ptr<float>(), start, n);
+        }
+    } else {
+        const int blocks = (int)((n + threads - 1) / threads);
+        softplus_kernel_tail<<<blocks, threads>>>(x.data_ptr<float>(), y.data_ptr<float>(), 0, n);
+    }
+
+    return y;
+}
+"""
+
+softplus_ext = load_inline(
+    name="softplus_inline_cuda_ext",
+    cpp_sources=softplus_cpp_source,
+    cuda_sources=softplus_cuda_source,
+    functions=["softplus_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.softplus_ext = softplus_ext
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.softplus_ext.softplus_cuda(x)
+```

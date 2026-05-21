@@ -1,0 +1,200 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <float.h>
+
+__device__ __forceinline__ float convt3d_value(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    int n, int oc, int od, int oh, int ow,
+    int N, int Cin, int D, int H, int W,
+    int Cout, int K, int stride, int padding,
+    int OD, int OH, int OW
+) {
+    float acc = b == nullptr ? 0.0f : b[oc];
+
+    #pragma unroll
+    for (int ic = 0; ic < 3; ++ic) {
+        #pragma unroll
+        for (int kd = 0; kd < 3; ++kd) {
+            int td = od + padding - kd;
+            if (td < 0 || td % stride != 0) continue;
+            int id = td / stride;
+            if (id < 0 || id >= D) continue;
+
+            #pragma unroll
+            for (int kh = 0; kh < 3; ++kh) {
+                int th = oh + padding - kh;
+                if (th < 0 || th % stride != 0) continue;
+                int ih = th / stride;
+                if (ih < 0 || ih >= H) continue;
+
+                #pragma unroll
+                for (int kw = 0; kw < 3; ++kw) {
+                    int tw = ow + padding - kw;
+                    if (tw < 0 || tw % stride != 0) continue;
+                    int iw = tw / stride;
+                    if (iw < 0 || iw >= W) continue;
+
+                    float xv = x[(((n * Cin + ic) * D + id) * H + ih) * W + iw];
+                    float wv = w[(((ic * Cout + oc) * K + kd) * K + kh) * K + kw];
+                    acc += xv * wv;
+                }
+            }
+        }
+    }
+    return acc;
+}
+
+__global__ void fused_deconv_pool_avg_clamp_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ out,
+    int N, int Cin, int D, int H, int W,
+    int Cout, int K, int stride, int padding,
+    float scale, int pool_k,
+    int OD, int OH, int OW,
+    int PD, int PH, int PW
+) {
+    int idx = blockIdx.x;
+    int n = idx / Cout;
+    int oc = idx - n * Cout;
+
+    float local_sum = 0.0f;
+    int total = PD * PH * PW;
+
+    for (int p = threadIdx.x; p < total; p += blockDim.x) {
+        int pw = p % PW;
+        int t = p / PW;
+        int ph = t % PH;
+        int pd = t / PH;
+
+        float m = -FLT_MAX;
+
+        for (int zd = 0; zd < 2; ++zd) {
+            int od = pd * pool_k + zd;
+            if (od >= OD) continue;
+            for (int zh = 0; zh < 2; ++zh) {
+                int oh = ph * pool_k + zh;
+                if (oh >= OH) continue;
+                for (int zw = 0; zw < 2; ++zw) {
+                    int ow = pw * pool_k + zw;
+                    if (ow >= OW) continue;
+                    float v = convt3d_value(x, w, b, n, oc, od, oh, ow,
+                                             N, Cin, D, H, W, Cout, K, stride,
+                                             padding, OD, OH, OW) * scale;
+                    m = fmaxf(m, v);
+                }
+            }
+        }
+        local_sum += m;
+    }
+
+    __shared__ float smem[256];
+    smem[threadIdx.x] = local_sum;
+    __syncthreads();
+
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        float v = smem[0] / (float)total;
+        v = fminf(1.0f, fmaxf(0.0f, v));
+        out[(n * Cout + oc)] = v;
+    }
+}
+
+torch::Tensor fused_deconv_pool_avg_clamp_cuda(
+    torch::Tensor x,
+    torch::Tensor w,
+    torch::Tensor b,
+    double scale,
+    int64_t stride,
+    int64_t padding,
+    int64_t pool_k
+) {
+    int N = x.size(0);
+    int Cin = x.size(1);
+    int D = x.size(2);
+    int H = x.size(3);
+    int W = x.size(4);
+    int Cout = w.size(1);
+    int K = w.size(2);
+
+    int OD = (D - 1) * stride - 2 * padding + K;
+    int OH = (H - 1) * stride - 2 * padding + K;
+    int OW = (W - 1) * stride - 2 * padding + K;
+
+    int PD = (OD - pool_k) / pool_k + 1;
+    int PH = (OH - pool_k) / pool_k + 1;
+    int PW = (OW - pool_k) / pool_k + 1;
+
+    auto out = torch::empty({N, Cout, 1, 1, 1}, x.options());
+
+    fused_deconv_pool_avg_clamp_kernel<<<N * Cout, 256>>>(
+        x.data_ptr<float>(),
+        w.data_ptr<float>(),
+        b.defined() ? b.data_ptr<float>() : nullptr,
+        out.data_ptr<float>(),
+        N, Cin, D, H, W, Cout, K, (int)stride, (int)padding,
+        (float)scale, (int)pool_k,
+        OD, OH, OW, PD, PH, PW
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor fused_deconv_pool_avg_clamp_cuda(
+    torch::Tensor x,
+    torch::Tensor w,
+    torch::Tensor b,
+    double scale,
+    int64_t stride,
+    int64_t padding,
+    int64_t pool_k
+);
+"""
+
+fused_deconv_pool_avg_clamp = load_inline(
+    name="fused_deconv_pool_avg_clamp_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["fused_deconv_pool_avg_clamp_cuda"],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, scale, maxpool_kernel_size):
+        super().__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, out_channels, kernel_size, stride=stride, padding=padding
+        )
+        self.scale = scale
+        self.stride = stride
+        self.padding = padding
+        self.maxpool_kernel_size = maxpool_kernel_size
+        self.op = fused_deconv_pool_avg_clamp
+
+    def forward(self, x):
+        return self.op.fused_deconv_pool_avg_clamp_cuda(
+            x,
+            self.conv_transpose.weight,
+            self.conv_transpose.bias,
+            float(self.scale),
+            int(self.stride if isinstance(self.stride, int) else self.stride[0]),
+            int(self.padding if isinstance(self.padding, int) else self.padding[0]),
+            int(self.maxpool_kernel_size if isinstance(self.maxpool_kernel_size, int) else self.maxpool_kernel_size[0]),
+        )
+```

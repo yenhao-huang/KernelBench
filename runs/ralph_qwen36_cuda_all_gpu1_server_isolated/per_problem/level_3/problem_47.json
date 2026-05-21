@@ -1,0 +1,44 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 68.011,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "0.003048",
+        "0.003048",
+        "0.003049",
+        "0.003049",
+        "0.003048"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "0.020268",
+        "0.020503",
+        "0.020142",
+        "0.020283",
+        "0.020962"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_3/problem_47.py",
+  "level": 3,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 47,
+  "problem_name": "47_NetVladNoGhostClusters.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_3/problem_47.txt",
+  "static_warnings": [
+    "Uses torch.nn compute layer (only containers, Parameter, init allowed)"
+  ],
+  "status": "evaluated"
+}

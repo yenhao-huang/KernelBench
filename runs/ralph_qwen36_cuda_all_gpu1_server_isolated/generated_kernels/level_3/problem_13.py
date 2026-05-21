@@ -1,0 +1,233 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for BatchNorm2d + ReLU + Conv2d(1x1) + AvgPool2d fusion
+# This kernel performs:
+# 1. Batch Normalization (running mean/var or training mode stats not applicable here as we assume inference/eval with fixed params, but standard BN formula applies)
+#    Note: The original model uses nn.BatchNorm2d. In eval mode, it uses running_mean and running_var.
+#    Formula: y = (x - running_mean) / sqrt(running_var + eps) * weight + bias
+# 2. ReLU: max(0, y)
+# 3. Conv2d with 1x1 kernel: dot product of input channel with kernel weights.
+# 4. AvgPool2d with 2x2 kernel and stride 2: sum of 2x2 block / 4.
+
+fusion_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper for atomic add if needed, but here we use reduction per thread/block or simple accumulation
+// Since AvgPool is just sum/4, we can accumulate in registers.
+
+__global__ void fused_bn_relu_conv_avgpool_kernel(
+    const float* __restrict__ input,      // [N, C, H, W]
+    const float* __restrict__ bn_weight,  // [C]
+    const float* __restrict__ bn_bias,    // [C]
+    const float* __restrict__ bn_running_mean, // [C]
+    const float* __restrict__ bn_running_var,  // [C]
+    const float* __restrict__ conv_weights, // [OutC, InC, 1, 1] -> flattened [OutC * InC]
+    const float* __restrict__ conv_bias,      // [OutC]
+    float* __restrict__ output,               // [N, OutC, H/2, W/2]
+    int N, int C_in, int C_out, int H, int W) 
+{
+    // Each thread handles one output element: (n, c_out, h_out, w_out)
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C_out * (H / 2) * (W / 2);
+
+    if (idx >= total_elements) return;
+
+    // Decode indices
+    int w_out = idx % (W / 2);
+    int h_out = (idx / (W / 2)) % (H / 2);
+    int c_out = (idx / ((W / 2) * (H / 2))) % C_out;
+    int n = idx / ((W / 2) * (H / 2) * C_out);
+
+    // AvgPool region in input space: [h_out*2, h_out*2+1] x [w_out*2, w_out*2+1]
+    int h_in_0 = h_out * 2;
+    int h_in_1 = h_out * 2 + 1;
+    int w_in_0 = w_out * 2;
+    int w_in_1 = w_out * 2 + 1;
+
+    // We need to compute the sum over the 2x2 spatial region for ALL input channels,
+    // then apply Conv (which is just a linear combination of channels since kernel is 1x1),
+    // then BN and ReLU.
+    
+    // However, standard order in PyTorch Sequential:
+    // 1. BatchNorm2d on [N, C_in, H, W] -> [N, C_in, H, W]
+    // 2. ReLU on [N, C_in, H, W] -> [N, C_in, H, W]
+    // 3. Conv2d(1x1) on [N, C_in, H, W] -> [N, C_out, H, W]
+    // 4. AvgPool2d on [N, C_out, H, W] -> [N, C_out, H/2, W/2]
+
+    // To optimize, we can fuse BN and ReLU into the Conv step if possible, 
+    // but Conv mixes channels. So we must compute BN+ReLU for each input channel first?
+    // Actually, Conv is linear. BN is affine per channel. ReLU is non-linear per element.
+    // Order: x -> BN(x) -> ReLU(BN(x)) -> Conv(ReLU(BN(x))) -> AvgPool(Conv(...))
+    
+    // Since Conv is 1x1, it doesn't mix spatial locations. It mixes channels.
+    // So for a specific output pixel (n, c_out, h_out, w_out), the value depends on 
+    // all input channels at spatial location (h_in_0..1, w_in_0..1).
+    
+    // Let's compute the contribution of each input channel to the sum before Conv.
+    // Wait, AvgPool is AFTER Conv. So we must do Conv first.
+    // Conv output at (n, c_out, h, w) = sum_c ( conv_weights[c_out, c] * ReLU(BN(x[n, c, h, w])) ) + bias[c_out]
+    
+    // Then AvgPool sums these values over the 2x2 window and divides by 4.
+    
+    float sum_conv_output = 0.0f;
+
+    // Iterate over input channels to compute the Conv output for the 2x2 block
+    // We can unroll or loop. C_in is small (32), so loop is fine.
+    for (int c_in = 0; c_in < C_in; ++c_in) {
+        float val_sum = 0.0f;
+        
+        // Sum the BN+ReLU activated values over the 2x2 spatial block
+        // Spatial indices: h_in_0, h_in_1 and w_in_0, w_in_1
+        
+        // Element (h_in_0, w_in_0)
+        int idx_h0w0 = ((n * C_in + c_in) * H + h_in_0) * W + w_in_0;
+        float x_val = input[idx_h0w0];
+        // BN: (x - mean) / sqrt(var + eps) * weight + bias
+        float bn_val = (x_val - bn_running_mean[c_in]) * rsqrtf(bn_running_var[c_in] + 1e-5f);
+        bn_val = bn_val * bn_weight[c_in] + bn_bias[c_in];
+        // ReLU
+        if (bn_val > 0.0f) val_sum += bn_val;
+
+        // Element (h_in_0, w_in_1)
+        int idx_h0w1 = ((n * C_in + c_in) * H + h_in_0) * W + w_in_1;
+        x_val = input[idx_h0w1];
+        bn_val = (x_val - bn_running_mean[c_in]) * rsqrtf(bn_running_var[c_in] + 1e-5f);
+        bn_val = bn_val * bn_weight[c_in] + bn_bias[c_in];
+        if (bn_val > 0.0f) val_sum += bn_val;
+
+        // Element (h_in_1, w_in_0)
+        int idx_h1w0 = ((n * C_in + c_in) * H + h_in_1) * W + w_in_0;
+        x_val = input[idx_h1w0];
+        bn_val = (x_val - bn_running_mean[c_in]) * rsqrtf(bn_running_var[c_in] + 1e-5f);
+        bn_val = bn_val * bn_weight[c_in] + bn_bias[c_in];
+        if (bn_val > 0.0f) val_sum += bn_val;
+
+        // Element (h_in_1, w_in_1)
+        int idx_h1w1 = ((n * C_in + c_in) * H + h_in_1) * W + w_in_1;
+        x_val = input[idx_h1w1];
+        bn_val = (x_val - bn_running_mean[c_in]) * rsqrtf(bn_running_var[c_in] + 1e-5f);
+        bn_val = bn_val * bn_weight[c_in] + bn_bias[c_in];
+        if (bn_val > 0.0f) val_sum += bn_val;
+
+        // Conv: weight for this input channel to output channel c_out
+        // Weights are stored as [OutC, InC, 1, 1]. Flattened index: c_out * C_in + c_in
+        float w = conv_weights[c_out * C_in + c_in];
+        sum_conv_output += w * val_sum;
+    }
+
+    // Add Conv bias
+    sum_conv_output += conv_bias[c_out];
+
+    // AvgPool divides by 4 (2x2 kernel)
+    output[idx] = sum_conv_output / 4.0f;
+}
+
+torch::Tensor fused_bn_relu_conv_avgpool_cuda(
+    torch::Tensor input,
+    torch::Tensor bn_weight,
+    torch::Tensor bn_bias,
+    torch::Tensor bn_running_mean,
+    torch::Tensor bn_running_var,
+    torch::Tensor conv_weights,
+    torch::Tensor conv_bias) 
+{
+    auto N = input.size(0);
+    auto C_in = input.size(1);
+    auto H = input.size(2);
+    auto W = input.size(3);
+    auto C_out = conv_weights.size(0);
+
+    auto output = torch::zeros({N, C_out, H / 2, W / 2}, input.options());
+
+    const int block_size = 256;
+    int total_elements = N * C_out * (H / 2) * (W / 2);
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    fused_bn_relu_conv_avgpool_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        bn_weight.data_ptr<float>(),
+        bn_bias.data_ptr<float>(),
+        bn_running_mean.data_ptr<float>(),
+        bn_running_var.data_ptr<float>(),
+        conv_weights.data_ptr<float>(),
+        conv_bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        N, C_in, C_out, H, W
+    );
+
+    return output;
+}
+"""
+
+fusion_cpp_source = (
+    "torch::Tensor fused_bn_relu_conv_avgpool_cuda("
+    "torch::Tensor input,"
+    "torch::Tensor bn_weight,"
+    "torch::Tensor bn_bias,"
+    "torch::Tensor bn_running_mean,"
+    "torch::Tensor bn_running_var,"
+    "torch::Tensor conv_weights,"
+    "torch::Tensor conv_bias"
+    ");"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_bn_relu_conv_avgpool",
+    cpp_sources=fusion_cpp_source,
+    cuda_sources=fusion_source,
+    functions=["fused_bn_relu_conv_avgpool_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_input_features: int, num_output_features: int):
+        """
+        :param num_input_features: The number of input feature maps
+        :param num_output_features: The number of output feature maps
+        """
+        super(ModelNew, self).__init__()
+        
+        # Initialize parameters to match the original model's structure
+        # We need to store these tensors to pass to the CUDA kernel
+        self.register_buffer('bn_weight', torch.ones(num_input_features))
+        self.register_buffer('bn_bias', torch.zeros(num_input_features))
+        self.register_buffer('bn_running_mean', torch.zeros(num_input_features))
+        self.register_buffer('bn_running_var', torch.ones(num_input_features))
+        
+        # Conv2d with 1x1 kernel, bias=False
+        conv = nn.Conv2d(num_input_features, num_output_features, kernel_size=1, bias=False)
+        self.register_buffer('conv_weights', conv.weight.data) # [OutC, InC, 1, 1]
+        # Conv has no bias in the original model
+        
+        self.num_input_features = num_input_features
+        self.num_output_features = num_output_features
+
+    def forward(self, x):
+        """
+        :param x: Input tensor of shape (batch_size, num_input_features, height, width)
+        :return: Downsampled tensor with reduced number of feature maps
+        """
+        return fused_ops.fused_bn_relu_conv_avgpool_cuda(
+            x,
+            self.bn_weight,
+            self.bn_bias,
+            self.bn_running_mean,
+            self.bn_running_var,
+            self.conv_weights,
+            torch.zeros(self.num_output_features, device=x.device) # Conv bias is zero
+        )
+
+def get_inputs():
+    return [torch.rand(128, 32, 256, 256).cuda()]
+
+def get_init_inputs():
+    return [32, 64]

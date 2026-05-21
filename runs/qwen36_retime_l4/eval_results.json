@@ -1,0 +1,137 @@
+{
+    "4": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "builtins.RuntimeError",
+                "compilation_error": "Error building extension 'custom_ops'"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "5": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "other_error": "error: name 'uniform_' is not defined",
+                "other_error_name": "builtins.NameError",
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "6": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "7": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "other_error": "error: randn() received an invalid combination of arguments - got (NoneType, int), but expected one of:\n * (tuple of ints size, *, torch.Generator generator, tuple of names names, torch.dtype dtype = None, torch.layout layout = None, torch.device device = None, bool pin_memory = False, bool requires_grad = False)\n * (tuple of ints size, *, torch.Generator generator, Tensor out = None, torch.dtype dtype = None, torch.layout layout = None, torch.device device = None, bool pin_memory = False, bool requires_grad = False)\n * (tuple of ints size, *, Tensor out = None, torch.dtype dtype = None, torch.layout layout = None, torch.device device = None, bool pin_memory = False, bool requires_grad = False)\n * (tuple of ints size, *, tuple of names names, torch.dtype dtype = None, torch.layout layout = None, torch.device device = None, bool pin_memory = False, bool requires_grad = False)\n",
+                "other_error_name": "builtins.TypeError",
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "13": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "other_error": "error: Expected tensor for argument #1 'indices' to have one of the following scalar types: Long, Int; but got torch.cuda.FloatTensor instead (while checking arguments for embedding)",
+                "other_error_name": "builtins.RuntimeError",
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "14": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "other_error": "error: 'builtin_function_or_method' object has no attribute 'normalized_shape'",
+                "other_error_name": "builtins.AttributeError",
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "15": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "builtins.RuntimeError",
+                "compilation_error": "Error building extension 'custom_ops'"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "16": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "other_error": "error: Expected tensor for argument #1 'indices' to have one of the following scalar types: Long, Int; but got torch.cuda.FloatTensor instead (while checking arguments for embedding)",
+                "other_error_name": "builtins.RuntimeError",
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "17": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "other_error": "error: Expected tensor for argument #1 'indices' to have one of the following scalar types: Long, Int; but got torch.cuda.FloatTensor instead (while checking arguments for embedding)",
+                "other_error_name": "builtins.RuntimeError",
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ]
+}

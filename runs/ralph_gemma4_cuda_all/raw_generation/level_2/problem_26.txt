@@ -1,0 +1,105 @@
+thought
+<channel|>```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# The optimization strategy is to fuse the element-wise addition and the HardSwish activation.
+# ConvTranspose3d is a heavy compute-bound operation usually handled by cuDNN.
+# Fusing the subsequent addition and HardSwish reduces memory bandwidth overhead (one pass instead of two).
+# HardSwish(x) = x * relu6(x + 3) / 6
+
+fused_ops_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__device__ __forceinline__ float hardswish(float x) {
+    float relu6 = x + 3.0f;
+    if (relu6 < 0.0f) relu6 = 0.0f;
+    if (relu6 > 6.0f) relu6 = 6.0f;
+    return x * (relu6 / 6.0f);
+}
+
+__global__ void fused_add_hardswish_kernel(const float* __restrict__ conv_out, 
+                                           const float* __restrict__ add_input, 
+                                           float* __restrict__ out, 
+                                           int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float val = conv_out[idx] + add_input[idx];
+        out[idx] = hardswish(val);
+    }
+}
+
+torch::Tensor fused_add_hardswish_cuda(torch::Tensor conv_out, torch::Tensor add_input) {
+    auto size = conv_out.numel();
+    auto out = torch::empty_like(conv_out);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    fused_add_hardswish_kernel<<<num_blocks, block_size>>>(
+        conv_out.data_ptr<float>(), 
+        add_input.data_ptr<float>(), 
+        out.data_ptr<float>(), 
+        size
+    );
+
+    return out;
+}
+"""
+
+fused_ops_cpp_source = """
+torch::Tensor fused_add_hardswish_cuda(torch::Tensor conv_out, torch::Tensor add_input);
+"""
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_cuda_source,
+    functions=["fused_add_hardswish_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model that performs a 3D transposed convolution, 
+    and uses a fused CUDA kernel for addition and HardSwish activation.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels, 
+            out_channels, 
+            kernel_size, 
+            stride=stride, 
+            padding=padding, 
+            output_padding=output_padding
+        )
+        # Note: The original model had a bias parameter but didn't actually use it in the forward pass 
+        # (it used the conv_transpose output + add_input). 
+        # To maintain exact functional parity with the provided 'Model' class:
+        self.register_parameter('bias', nn.Parameter(torch.randn(bias_shape)))
+        self.fused_ops = fused_ops
+
+    def forward(self, x, add_input):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, D, H, W).
+            add_input (torch.Tensor): Input tensor of shape (batch_size, out_channels, D_out, H_out, W_out).
+        Returns:
+            torch.Tensor: Output tensor after fused addition and HardSwish.
+        """
+        # 1. Perform Transposed Convolution
+        x = self.conv_transpose(x)
+        
+        # 2. Fused Kernel: (x + add_input) -> HardSwish
+        # This replaces:
+        # x = x + add_input
+        # x = x * torch.nn.functional.hardswish(x)
+        x = self.fused_ops.fused_add_hardswish_cuda(x, add_input)
+        
+        return x
+```

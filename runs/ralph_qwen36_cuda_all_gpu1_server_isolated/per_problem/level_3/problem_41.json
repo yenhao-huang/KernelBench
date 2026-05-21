@@ -1,0 +1,30 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 72.97,
+  "eval_result": {
+    "compiled": false,
+    "correctness": false,
+    "metadata": {
+      "compilation_error": "Syntax error in custom generated code or ModelNew not found",
+      "compilation_error_name": "SyntaxError",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090"
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_3/problem_41.py",
+  "level": 3,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 41,
+  "problem_name": "41_GRUBidirectional.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_3/problem_41.txt",
+  "static_warnings": [
+    "Uses torch.nn compute layer (only containers, Parameter, init allowed)"
+  ],
+  "status": "evaluated"
+}

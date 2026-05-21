@@ -1,0 +1,167 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void conv_transpose1d_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ bias,
+    float* __restrict__ y,
+    int B,
+    int IC,
+    int L,
+    int OC,
+    int K,
+    int stride,
+    int padding,
+    int output_padding,
+    int groups,
+    int has_bias,
+    int OL
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * OC * OL;
+    if (idx >= total) return;
+
+    int t = idx % OL;
+    int oc = (idx / OL) % OC;
+    int b = idx / (OC * OL);
+
+    int oc_per_group = OC / groups;
+    int ic_per_group = IC / groups;
+    int g = oc / oc_per_group;
+    int ic_start = g * ic_per_group;
+    int ic_end = ic_start + ic_per_group;
+    int ocg = oc - g * oc_per_group;
+
+    float acc = has_bias ? bias[oc] : 0.0f;
+
+    for (int ic = ic_start; ic < ic_end; ++ic) {
+        const float* x_base = x + (b * IC + ic) * L;
+        const float* w_base = w + ((ic * oc_per_group + ocg) * K);
+
+        #pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            if (k >= K) break;
+            int numer = t + padding - k;
+            if (numer >= 0 && numer % stride == 0) {
+                int in_t = numer / stride;
+                if (in_t >= 0 && in_t < L) {
+                    acc += x_base[in_t] * w_base[k];
+                }
+            }
+        }
+    }
+
+    y[idx] = acc;
+}
+
+torch::Tensor conv_transpose1d_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int stride,
+    int padding,
+    int output_padding,
+    int groups,
+    bool has_bias
+) {
+    int B = x.size(0);
+    int IC = x.size(1);
+    int L = x.size(2);
+    int K = weight.size(2);
+    int OC = weight.size(1) * groups;
+    int OL = (L - 1) * stride - 2 * padding + K + output_padding;
+
+    auto y = torch::empty({B, OC, OL}, x.options());
+
+    int total = B * OC * OL;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+
+    const float* bias_ptr = has_bias ? bias.data_ptr<float>() : nullptr;
+
+    conv_transpose1d_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias_ptr,
+        y.data_ptr<float>(),
+        B, IC, L, OC, K, stride, padding, output_padding, groups,
+        has_bias ? 1 : 0,
+        OL
+    );
+
+    return y;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor conv_transpose1d_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int stride,
+    int padding,
+    int output_padding,
+    int groups,
+    bool has_bias
+);
+"""
+
+conv_transpose1d_ext = load_inline(
+    name="conv_transpose1d_ext_kb",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["conv_transpose1d_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        output_padding: int = 0,
+        groups: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.conv1d_transpose = nn.ConvTranspose1d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            output_padding=output_padding,
+            groups=groups,
+            bias=bias,
+        )
+        self.stride = stride
+        self.padding = padding
+        self.output_padding = output_padding
+        self.groups = groups
+        self.has_bias = bias
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b = self.conv1d_transpose.bias
+        if b is None:
+            b = self.conv1d_transpose.weight
+        return conv_transpose1d_ext.conv_transpose1d_cuda(
+            x,
+            self.conv1d_transpose.weight,
+            b,
+            self.stride,
+            self.padding,
+            self.output_padding,
+            self.groups,
+            self.has_bias,
+        )

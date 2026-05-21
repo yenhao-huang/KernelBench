@@ -1,0 +1,195 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+#define TILE 16
+
+__global__ void linear_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ z,
+    int B, int K, int O
+) {
+    __shared__ float xs[TILE][TILE];
+    __shared__ float ws[TILE][TILE];
+
+    int row = blockIdx.y * TILE + threadIdx.y;
+    int col = blockIdx.x * TILE + threadIdx.x;
+
+    float acc = 0.0f;
+
+    for (int t = 0; t < K; t += TILE) {
+        int xk = t + threadIdx.x;
+        int wk = t + threadIdx.y;
+
+        xs[threadIdx.y][threadIdx.x] = (row < B && xk < K) ? x[row * K + xk] : 0.0f;
+        ws[threadIdx.y][threadIdx.x] = (col < O && wk < K) ? w[col * K + wk] : 0.0f;
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE; ++i) {
+            acc += xs[threadIdx.y][i] * ws[i][threadIdx.x];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < B && col < O) {
+        z[row * O + col] = acc + b[col];
+    }
+}
+
+__global__ void stats_kernel(
+    const float* __restrict__ z,
+    float* __restrict__ mean,
+    float* __restrict__ invstd,
+    int B, int O,
+    float eps
+) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    __shared__ float ssum[256];
+    __shared__ float ssq[256];
+
+    float sum = 0.0f;
+    float sq = 0.0f;
+
+    for (int col = tid; col < O; col += blockDim.x) {
+        float v = z[row * O + col];
+        sum += v;
+        sq += v * v;
+    }
+
+    ssum[tid] = sum;
+    ssq[tid] = sq;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            ssum[tid] += ssum[tid + stride];
+            ssq[tid] += ssq[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float m = ssum[0] / (float)O;
+        float var = ssq[0] / (float)O - m * m;
+        mean[row] = m;
+        invstd[row] = rsqrtf(fmaxf(var, 0.0f) + eps);
+    }
+}
+
+__global__ void norm_res_mul_kernel(
+    const float* __restrict__ z,
+    const float* __restrict__ y,
+    const float* __restrict__ mean,
+    const float* __restrict__ invstd,
+    float* __restrict__ out,
+    int total,
+    int O
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        int row = idx / O;
+        float yy = y[idx];
+        float n = (z[idx] - mean[row]) * invstd[row];
+        out[idx] = (n + yy) * yy;
+    }
+}
+
+torch::Tensor fused_linear_instancenorm_resmul_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor y,
+    double eps
+) {
+    int B = x.size(0);
+    int K = x.size(1);
+    int O = weight.size(0);
+
+    auto z = torch::empty({B, O}, x.options());
+    auto mean = torch::empty({B}, x.options());
+    auto invstd = torch::empty({B}, x.options());
+    auto out = torch::empty({B, O}, x.options());
+
+    dim3 block(TILE, TILE);
+    dim3 grid((O + TILE - 1) / TILE, (B + TILE - 1) / TILE);
+    linear_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        z.data_ptr<float>(),
+        B, K, O
+    );
+
+    stats_kernel<<<B, 256>>>(
+        z.data_ptr<float>(),
+        mean.data_ptr<float>(),
+        invstd.data_ptr<float>(),
+        B, O,
+        (float)eps
+    );
+
+    int total = B * O;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    norm_res_mul_kernel<<<blocks, threads>>>(
+        z.data_ptr<float>(),
+        y.data_ptr<float>(),
+        mean.data_ptr<float>(),
+        invstd.data_ptr<float>(),
+        out.data_ptr<float>(),
+        total, O
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor fused_linear_instancenorm_resmul_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor y,
+    double eps
+);
+"""
+
+fused_op = load_inline(
+    name="fused_linear_instancenorm_resmul_op",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["fused_linear_instancenorm_resmul_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.bmm = nn.Linear(in_features, out_features)
+        self.instance_norm = nn.InstanceNorm2d(out_features, eps=eps, momentum=momentum)
+        self.eps = eps
+        self.fused_op = fused_op
+
+    def forward(self, x, y):
+        return self.fused_op.fused_linear_instancenorm_resmul_cuda(
+            x.contiguous(),
+            self.bmm.weight.contiguous(),
+            self.bmm.bias.contiguous(),
+            y.contiguous(),
+            self.eps,
+        )

@@ -1,0 +1,148 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused Linear + Divide + GELU
+# This fuses: matmul (linear), division, and gelu activation into a single kernel pass.
+# Input shape: (batch_size, input_size)
+# Weight shape: (output_size, input_size)
+# Bias shape: (output_size,)
+# Output shape: (batch_size, output_size)
+
+fused_linear_gelu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+// Helper for GELU approximation used in PyTorch's default implementation
+__device__ inline float gelu(float x) {
+    return 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+}
+
+__global__ void fused_linear_gelu_kernel(
+    const float* __restrict__ input, 
+    const float* __restrict__ weight, 
+    const float* __restrict__ bias, 
+    float* __restrict__ output, 
+    int batch_size, 
+    int input_size, 
+    int output_size, 
+    float divisor) 
+{
+    // Each thread block handles one row of the output matrix (one sample in the batch)
+    // However, for large matrices, it's better to have threads within a block work on different parts of the output row or use grid-stride loops.
+    // Here we map each thread to an output element (batch_idx, out_idx).
+    
+    int batch_idx = blockIdx.y;
+    int out_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (batch_idx >= batch_size || out_idx >= output_size) {
+        return;
+    }
+
+    // Calculate the base pointer for the current input row and weight column
+    const float* input_row = input + batch_idx * input_size;
+    const float* weight_col = weight + out_idx * input_size; // Weight is stored as (output_size, input_size)
+
+    float sum = 0.0f;
+    
+    // Perform the dot product for the linear layer
+    // We can optimize this with loop unrolling or vectorized loads if needed, 
+    // but a simple loop is robust and correct.
+    #pragma unroll
+    for (int i = 0; i < input_size; ++i) {
+        sum += input_row[i] * weight_col[i];
+    }
+
+    // Add bias
+    if (bias != nullptr) {
+        sum += bias[out_idx];
+    }
+
+    // Divide by scalar
+    sum /= divisor;
+
+    // Apply GELU
+    float result = gelu(sum);
+
+    // Write to output
+    output[batch_idx * output_size + out_idx] = result;
+}
+
+torch::Tensor fused_linear_gelu_cuda(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    torch::Tensor bias, 
+    float divisor) 
+{
+    auto batch_size = input.size(0);
+    auto input_size = input.size(1);
+    auto output_size = weight.size(0);
+
+    auto output = torch::empty({batch_size, output_size}, input.options());
+
+    const int block_size = 256;
+    // Calculate grid dimensions. 
+    // We want to cover all (batch, output) pairs.
+    // Let's map x-dimension to output_size and y-dimension to batch_size.
+    dim3 threads(block_size);
+    dim3 blocks((output_size + block_size - 1) / block_size, batch_size);
+
+    const float* input_ptr = input.data_ptr<float>();
+    const float* weight_ptr = weight.data_ptr<float>();
+    const float* bias_ptr = bias.numel() > 0 ? bias.data_ptr<float>() : nullptr;
+    float* output_ptr = output.data_ptr<float>();
+
+    fused_linear_gelu_kernel<<<blocks, threads>>>(
+        input_ptr, 
+        weight_ptr, 
+        bias_ptr, 
+        output_ptr, 
+        batch_size, 
+        input_size, 
+        output_size, 
+        divisor
+    );
+
+    return output;
+}
+"""
+
+fused_linear_gelu_cpp_source = (
+    "torch::Tensor fused_linear_gelu_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, float divisor);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_linear_gelu",
+    cpp_sources=fused_linear_gelu_cpp_source,
+    cuda_sources=fused_linear_gelu_source,
+    functions=["fused_linear_gelu_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    A model that performs a matrix multiplication, divides by a scalar, and applies GELU activation.
+    Optimized with a custom fused CUDA kernel.
+    """
+    def __init__(self, input_size, output_size, divisor):
+        super(ModelNew, self).__init__()
+        self.linear_weight = nn.Parameter(torch.randn(output_size, input_size))
+        self.linear_bias = nn.Parameter(torch.zeros(output_size))
+        self.divisor = divisor
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, input_size).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, output_size).
+        """
+        # Use the custom fused operator
+        return fused_ops.fused_linear_gelu_cuda(x, self.linear_weight, self.linear_bias, self.divisor)
+```

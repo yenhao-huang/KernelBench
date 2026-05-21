@@ -1,0 +1,17 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 58.741,
+  "generated_kernel_path": "runs/ralph_gemma4_cuda_all/generated_kernels/level_1/problem_94.py",
+  "level": 1,
+  "model_name": "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
+  "precision": "fp32",
+  "problem_id": 94,
+  "problem_name": "94_MSELoss.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_gemma4_cuda_all/raw_generation/level_1/problem_94.txt",
+  "static_errors": [
+    "Contains 'pass' statement (inheritance bypass)"
+  ],
+  "static_warnings": [],
+  "status": "static_failed"
+}

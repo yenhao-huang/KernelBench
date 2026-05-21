@@ -1,0 +1,14 @@
+{
+  "accuracy_all": 0.0,
+  "accuracy_evaluated": 0.0,
+  "compile_rate_all": 0.0,
+  "compiled": 0,
+  "completed": 3,
+  "correct": 0,
+  "evaluated": 0,
+  "expected_total": 10,
+  "is_complete": false,
+  "status_counts": {
+    "static_failed": 3
+  }
+}

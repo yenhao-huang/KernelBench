@@ -1,0 +1,157 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+from transformers import AutoModelForCausalLM, AutoConfig
+
+# Define custom CUDA kernels for optimized operations
+# We will replace the core Linear layer computation (Matmul + Bias) with a fused kernel
+# and potentially optimize the Softmax if needed, but Matmul is usually the bottleneck.
+
+custom_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Fused Linear Kernel: out = x @ w^T + b
+// Assumes x is (M, K), w is (N, K), b is (N,)
+// Output is (M, N)
+__global__ void fused_linear_kernel(
+    const float* __restrict__ x, 
+    const float* __restrict__ w, 
+    const float* __restrict__ b, 
+    float* __restrict__ out, 
+    int M, int K, int N) {
+    
+    // Each block handles one row of the output matrix (one sample in batch if M is batch_size)
+    // Or we can map threads to elements. Let's map each thread to an output element (i, j).
+    int i = blockIdx.y * blockDim.y + threadIdx.y; // Row index (M dimension)
+    int j = blockIdx.x * blockDim.x + threadIdx.x; // Col index (N dimension)
+
+    if (i < M && j < N) {
+        float sum = 0.0f;
+        const float* x_row = x + i * K;
+        const float* w_col = w + j * K; // Note: w is stored as (N, K), so row j is the weights for output neuron j
+        
+        // Unrolling or simple loop for dot product
+        for (int k = 0; k < K; ++k) {
+            sum += x_row[k] * w_col[k];
+        }
+        
+        out[i * N + j] = sum + b[j];
+    }
+}
+
+torch::Tensor fused_linear_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias) {
+    // x: (M, K)
+    // weight: (N, K)
+    // bias: (N,)
+    
+    auto M = x.size(0);
+    auto K = x.size(1);
+    auto N = weight.size(0);
+    
+    auto out = torch::empty({M, N}, x.options());
+    
+    if (M == 0 || N == 0) {
+        return out;
+    }
+
+    dim3 threadsPerBlock(32, 8); // 256 threads per block
+    dim3 numBlocks((N + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                   (M + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    fused_linear_kernel<<<numBlocks, threadsPerBlock>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        M, K, N
+    );
+    
+    return out;
+}
+"""
+
+custom_cpp_source = "torch::Tensor fused_linear_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias);"
+
+# Load the custom extension
+fused_linear_ext = load_inline(
+    name="fused_linear_ext",
+    cpp_sources=custom_cpp_source,
+    cuda_sources=custom_cuda_source,
+    functions=["fused_linear_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"]
+)
+
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, model_name, config):
+        super().__init__()
+        self.model_name = model_name
+        self.config = config
+        
+        # Load the original model to get weights and structure
+        self.original_model = AutoModelForCausalLM.from_pretrained(model_name, config=config)
+        
+        # We will replace specific Linear layers with our custom fused linear logic
+        # BART Large has many linear layers. We can hook into them or rebuild the forward pass.
+        # To keep it simple and robust, we will create a wrapper that intercepts calls to Linear layers
+        # inside the model's forward pass by replacing the modules in-place.
+        
+        self._replace_linear_layers()
+
+    def _replace_linear_layers(self):
+        """
+        Recursively find all nn.Linear layers in the model and replace their forward method
+        with our custom CUDA implementation.
+        """
+        for module in self.original_model.modules():
+            if isinstance(module, torch.nn.Linear):
+                # Save original weights and bias
+                weight = module.weight.data.contiguous()
+                bias = module.bias.data.contiguous() if module.bias is not None else None
+                
+                # Create a closure to capture these tensors
+                def make_custom_forward(w, b):
+                    def custom_forward(x):
+                        # x shape: (..., K)
+                        # We need to flatten the batch dimensions to apply the kernel efficiently
+                        original_shape = x.shape
+                        M = x.numel() // w.size(1)
+                        K = w.size(1)
+                        
+                        x_flat = x.view(M, K)
+                        
+                        if b is not None:
+                            out = fused_linear_ext.fused_linear_cuda(x_flat, w, b)
+                        else:
+                            # If no bias, we can still use the kernel but ignore bias, 
+                            # or implement a separate one. For simplicity, let's assume bias exists for BART linear layers usually.
+                            # BART Linear layers typically have biases.
+                            out = fused_linear_ext.fused_linear_cuda(x_flat, w, torch.zeros(w.size(0), device=w.device))
+                        
+                        return out.view(original_shape)
+                    return custom_forward
+                
+                module.forward = make_custom_forward(weight, bias)
+
+    def forward(self, x):
+        # The original model's forward method now uses our custom CUDA linear layers
+        return self.original_model(x).logits
+
+model_name = "facebook/bart-large"
+config = AutoConfig.from_pretrained(model_name)
+vocab_size = config.vocab_size
+sequence_length = 256
+batch_size = 32
+
+def get_inputs():
+    inputs = torch.randint(0, vocab_size, (batch_size, sequence_length))
+    return [inputs]
+
+def get_init_inputs():
+    return [model_name, config]
+```

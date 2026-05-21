@@ -1,0 +1,19 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 63.419,
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_3/problem_29.py",
+  "level": 3,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 29,
+  "problem_name": "29_SwinMLP.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_3/problem_29.txt",
+  "static_errors": [
+    "Contains try-except block (potential fallback bypass)"
+  ],
+  "static_warnings": [
+    "Uses torch.nn compute layer (only containers, Parameter, init allowed)"
+  ],
+  "status": "static_failed"
+}

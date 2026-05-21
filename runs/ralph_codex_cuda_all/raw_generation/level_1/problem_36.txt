@@ -1,0 +1,89 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+rmsnorm_cpp_source = """
+torch::Tensor rmsnorm_cuda(torch::Tensor x, double eps);
+"""
+
+rmsnorm_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void rmsnorm_c64_kernel(const float* __restrict__ x,
+                                   float* __restrict__ y,
+                                   int outer,
+                                   int spatial,
+                                   float eps) {
+    int idx = blockIdx.x;
+    int tid = threadIdx.x;
+
+    int n = idx / spatial;
+    int s = idx - n * spatial;
+    int base = n * 64 * spatial + s;
+
+    float v = x[base + tid * spatial];
+    float ss = v * v;
+
+    __shared__ float smem[64];
+    smem[tid] = ss;
+    __syncthreads();
+
+    if (tid < 32) smem[tid] += smem[tid + 32];
+    __syncthreads();
+    if (tid < 16) smem[tid] += smem[tid + 16];
+    __syncthreads();
+    if (tid < 8) smem[tid] += smem[tid + 8];
+    __syncthreads();
+    if (tid < 4) smem[tid] += smem[tid + 4];
+    __syncthreads();
+    if (tid < 2) smem[tid] += smem[tid + 2];
+    __syncthreads();
+    if (tid == 0) smem[0] += smem[1];
+    __syncthreads();
+
+    float inv_rms = rsqrtf(smem[0] * 0.015625f + eps);
+    y[base + tid * spatial] = v * inv_rms;
+}
+
+torch::Tensor rmsnorm_cuda(torch::Tensor x, double eps) {
+    auto y = torch::empty_like(x);
+
+    int ndim = x.dim();
+    int outer = x.size(0);
+    int spatial = 1;
+    for (int i = 2; i < ndim; ++i) {
+        spatial *= x.size(i);
+    }
+
+    int blocks = outer * spatial;
+    rmsnorm_c64_kernel<<<blocks, 64>>>(x.data_ptr<float>(),
+                                       y.data_ptr<float>(),
+                                       outer,
+                                       spatial,
+                                       static_cast<float>(eps));
+    return y;
+}
+"""
+
+rmsnorm_ext = load_inline(
+    name="rmsnorm_c64_inline_ext",
+    cpp_sources=rmsnorm_cpp_source,
+    cuda_sources=rmsnorm_cuda_source,
+    functions=["rmsnorm_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int, eps: float = 1e-5):
+        super(ModelNew, self).__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.rmsnorm_ext = rmsnorm_ext
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.rmsnorm_ext.rmsnorm_cuda(x, self.eps)
+```

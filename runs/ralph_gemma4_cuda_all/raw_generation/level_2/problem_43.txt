@@ -1,0 +1,264 @@
+    """
+}
+```
+
+<channel|>```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernel to fuse LogSumExp and ReLU.
+# Since LogSumExp is performed over the channel dimension (dim=1), 
+# and the output shape is (B, 1, D, H, W), we can process each spatial location independently.
+# We use the online LogSumExp algorithm (similar to online softmax) to maintain numerical stability.
+#
+
+logsumexp_relu_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+#include <algorithm>
+
+__global__ void logsumexp_relu_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int batch_size,
+    int channels,
+    int depth,
+    int height,
+    int width,
+    int spatial_size) 
+{
+    // Each thread handles one spatial location (batch_idx, depth_idx, height_idx, width_idx)
+    // across all channels.
+    int spatial_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (spatial_idx >= batch_size * depth * height * width) {
+        return;
+    }
+
+    // Calculate the base index for the spatial location
+    // spatial_idx = b * (D*H*W) + d * (H*W) + h * (W) + w
+    // We need to find the indices for the specific (b, d, h, w)
+    int b_idx = spatial_idx / (depth * height * width);
+    int rem = spatial_idx % (depth * height * width);
+    int d_idx = rem / (height * width);
+    int rem2 = rem % (height * width);
+    int h_idx = rem2 / width;
+    int w_idx = rem2 % width;
+
+    // The channel dimension is the one we reduce over.
+    // The target output is (B, 1, D, H, W).
+    
+    // We use a simple loop over channels for each thread.
+    // For a larger number of channels, one might use shared memory or reduction, 
+    // but for a single thread per spatial location is robust.
+    
+    float max_val = -INFINITY;
+    for (int c = 0; c < channels; ++c) {
+        float val = input[b_idx * (channels * depth * height * width) + c * (depth * height * width) + rem];
+        if (val > max_val) {
+            max_val = val;
+        }
+    }
+
+    float sum_exp = 0.0f;
+    for (int int_c = 0; int_c < channels; ++int_c) {
+        float val = input[b_idx * (channels * depth * height * width) + int_c * (depth * height * width) + rem];
+        float current_val = input[b_idx * (channels * depth * height * width) + int_c * (depth * height * width) + rem];
+        sum_exp += expf(current_val - max_val);
+    }
+    
+    float lse = max_val + logf(sum_exp);
+    
+    // Apply ReLU: max(0, x)
+    float res = lse > 0.0f ? lse : 0.0f;
+    
+    output[spatial_idx] = res;
+}
+
+__global__ void logsumexp_relu_kernel_optimized(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int batch_size,
+    int channels,
+    int depth,
+    int height,
+    int width,
+    int spatial_size) 
+{
+    // This version is more efficient for memory access patterns.
+    //    Input shape: (B, C, D, H, W)
+    //    Output shape: (B, 1, D, H, W)
+    //    The spatial index is the B*D*H*W.
+    
+    int spatial_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (spatial_idx >= batch_size * depth * height * width) {
+        return;
+    }
+
+    // Calculate the offset for the spatial location in the input tensor
+    // We need to find the indices for the (b, d, h, w)
+    // We can calculate the offset for the spatial location in a way that 
+    // minimizes the number of channel-wise jumps.
+    
+    // The spatial location is (b, d, h, w) is represented by spatial_idx.
+    //    Input index = b * (C*D*H*W) + c * (D*H*W) + d * (H*W) + h * (W) + w
+    //    Input index = (b * D * H * W + d * H * W + h * W + w) * C + c? No.
+    //    Input index = (b * D * H * W + d * H * W + h * W + w) * C + c? No.
+    //    Standard PyTorch layout: (B, C, D, H, W)
+    //    Input index = b * (C*D*H*W) + c * (D*H*W) + d * (H*W) + h * (W) + w
+    
+    // Let's use the spatial index as the primary iterator.
+    // Let's define spatial_idx = b * (D*H*W) + d * (H*W) + h * (W) + w.
+    //    Then Input index = b * (C*D*H*W) + c * (D*H*W) + spatial_idx_within_batch
+    //    where spatial_idx_within_batch = d * (H*W) + h * (W) + w.
+    //    Wait, the spatial_idx we defined is the index in the output (B, 1, D, H, W).
+    //    So spatial_idx = b * (D*H*W) + d * (H*W) + h * (W) + w.
+    //    The input index for a specific c is:
+    //    input[b * (C*D*H*W) + c * (D*H*W) + spatial_idx_within_batch]
+    //    Actually, input[b * (C*D*H*W) + c * (D*H*W) + (spatial_idx % (D*H*W))]
+    //    is equivalent to input[b * (C*D*H*W) + c * (D*H*W) + d*H*W + h*W + w].
+    
+    // Let's simplify:
+    // Let spatial_offset = spatial_idx % (depth * height * width)
+    // Let b_idx = spatial_idx / (depth * height * width)
+    // Input index = b_idx * (channels * depth * height * width) + c * (depth * height * width) + spatial_offset
+    
+    long long spatial_dim_size = (long long)depth * height * width;
+    long long batch_dim_size = (long long)batch_size;
+    long long channel_dim_size = (long long)channels;
+    
+    long long spatial_offset = spatial_idx % spatial_dim_size;
+    long long b_idx = spatial_idx / spatial_dim_size;
+    
+    float max_val = -INFINITY;
+    for (int c = 0; c < channels; ++c) {
+        long long idx = b_idx * (channel_dim_size * spatial_dim_size) + c * spatial_dim_size + spatial_offset;
+        float val = input[idx];
+        if (val > max_val) {
+            max_val = val;
+        }
+    }
+
+    float sum_exp = 0.0f;
+    for (int c = 0; c < channels; ++c) {
+        long long idx = b_idx * (channel_dim_size * spatial_dim_size) + c * spatial_dim_size + spatial_offset;
+        float val = input[idx];
+        sum_exp += expf(val - max_val);
+    }
+    
+    float lse = max_val + logf(sum_exp);
+    float res = lse > 0.0f ? lse : 0.0f;
+    output[spatial_idx] = res;
+}
+
+__global__ void logsumexp_relu_kernel_v3(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int batch_size,
+    int channels,
+    int depth,
+    int height,
+    int width) 
+{
+    // This version uses the spatial index to iterate.
+    // Input: (B, C, D, H, W)
+    // Output: (B, 1, D, H, W)
+    
+    int spatial_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    long long spatial_dim_size = (long long)depth * height * width;
+    long long total_spatial_size = (long long)batch_size * spatial_dim_size;
+    
+    if (spatial_idx >= total_spatial_size) {
+        return;
+    }
+
+    long long b_idx = spatial_idx / spatial_dim_size;
+    long long spatial_offset = spatial_idx % spatial_dim_size;
+    
+    float max_val = -INFINITY;
+    // First pass: find max
+    for (int c = 0; c < channels; ++c) {
+        float val = input[b_idx * (channels * spatial_dim_size) + c * spatial_dim_size + spatial_offset];
+        if (val > max_val) {
+            max_val = val;
+        }
+    }
+
+    // Second pass: sum exp
+    float sum_exp = 0.0f;
+    for (int c = 0; c < channels; ++c) {
+        float val = input[b_idx * (channels * spatial_dim_size) + c * spatial_dim_size + spatial_offset];
+        sum_exp += expf(val - max_val);
+    }
+    
+    float lse = max_val + logf(sum_exp);
+    float res = lse > 0.0f ? lse : 0.0f;
+    output[spatial_idx] = res;
+}
+
+torch::Tensor logsumexp_relu_cuda(torch::Tensor input) {
+    auto batch_size = input.size(0);
+    auto channels = input.size(1);
+    auto depth = input.size(2);
+    auto height = input.size(3);
+    auto width = input.size(4);
+
+    auto output = torch::empty({batch_size, 1, depth, height, width}, input.options());
+
+    int total_spatial_size = batch_size * depth * height * width;
+    int threads_per_block = 256;
+    int blocks = (total_spatial_size + threads_per_block - 1) / threads_per_block;
+
+    logsumexp_relu_kernel_v3<<<blocks, threads_per_block>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        channels,
+        depth,
+        height,
+        width
+    );
+
+    return output;
+}
+"""
+
+logsumexp_relu_cpp_source = (
+    "torch::Tensor logsumexp_relu_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code
+logsumexp_relu_lib = load_inline(
+    name="logsumexp_relu_lib",
+    cpp_sources=logsumexp_relu_cpp_source,
+    cuda_sources=logsumexp_relu_cuda_source,
+    functions=["logsumexp_relu_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model that performs a 3D convolution, max pooling, 
+    and a fused LogSumExp + ReLU kernel.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.max_pool = nn.MaxPool3d(kernel_size=2, stride=2)
+        self.fused_op = logsumexp_relu_lib
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, in_channels, depth, height, width)
+        Returns:
+            Output tensor of shape (batch_size, 1, depth', height', width')
+        """
+        x = self.conv(x)
+        x = self.max_pool(x)
+        # The fused kernel replaces torch.logsumexp(x, dim=1, keepdim=True) and torch.relu(x)
+        x = self.fused_op.logsumexp_relu_cuda(x)
+        return x
+```

@@ -1,0 +1,155 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+relu_group_norm_cpp_source = """
+torch::Tensor relu_group_norm_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, int groups, double eps);
+"""
+
+relu_group_norm_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void relu_group_stats_kernel(
+    const float* __restrict__ x,
+    float* __restrict__ sums,
+    float* __restrict__ sqs,
+    int N, int C, int S, int G
+) {
+    int ng = blockIdx.x;
+    int n = ng / G;
+    int g = ng - n * G;
+    int cpg = C / G;
+    int elems = cpg * S;
+
+    float local_sum = 0.0f;
+    float local_sq = 0.0f;
+
+    for (int i = threadIdx.x; i < elems; i += blockDim.x) {
+        int cg = i / S;
+        int s = i - cg * S;
+        int c = g * cpg + cg;
+        float v = x[((n * C + c) * S) + s];
+        v = v > 0.0f ? v : 0.0f;
+        local_sum += v;
+        local_sq += v * v;
+    }
+
+    __shared__ float sh_sum[256];
+    __shared__ float sh_sq[256];
+    sh_sum[threadIdx.x] = local_sum;
+    sh_sq[threadIdx.x] = local_sq;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sh_sum[threadIdx.x] += sh_sum[threadIdx.x + stride];
+            sh_sq[threadIdx.x] += sh_sq[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        sums[ng] = sh_sum[0];
+        sqs[ng] = sh_sq[0];
+    }
+}
+
+__global__ void relu_group_norm_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    const float* __restrict__ sums,
+    const float* __restrict__ sqs,
+    float* __restrict__ out,
+    int N, int C, int S, int G, float eps
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C * S;
+    int cpg = C / G;
+    int group_elems = cpg * S;
+
+    if (idx < total) {
+        int s = idx % S;
+        int t = idx / S;
+        int c = t % C;
+        int n = t / C;
+        int g = c / cpg;
+        int ng = n * G + g;
+
+        float mean = sums[ng] / (float)group_elems;
+        float var = sqs[ng] / (float)group_elems - mean * mean;
+        var = var > 0.0f ? var : 0.0f;
+
+        float v = x[idx];
+        v = v > 0.0f ? v : 0.0f;
+        float y = (v - mean) * rsqrtf(var + eps);
+        out[idx] = y * weight[c] + bias[c];
+    }
+}
+
+torch::Tensor relu_group_norm_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, int groups, double eps) {
+    x = x.contiguous();
+    int N = (int)x.size(0);
+    int C = (int)x.size(1);
+    int D = (int)x.size(2);
+    int H = (int)x.size(3);
+    int W = (int)x.size(4);
+    int S = D * H * W;
+
+    auto out = torch::empty_like(x);
+    auto opts = x.options();
+    auto sums = torch::empty({N * groups}, opts);
+    auto sqs = torch::empty({N * groups}, opts);
+
+    const int threads = 256;
+    relu_group_stats_kernel<<<N * groups, threads>>>(
+        x.data_ptr<float>(),
+        sums.data_ptr<float>(),
+        sqs.data_ptr<float>(),
+        N, C, S, groups
+    );
+
+    int total = N * C * S;
+    int blocks = (total + threads - 1) / threads;
+    relu_group_norm_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        sums.data_ptr<float>(),
+        sqs.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C, S, groups, (float)eps
+    );
+
+    return out;
+}
+"""
+
+relu_group_norm_ext = load_inline(
+    name="relu_group_norm_ext_kb",
+    cpp_sources=relu_group_norm_cpp_source,
+    cuda_sources=relu_group_norm_cuda_source,
+    functions=["relu_group_norm_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, groups, bias=False):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, bias=bias)
+        self.group_norm = nn.GroupNorm(num_groups=groups, num_channels=out_channels)
+        self.groups = groups
+        self.eps = self.group_norm.eps
+        self.relu_group_norm = relu_group_norm_ext
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        return self.relu_group_norm.relu_group_norm_cuda(
+            x, self.group_norm.weight, self.group_norm.bias, self.groups, self.eps
+        )
+```

@@ -1,0 +1,450 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernels for Conv2d + BatchNorm2d + ReLU fusion
+# This reduces memory traffic by avoiding intermediate tensor allocations.
+
+custom_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAGuard.h>
+
+// Helper to get grid/block dimensions
+static int GET_BLOCKS(const int N) {
+    return (N + 255) / 256;
+}
+
+// Kernel for Conv2d + BatchNorm2d + ReLU
+// Assumes input is NHWC or NCHW. Here we assume NCHW as per PyTorch default.
+// We perform: out = relu( (input * weight).conv() * gamma + beta )
+// Note: Standard BatchNorm uses running_mean/var during eval, but for custom kernel simplicity 
+// and typical inference optimization, we often fuse the affine transform. 
+// However, to be strictly correct with nn.BatchNorm2d behavior in training/eval, 
+// we need to handle mean/var. For this specific optimization task focusing on speedup,
+// we will implement a fused Conv-BN-ReLU that uses the affine parameters (weight/bias) 
+// directly if we assume the BN has been folded or we compute it on the fly.
+// To be safe and generic without folding weights beforehand, we can do:
+// 1. Conv2d
+// 2. BatchNorm2d (using running stats if eval, else batch stats)
+// 3. ReLU
+
+// Since implementing full online BN with running stats in a single kernel is complex 
+// and error-prone without external libraries like CUTLASS or cuDNN wrappers, 
+// we will use a highly optimized approach: 
+// We will replace the Conv2d + BatchNorm2d + ReLU sequence with a custom kernel 
+// that performs Conv2d, then applies the affine transform of BN (assuming weights are pre-computed 
+// or we do it in two steps). 
+// Actually, the most robust "speedup" without changing model structure logic is to fuse 
+// Conv -> Add Bias -> ReLU if BN is folded. But here BN is explicit.
+// Let's implement a fused Conv2d + BatchNorm2d (affine part) + ReLU kernel.
+// We assume the user might want to keep the standard PyTorch BN stats handling or fold them.
+// For maximum speedup in inference, folding BN into Conv is best. 
+// However, the prompt asks to replace operators. Let's replace Conv2d and BatchNorm2d with a fused kernel 
+// that does Conv + Affine Transform (using gamma/beta) + ReLU. 
+// Note: This assumes running_mean/running_var are zero or handled by pre-folding weights in __init__.
+// To make it fully functional as a drop-in replacement for the provided Model which uses standard BN,
+// we must handle the BN statistics. 
+// Alternative: Use cuDNN via torch.backends.cudnn.conv_fallback? No, that's not custom CUDA.
+// Let's implement a simple but effective Conv2d kernel and a separate BatchNorm2d kernel, 
+// or fuse them if possible. Fusing Conv+BN+ReLU is the gold standard.
+
+// We will assume for this optimization that we are in inference mode or that BN stats are folded 
+// into the convolution weights/bias for the sake of the custom kernel implementation simplicity 
+// and performance demonstration. If strict training compatibility with running stats is needed,
+// a more complex kernel is required. Given the "speedup" goal, we will implement a fused 
+// Conv2d + BatchNorm2d (using affine params only, assuming pre-folding or eval mode behavior) + ReLU.
+
+__global__ void conv_bn_relu_kernel(
+    const float* input,
+    const float* weight,
+    const float* bias, // This will be the combined bias: bn_gamma * conv_bias / sqrt(var + eps) + bn_beta - bn_gamma * running_mean / sqrt(var + eps)
+    float* output,
+    int batch_size,
+    int in_channels,
+    int out_channels,
+    int height,
+    int width,
+    int kernel_size,
+    int stride,
+    int padding
+) {
+    // Each thread handles one output element (N, C_out, H, W)
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    int total_elements = batch_size * out_channels * height * width;
+    if (idx >= total_elements) return;
+
+    // Decode index to N, C_out, H, W
+    int w = idx % width;
+    int h = (idx / width) % height;
+    int c_out = (idx / (width * height)) % out_channels;
+    int n = idx / (width * height * out_channels);
+
+    float sum = 0.0f;
+    
+    // Convolution loop
+    for (int c_in = 0; c_in < in_channels; ++c_in) {
+        for (int ky = 0; ky < kernel_size; ++ky) {
+            for (int kx = 0; kx < kernel_size; ++kx) {
+                int hx = h * stride + ky - padding;
+                int wx = w * stride + kx - padding;
+                
+                if (hx >= 0 && hx < height && wx >= 0 && wx < width) {
+                    // Input index: N, C_in, H, W
+                    int input_idx = n * in_channels * height * width + c_in * height * width + hx * width + wx;
+                    
+                    // Weight index: C_out, C_in, Ky, Kx
+                    int weight_idx = c_out * in_channels * kernel_size * kernel_size + 
+                                     c_in * kernel_size * kernel_size + 
+                                     ky * kernel_size + kx;
+                    
+                    sum += input[input_idx] * weight[weight_idx];
+                }
+            }
+        }
+    }
+    
+    // Apply Bias (which includes the BatchNorm affine transform)
+    sum += bias[c_out];
+    
+    // Apply ReLU
+    if (sum < 0.0f) sum = 0.0f;
+    
+    output[idx] = sum;
+}
+
+// Kernel for Downsample Conv2d + BatchNorm2d + Identity addition
+// This is trickier because it involves adding to identity.
+// We can fuse: out = relu( conv2(x) + bn(downsample_conv(x)) )
+// But the original code does:
+// out = conv1 -> bn1 -> relu
+// out = conv2 -> bn2
+// identity = downsample(x)
+// out += identity
+// out = relu(out)
+
+// We will replace the entire forward pass logic with a custom kernel that performs 
+// the residual block operation.
+
+__global__ void residual_block_kernel(
+    const float* input,
+    // Conv1 weights: [out_ch, in_ch, 3, 3]
+    const float* conv1_weight,
+    // BN1 params: gamma1, beta1, running_mean1, running_var1 (inv_sqrt)
+    const float* bn1_gamma,
+    const float* bn1_beta,
+    const float* bn1_inv_sqrt_var,
+    const float* bn1_running_mean,
+    
+    // Conv2 weights: [out_ch, out_ch, 3, 3]
+    const float* conv2_weight,
+    // BN2 params
+    const float* bn2_gamma,
+    const float* bn2_beta,
+    const float* bn2_inv_sqrt_var,
+    const float* bn2_running_mean,
+
+    // Downsample Conv weights: [out_ch, in_ch, 1, 1]
+    const float* downsample_weight,
+    // Downsample BN params
+    const float* ds_bn_gamma,
+    const float* ds_bn_beta,
+    const float* ds_bn_inv_sqrt_var,
+    const float* ds_bn_running_mean,
+
+    float* output,
+    int batch_size,
+    int in_channels,
+    int out_channels,
+    int height,
+    int width,
+    int stride
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * out_channels * height * width;
+    if (idx >= total_elements) return;
+
+    int w = idx % width;
+    int h = (idx / width) % height;
+    int c_out = (idx / (width * height)) % out_channels;
+    int n = idx / (width * height * out_channels);
+
+    // 1. Compute Conv1 + BN1 + ReLU
+    float conv1_sum = 0.0f;
+    for (int c_in = 0; c_in < in_channels; ++c_in) {
+        for (int ky = 0; ky < 3; ++ky) {
+            for (int kx = 0; kx < 3; ++kx) {
+                int hx = h * stride + ky - 1;
+                int wx = w * stride + kx - 1;
+                if (hx >= 0 && hx < height && wx >= 0 && wx < width) {
+                    int input_idx = n * in_channels * height * width + c_in * height * width + hx * width + wx;
+                    int weight_idx = c_out * in_channels * 9 + c_in * 9 + ky * 3 + kx;
+                    conv1_sum += input[input_idx] * conv1_weight[weight_idx];
+                }
+            }
+        }
+    }
+    // BN1 Affine Transform (assuming eval mode for simplicity and speed, using running stats)
+    float bn1_val = (conv1_sum - bn1_running_mean[c_out]) * bn1_inv_sqrt_var[c_out] * bn1_gamma[c_out] + bn1_beta[c_out];
+    float relu1_val = fmaxf(bn1_val, 0.0f);
+
+    // 2. Compute Conv2 + BN2 (no ReLU yet)
+    float conv2_sum = 0.0f;
+    for (int c_in = 0; c_in < out_channels; ++c_in) {
+        for (int ky = 0; ky < 3; ++ky) {
+            for (int kx = 0; kx < 3; ++kx) {
+                int hx = h * 1 + ky - 1; // stride=1, padding=1
+                int wx = w * 1 + kx - 1;
+                if (hx >= 0 && hx < height && wx >= 0 && wx < width) {
+                    // Input is relu1_val from the same spatial location and channel? 
+                    // No, Conv2 takes the output of Conv1+BN1+ReLU.
+                    // We need to fetch the value from the intermediate buffer. 
+                    // Since we are in a single kernel, we can't easily access the "intermediate" tensor 
+                    // unless we recompute it or store it in shared memory (too big for 224x224).
+                    // Recomputing is expensive but correct.
+                    
+                    // Recompute Conv1+BN1+ReLU for this specific output element's input dependency?
+                    // Actually, Conv2 at (n, c_out, h, w) depends on Conv1+BN1+ReLU at (n, c_in, h, w) for all c_in.
+                    // So we need to recompute the entire first branch for each output pixel.
+                    
+                    float conv1_sum_inner = 0.0f;
+                    for (int c_in_inner = 0; c_in_inner < in_channels; ++c_in_inner) {
+                        for (int ky2 = 0; ky2 < 3; ++ky2) {
+                            for (int kx2 = 0; kx2 < 3; ++kx2) {
+                                int hx2 = h * stride + ky2 - 1;
+                                int wx2 = w * stride + kx2 - 1;
+                                if (hx2 >= 0 && hx2 < height && wx2 >= 0 && wx2 < width) {
+                                    int input_idx = n * in_channels * height * width + c_in_inner * height * width + hx2 * width + wx2;
+                                    int weight_idx = c_in * in_channels * 9 + c_in_inner * 9 + ky2 * 3 + kx2;
+                                    conv1_sum_inner += input[input_idx] * conv1_weight[weight_idx];
+                                }
+                            }
+                        }
+                    }
+                    float bn1_val_inner = (conv1_sum_inner - bn1_running_mean[c_in]) * bn1_inv_sqrt_var[c_in] * bn1_gamma[c_in] + bn1_beta[c_in];
+                    float relu1_val_inner = fmaxf(bn1_val_inner, 0.0f);
+                    
+                    int weight_idx2 = c_out * out_channels * 9 + c_in * 9 + ky * 3 + kx;
+                    conv2_sum += relu1_val_inner * conv2_weight[weight_idx2];
+                }
+            }
+        }
+    }
+    
+    // BN2 Affine Transform
+    float bn2_val = (conv2_sum - bn2_running_mean[c_out]) * bn2_inv_sqrt_var[c_out] * bn2_gamma[c_out] + bn2_beta[c_out];
+
+    // 3. Compute Downsample Branch: Conv1x1 + BN
+    float ds_conv_sum = 0.0f;
+    for (int c_in = 0; c_in < in_channels; ++c_in) {
+        int hx = h * stride - 0; // kernel=1, padding=0
+        int wx = w * stride - 0;
+        if (hx >= 0 && hx < height && wx >= 0 && wx < width) {
+            int input_idx = n * in_channels * height * width + c_in * height * width + hx * width + wx;
+            // Downsample weight: [out_ch, in_ch, 1, 1]
+            int weight_idx = c_out * in_channels * 1 + c_in * 1; 
+            ds_conv_sum += input[input_idx] * downsample_weight[weight_idx];
+        }
+    }
+    
+    float ds_bn_val = (ds_conv_sum - ds_bn_running_mean[c_out]) * ds_bn_inv_sqrt_var[c_out] * ds_bn_gamma[c_out] + ds_bn_beta[c_out];
+
+    // 4. Add and ReLU
+    float final_val = bn2_val + ds_bn_val;
+    output[idx] = fmaxf(final_val, 0.0f);
+}
+
+torch::Tensor residual_block_cuda(
+    torch::Tensor input,
+    torch::Tensor conv1_weight,
+    torch::Tensor bn1_gamma,
+    torch::Tensor bn1_beta,
+    torch::Tensor bn1_running_mean,
+    torch::Tensor bn1_running_var,
+    torch::Tensor conv2_weight,
+    torch::Tensor bn2_gamma,
+    torch::Tensor bn2_beta,
+    torch::Tensor bn2_running_mean,
+    torch::Tensor bn2_running_var,
+    torch::Tensor downsample_weight,
+    torch::Tensor ds_bn_gamma,
+    torch::Tensor ds_bn_beta,
+    torch::Tensor ds_bn_running_mean,
+    torch::Tensor ds_bn_running_var,
+    int stride
+) {
+    auto device = input.device();
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+    
+    int batch_size = input.size(0);
+    int in_channels = input.size(1);
+    int height = input.size(2);
+    int width = input.size(3);
+    int out_channels = conv1_weight.size(0);
+
+    auto output = torch::zeros({batch_size, out_channels, height, width}, options);
+
+    const int block_size = 256;
+    int total_elements = batch_size * out_channels * height * width;
+    int num_blocks = GET_BLOCKS(total_elements);
+
+    // Precompute inverse sqrt of variance + eps (eps=1e-5)
+    auto bn1_inv_sqrt_var = torch::rsqrt(bn1_running_var + 1e-5);
+    auto bn2_inv_sqrt_var = torch::rsqrt(bn2_running_var + 1e-5);
+    auto ds_bn_inv_sqrt_var = torch::rsqrt(ds_bn_running_var + 1e-5);
+
+    at::cuda::CUDAGuard device_guard(device.index());
+    
+    residual_block_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        conv1_weight.data_ptr<float>(),
+        bn1_gamma.data_ptr<float>(),
+        bn1_beta.data_ptr<float>(),
+        bn1_inv_sqrt_var.data_ptr<float>(),
+        bn1_running_mean.data_ptr<float>(),
+        
+        conv2_weight.data_ptr<float>(),
+        bn2_gamma.data_ptr<float>(),
+        bn2_beta.data_ptr<float>(),
+        bn2_inv_sqrt_var.data_ptr<float>(),
+        bn2_running_mean.data_ptr<float>(),
+
+        downsample_weight.data_ptr<float>(),
+        ds_bn_gamma.data_ptr<float>(),
+        ds_bn_beta.data_ptr<float>(),
+        ds_bn_inv_sqrt_var.data_ptr<float>(),
+        ds_bn_running_mean.data_ptr<float>(),
+
+        output.data_ptr<float>(),
+        batch_size,
+        in_channels,
+        out_channels,
+        height,
+        width,
+        stride
+    );
+
+    return output;
+}
+"""
+
+custom_ops_cpp_source = (
+    "torch::Tensor residual_block_cuda("
+    "torch::Tensor input,"
+    "torch::Tensor conv1_weight,"
+    "torch::Tensor bn1_gamma,"
+    "torch::Tensor bn1_beta,"
+    "torch::Tensor bn1_running_mean,"
+    "torch::Tensor bn1_running_var,"
+    "torch::Tensor conv2_weight,"
+    "torch::Tensor bn2_gamma,"
+    "torch::Tensor bn2_beta,"
+    "torch::Tensor bn2_running_mean,"
+    "torch::Tensor bn2_running_var,"
+    "torch::Tensor downsample_weight,"
+    "torch::Tensor ds_bn_gamma,"
+    "torch::Tensor ds_bn_beta,"
+    "torch::Tensor ds_bn_running_mean,"
+    "torch::Tensor ds_bn_running_var,"
+    "int stride"
+    ");"
+);
+
+# Compile the inline CUDA code
+custom_ops = load_inline(
+    name="custom_ops",
+    cpp_sources=custom_ops_cpp_source,
+    cuda_sources=custom_ops_source,
+    functions=["residual_block_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        """
+        :param in_channels: Number of input channels
+        :param out_channels: Number of output channels
+        :param stride: Stride for the first convolutional layer
+        """
+        super(ModelNew, self).__init__()
+        
+        # We still define the PyTorch modules to get their parameters (weights, biases, running stats)
+        # These will be passed to the custom CUDA kernel.
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        
+        self.downsample = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels * self.expansion, kernel_size=1, stride=stride, bias=False),
+            nn.BatchNorm2d(out_channels * self.expansion),
+        )
+        self.stride = stride
+
+    def forward(self, x):
+        """
+        :param x: Input tensor, shape (batch_size, in_channels, height, width)
+        :return: Output tensor, shape (batch_size, out_channels, height, width)
+        """
+        # Extract parameters from PyTorch modules
+        conv1_weight = self.conv1.weight
+        bn1_gamma = self.bn1.weight
+        bn1_beta = self.bn1.bias
+        bn1_running_mean = self.bn1.running_mean
+        bn1_running_var = self.bn1.running_var
+        
+        conv2_weight = self.conv2.weight
+        bn2_gamma = self.bn2.weight
+        bn2_beta = self.bn2.bias
+        bn2_running_mean = self.bn2.running_mean
+        bn2_running_var = self.bn2.running_var
+        
+        downsample_weight = self.downsample[0].weight
+        ds_bn_gamma = self.downsample[1].weight
+        ds_bn_beta = self.downsample[1].bias
+        ds_bn_running_mean = self.downsample[1].running_mean
+        ds_bn_running_var = self.downsample[1].running_var
+
+        # Call the custom fused CUDA kernel
+        out = custom_ops.residual_block_cuda(
+            x,
+            conv1_weight,
+            bn1_gamma,
+            bn1_beta,
+            bn1_running_mean,
+            bn1_running_var,
+            conv2_weight,
+            bn2_gamma,
+            bn2_beta,
+            bn2_running_mean,
+            bn2_running_var,
+            downsample_weight,
+            ds_bn_gamma,
+            ds_bn_beta,
+            ds_bn_running_mean,
+            ds_bn_running_var,
+            self.stride
+        )
+
+        return out
+    
+# Test code
+in_channels = 3
+out_channels = 64
+stride = 1
+batch_size = 10
+num_classes = 1000
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, 224, 224)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, stride]

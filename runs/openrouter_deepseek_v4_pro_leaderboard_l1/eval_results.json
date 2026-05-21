@@ -1,0 +1,1032 @@
+{
+    "1": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 21.8,
+            "runtime_stats": {
+                "mean": 21.8,
+                "std": 0.195,
+                "min": 21.7,
+                "max": 23.1,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "2": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 23.1,
+            "runtime_stats": {
+                "mean": 23.1,
+                "std": 0.0154,
+                "min": 23.0,
+                "max": 23.1,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "3": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 39.2,
+            "runtime_stats": {
+                "mean": 39.2,
+                "std": 0.0573,
+                "min": 39.1,
+                "max": 39.3,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "4": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 9.19,
+            "runtime_stats": {
+                "mean": 9.19,
+                "std": 0.0055,
+                "min": 9.18,
+                "max": 9.21,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "6": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 15.6,
+            "runtime_stats": {
+                "mean": 15.6,
+                "std": 0.0159,
+                "min": 15.5,
+                "max": 15.6,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "8": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "cuda_error": "CUDA Error: CUDA error: misaligned address\nSearch for `cudaErrorMisalignedAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n",
+                "cuda_error_name": "torch.AcceleratorError",
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "10": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 14.9,
+            "runtime_stats": {
+                "mean": 14.9,
+                "std": 1.08,
+                "min": 8.85,
+                "max": 15.4,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "12": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 0.161,
+            "runtime_stats": {
+                "mean": 0.161,
+                "std": 0.00644,
+                "min": 0.154,
+                "max": 0.176,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "13": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 49.1,
+            "runtime_stats": {
+                "mean": 49.1,
+                "std": 2.23,
+                "min": 39.9,
+                "max": 50.5,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "14": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 10.0,
+            "runtime_stats": {
+                "mean": 10.0,
+                "std": 0.613,
+                "min": 5.89,
+                "max": 10.3,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "15": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 48.9,
+            "runtime_stats": {
+                "mean": 48.9,
+                "std": 2.36,
+                "min": 39.3,
+                "max": 50.2,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "16": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 68.7,
+            "runtime_stats": {
+                "mean": 68.7,
+                "std": 2.59,
+                "min": 59.6,
+                "max": 70.2,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "17": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "error": "Kernel not found for problem 17 sample 0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "18": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "40": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 5.12,
+            "runtime_stats": {
+                "mean": 5.12,
+                "std": 0.377,
+                "min": 3.02,
+                "max": 5.34,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "43": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "builtins.RuntimeError",
+                "compilation_error": "Error building extension 'max_pool3d_custom': [1/3] /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=max_pool3d_custom -DTORCH_API_INCLUDE_EXTENSION_H -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/include -isystem /home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 --compiler-options '-fPIC' -std=c++17 -c /workspace/external/KernelBench/cache/openrouter_deepseek_v4_pro_leaderboard_l1/43/0/max_pool3d_custom/cuda.cu -o cuda.cuda.o \nFAILED: [code=2] cuda.cuda.o \n/workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=max_pool3d_custom -DTORCH_API_INCLUDE_EXTENSION_H -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/include -isystem /home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 --compiler-options '-fPIC' -std=c++17 -c /workspace/external/KernelBench/cache/openrouter_deepseek_v4_pro_leaderboard_l1/43/0/max_pool3d_custom/cuda.cu -o cuda.cuda.o \n/workspace/external/KernelBench/cache/openrouter_deepseek_v4_pro_leaderboard_l1/43/0/max_pool3d_custom/cuda.cu(37): error: expected a \";\"\n                  int input_idx = ((n * channels + c) * input_d + in_d) * input_h + in_h) * input_w + in_w;\n                                                                                        ^\n\n1 error detected in the compilation of \"/workspace/external/KernelBench/cache/openrouter_deepseek_v4_pro_leaderboard_l1/43/0/max_pool3d_custom/cuda.cu\".\n[2/3] c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=max_pool3d_custom -DTORCH_API_INCLUDE_EXTENSION_H -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/include -isystem /home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -fPIC -std=c++17  -c /workspace/external/KernelBench/cache/openrouter_deepseek_v4_pro_leaderboard_l1/43/0/max_pool3d_custom/main.cpp -o main.o \nninja: build stopped: subcommand failed.\n"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "47": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 74.7,
+            "runtime_stats": {
+                "mean": 74.7,
+                "std": 3.56,
+                "min": 58.5,
+                "max": 76.9,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "48": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 27.0,
+            "runtime_stats": {
+                "mean": 27.0,
+                "std": 1.59,
+                "min": 17.5,
+                "max": 27.7,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "49": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "error": "Kernel not found for problem 49 sample 0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "50": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.000522",
+                    "0.000545",
+                    "0.000567",
+                    "0.000547",
+                    "0.000539"
+                ],
+                "avg_difference": [
+                    "0.000076",
+                    "0.000076",
+                    "0.000076",
+                    "0.000076",
+                    "0.000076"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "51": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "runtime_error": "mean(): could not infer output dtype. Input dtype must be either a floating point or complex dtype. Got: Long",
+                "runtime_error_name": "builtins.RuntimeError",
+                "runtime_error_traceback": "Traceback (most recent call last):\n  File \"/workspace/external/KernelBench/src/kernelbench/eval.py\", line 808, in run_and_check_correctness\n    avg_diff = torch.mean(torch.abs(output - output_new)).item()\nRuntimeError: mean(): could not infer output dtype. Input dtype must be either a floating point or complex dtype. Got: Long\n"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "52": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 26.8,
+            "runtime_stats": {
+                "mean": 26.8,
+                "std": 1.72,
+                "min": 17.2,
+                "max": 27.5,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "53": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 55.1,
+            "runtime_stats": {
+                "mean": 55.1,
+                "std": 2.29,
+                "min": 46.4,
+                "max": 56.5,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "54": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "other_error": "error: name 'math' is not defined",
+                "other_error_name": "builtins.NameError",
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "56": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.000494",
+                    "0.000539",
+                    "0.000509",
+                    "0.000502",
+                    "0.000507"
+                ],
+                "avg_difference": [
+                    "0.000075",
+                    "0.000075",
+                    "0.000075",
+                    "0.000075",
+                    "0.000075"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "58": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 108.0,
+            "runtime_stats": {
+                "mean": 108.0,
+                "std": 3.16,
+                "min": 99.6,
+                "max": 110.0,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "60": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "other_error": "error: name 'math' is not defined",
+                "other_error_name": "builtins.NameError",
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "61": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "62": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "64": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "runtime_error": "CUDA out of memory. Tried to allocate 2.00 GiB. GPU 0 has a total capacity of 23.52 GiB of which 618.38 MiB is free. Including non-PyTorch memory, this process has 10.95 GiB memory in use. Of the a...",
+                "runtime_error_name": "torch.OutOfMemoryError",
+                "runtime_error_traceback": "Traceback (most recent call last):\n  File \"/workspace/external/KernelBench/src/kernelbench/eval.py\", line 804, in run_and_check_correctness\n    if not torch.allclose(\ntorch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB. GPU 0 has a total capacity of 23.52 GiB of which 618.38 MiB is free. Including non-PyTorch memory, this process has 10.95 GiB memory in use. Of the allocated memory 10.50 GiB is allocated by PyTorch, and 11.36 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)\n"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "65": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "error": "Kernel not found for problem 65 sample 0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "66": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 41.0,
+            "runtime_stats": {
+                "mean": 41.0,
+                "std": 2.03,
+                "min": 31.4,
+                "max": 42.1,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "67": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "runtime_error": "CUDA out of memory. Tried to allocate 2.00 GiB. GPU 0 has a total capacity of 23.52 GiB of which 1.61 GiB is free. Including non-PyTorch memory, this process has 9.94 GiB memory in use. Of the allo...",
+                "runtime_error_name": "torch.OutOfMemoryError",
+                "runtime_error_traceback": "Traceback (most recent call last):\n  File \"/workspace/external/KernelBench/src/kernelbench/eval.py\", line 804, in run_and_check_correctness\n    if not torch.allclose(\ntorch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB. GPU 0 has a total capacity of 23.52 GiB of which 1.61 GiB is free. Including non-PyTorch memory, this process has 9.94 GiB memory in use. Of the allocated memory 9.50 GiB is allocated by PyTorch, and 1.81 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)\n"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "68": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "error": "Kernel not found for problem 68 sample 0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "69": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "70": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "error": "Kernel not found for problem 70 sample 0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "71": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "error": "Kernel not found for problem 71 sample 0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "72": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "error": "Kernel not found for problem 72 sample 0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "73": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "other_error": "error: name 'math' is not defined",
+                "other_error_name": "builtins.NameError",
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "74": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 118.0,
+            "runtime_stats": {
+                "mean": 118.0,
+                "std": 3.48,
+                "min": 109.0,
+                "max": 120.0,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "75": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 72.1,
+            "runtime_stats": {
+                "mean": 72.1,
+                "std": 5.17,
+                "min": 65.8,
+                "max": 78.1,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "77": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "1.495176",
+                    "1.532375",
+                    "1.473544",
+                    "1.544244",
+                    "1.526596"
+                ],
+                "avg_difference": [
+                    "0.024878",
+                    "0.024871",
+                    "0.024875",
+                    "0.024869",
+                    "0.024867"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "78": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.000478",
+                    "0.000518",
+                    "0.000485",
+                    "0.000525",
+                    "0.000496"
+                ],
+                "avg_difference": [
+                    "0.000071",
+                    "0.000071",
+                    "0.000071",
+                    "0.000071",
+                    "0.000071"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "79": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "max_difference": [
+                    "0.000426",
+                    "0.000425",
+                    "0.000426",
+                    "0.000425",
+                    "0.000416"
+                ],
+                "avg_difference": [
+                    "0.000026",
+                    "0.000026",
+                    "0.000026",
+                    "0.000026",
+                    "0.000026"
+                ],
+                "correctness_issue": "Output mismatch",
+                "correctness_trials": "(0 / 5)"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "80": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "runtime_error": "CUDA out of memory. Tried to allocate 10.81 GiB. GPU 0 has a total capacity of 23.52 GiB of which 10.44 GiB is free. Including non-PyTorch memory, this process has 1.12 GiB memory in use. Of the al...",
+                "runtime_error_name": "torch.OutOfMemoryError",
+                "runtime_error_traceback": "Traceback (most recent call last):\n  File \"/workspace/external/KernelBench/src/kernelbench/eval.py\", line 782, in run_and_check_correctness\n    output_new = model_new(*inputs)\n  File \"/workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1776, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n  File \"/workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1787, in _call_impl\n    return forward_call(*args, **kwargs)\n  File \"<string>\", line 193, in forward\ntorch.OutOfMemoryError: CUDA out of memory. Tried to allocate 10.81 GiB. GPU 0 has a total capacity of 23.52 GiB of which 10.44 GiB is free. Including non-PyTorch memory, this process has 1.12 GiB memory in use. Of the allocated memory 748.83 MiB is allocated by PyTorch, and 3.17 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)\n"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "81": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 119.0,
+            "runtime_stats": {
+                "mean": 119.0,
+                "std": 3.81,
+                "min": 109.0,
+                "max": 123.0,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "82": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 5.02,
+            "runtime_stats": {
+                "mean": 5.02,
+                "std": 0.334,
+                "min": 2.89,
+                "max": 5.26,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "83": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)"
+            },
+            "runtime": 1.19,
+            "runtime_stats": {
+                "mean": 1.19,
+                "std": 0.0263,
+                "min": 1.18,
+                "max": 1.28,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "85": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "error": "Kernel not found for problem 85 sample 0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "86": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "runtime_error": "CUDA out of memory. Tried to allocate 2.00 GiB. GPU 0 has a total capacity of 23.52 GiB of which 1.11 GiB is free. Including non-PyTorch memory, this process has 10.44 GiB memory in use. Of the all...",
+                "runtime_error_name": "torch.OutOfMemoryError",
+                "runtime_error_traceback": "Traceback (most recent call last):\n  File \"/workspace/external/KernelBench/src/kernelbench/eval.py\", line 804, in run_and_check_correctness\n    if not torch.allclose(\ntorch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB. GPU 0 has a total capacity of 23.52 GiB of which 1.11 GiB is free. Including non-PyTorch memory, this process has 10.44 GiB memory in use. Of the allocated memory 9.50 GiB is allocated by PyTorch, and 513.93 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)\n"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "88": [
+        {
+            "sample_id": 0,
+            "compiled": true,
+            "correctness": true,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "correctness_trials": "(5 / 5)",
+                "excessive_speedup": true
+            },
+            "runtime": 0.593,
+            "runtime_stats": {
+                "mean": 0.593,
+                "std": 0.00887,
+                "min": 0.584,
+                "max": 0.625,
+                "num_trials": 100,
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            }
+        }
+    ],
+    "93": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "SyntaxError",
+                "compilation_error": "Syntax error in custom generated code or ModelNew not found"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "94": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "other_error": "error: CUDA out of memory. Tried to allocate 4.00 GiB. GPU 0 has a total capacity of 23.52 GiB of which 3.18 GiB is free. Including non-PyTorch memory, this process has 8.38 GiB memory in use. Of the allocated memory 8.00 GiB is allocated by PyTorch, and 0 bytes is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)",
+                "other_error_name": "torch.OutOfMemoryError",
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ],
+    "95": [
+        {
+            "sample_id": 0,
+            "compiled": false,
+            "correctness": false,
+            "metadata": {
+                "hardware": "NVIDIA GeForce RTX 4090",
+                "device": "cuda:0",
+                "compilation_error_name": "builtins.RuntimeError",
+                "compilation_error": "Error building extension 'cross_entropy_loss_cuda': [1/3] c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=cross_entropy_loss_cuda -DTORCH_API_INCLUDE_EXTENSION_H -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/include -isystem /home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -fPIC -std=c++17 --use_fast_math -c /workspace/external/KernelBench/cache/openrouter_deepseek_v4_pro_leaderboard_l1/95/0/cross_entropy_loss_cuda/main.cpp -o main.o \nFAILED: [code=1] main.o \nc++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=cross_entropy_loss_cuda -DTORCH_API_INCLUDE_EXTENSION_H -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/include -isystem /home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -fPIC -std=c++17 --use_fast_math -c /workspace/external/KernelBench/cache/openrouter_deepseek_v4_pro_leaderboard_l1/95/0/cross_entropy_loss_cuda/main.cpp -o main.o \nc++: error: unrecognized command-line option \u2018--use_fast_math\u2019; did you mean \u2018--fast-math\u2019?\n[2/3] /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=cross_entropy_loss_cuda -DTORCH_API_INCLUDE_EXTENSION_H -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/include -isystem /home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 --compiler-options '-fPIC' -std=c++17 -c /workspace/external/KernelBench/cache/openrouter_deepseek_v4_pro_leaderboard_l1/95/0/cross_entropy_loss_cuda/cuda.cu -o cuda.cuda.o \nninja: build stopped: subcommand failed.\n"
+            },
+            "runtime": -1.0,
+            "runtime_stats": {}
+        }
+    ]
+}

@@ -1,0 +1,26 @@
+{
+  "backend": "cuda",
+  "codex_command": "codex",
+  "codex_model": "gpt-5.5",
+  "codex_timeout_sec": 900,
+  "dataset_src": "local",
+  "expected_total": 1,
+  "gpu_arch": "Ada",
+  "levels": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "limit": 1,
+  "max_tokens": 8192,
+  "measure_performance": false,
+  "model_name": "codex-gpt-5.5",
+  "num_correct_trials": 5,
+  "precision": "fp32",
+  "prompt_option": "one_shot",
+  "server_address": "192.168.1.78",
+  "server_port": 3132,
+  "server_type": "codex_cli",
+  "temperature": 0.0
+}

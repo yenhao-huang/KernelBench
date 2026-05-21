@@ -1,0 +1,248 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA implementation for LSTM cell operations fused together.
+# This replaces the standard nn.LSTM with a custom kernel that performs:
+# 1. Input gate, Forget gate, Cell candidate, Output gate calculations (Gates)
+# 2. Cell state update
+# 3. Hidden state update
+# We fuse the linear projections and the LSTM cell logic to reduce memory bandwidth pressure.
+
+lstm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper for sigmoid
+__device__ __forceinline__ float sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+// Helper for tanh
+__device__ __forceinline__ float tanh_val(float x) {
+    if (x > 20.0f) return 1.0f;
+    if (x < -20.0f) return -1.0f;
+    return tanhf(x);
+}
+
+// Kernel for a single LSTM layer forward pass
+__global__ void lstm_layer_forward_kernel(
+    const float* x,           // Input: [seq_len, batch, input_size]
+    const float* h_prev,      // Hidden prev: [batch, hidden_size]
+    const float* c_prev,      // Cell prev: [batch, hidden_size]
+    const float* w_ih,        // Weights input-hidden: [4*hidden, input_size]
+    const float* w_hh,        // Weights hidden-hidden: [4*hidden, hidden_size]
+    const float* b_ih,        // Bias input-hidden: [4*hidden]
+    const float* b_hh,        // Bias hidden-hidden: [4*hidden]
+    float* h_out,             // Hidden out: [batch, hidden_size]
+    float* c_out              // Cell out: [batch, hidden_size]
+) {
+    int batch_idx = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    const int hidden_size = blockDim.x; // We launch with hidden_size threads per block
+    
+    // Shared memory for weights and biases to reduce global memory access latency
+    // Note: For large hidden sizes, this might need tiling or shared memory management.
+    // Here we assume hidden_size fits in registers/shared memory efficiently or rely on L1 cache.
+    // A more robust implementation would use shared memory tiling for W_ih and W_hh.
+    
+    extern __shared__ float shared_mem[];
+    float* s_w_ih = shared_mem;
+    float* s_w_hh = shared_mem + 4 * hidden_size * input_size_global_placeholder; // Placeholder logic, simplified below
+    
+    // Actually, let's use a simpler approach: Load weights into registers or rely on coalesced access.
+    // Given the constraint of inline code and complexity, we will do a direct computation 
+    // assuming coalesced global memory access is sufficient for this optimization level,
+    // but we fuse the 4 gates into one pass over the input and hidden states.
+
+    int input_size = gridDim.y; // We can encode input_size in grid if needed, but let's use a fixed constant or pass it.
+    // To make it generic, we'll pass dimensions via kernel launch config or assume standard sizes.
+    // Let's assume the kernel is launched with specific dimensions passed as arguments.
+    
+    // Re-defining kernel signature for clarity in this simplified fused version:
+    // We will compute gates sequentially per thread block handling one batch item.
+}
+
+// A more practical fused kernel structure for LSTM:
+// Each block handles one batch element.
+// Threads within the block handle the hidden_size dimension.
+
+__global__ void lstm_cell_fused_kernel(
+    const float* x,           // [seq_len, batch, input_size]
+    const float* h_prev,      // [batch, hidden_size]
+    const float* c_prev,      // [batch, hidden_size]
+    const float* w_ih,        // [4*hidden, input_size]
+    const float* w_hh,        // [4*hidden, hidden_size]
+    const float* b_ih,        // [4*hidden]
+    const float* b_hh,        // [4*hidden]
+    float* h_out,             // [batch, hidden_size]
+    float* c_out              // [batch, hidden_size]
+) {
+    int batch_idx = blockIdx.x;
+    int hid_idx = threadIdx.x;
+    
+    const int input_size = gridDim.y; 
+    const int hidden_size = blockDim.x;
+
+    if (hid_idx >= hidden_size) return;
+
+    // Load previous hidden and cell states
+    float h_val = h_prev[batch_idx * hidden_size + hid_idx];
+    float c_val = c_prev[batch_idx * hidden_size + hid_idx];
+
+    // We need to compute the 4 gates: i, f, g (cell), o
+    // Gate indices: 0..hidden-1: input, hidden..2*hidden-1: forget, etc.
+    
+    float i_sum = 0.0f;
+    float f_sum = 0.0f;
+    float g_sum = 0.0f;
+    float o_sum = 0.0f;
+
+    // Compute dot products for all 4 gates
+    // This loop is unrolled or optimized by compiler if input_size is small, 
+    // but for general case, we iterate.
+    for (int j = 0; j < input_size; ++j) {
+        float x_val = x[j * hidden_size + hid_idx]; // Wait, x is [seq_len, batch, input_size]
+        // In the kernel above, x layout was assumed. Let's fix x layout access.
+        // Standard PyTorch LSTM input: [seq_len, batch, input_size]
+        // But here we are processing a single time step? 
+        // The problem asks to replace nn.LSTM which processes the whole sequence.
+        // Fusing the entire sequence loop into one kernel is complex due to recurrence.
+        // However, we can fuse the linear layers + LSTM cell for ONE time step, 
+        // and launch the kernel seq_len times? No, that's not a speedup over cuDNN usually.
+        
+        // Better approach: Replace the Linear layer with a custom matmul if it's bottleneck,
+        // or replace the LSTM cell logic.
+        // Since cuDNN is highly optimized for LSTM, replacing the whole LSTM with a naive CUDA kernel 
+        // in inline code is unlikely to beat cuDNN unless we fuse specific sub-ops.
+        
+        // Let's focus on fusing the FC layer and potentially optimizing the LSTM if possible.
+        // But the prompt allows replacing operators.
+        // Let's replace the nn.Linear with a custom fused Matmul + Bias if needed, 
+        // but the main bottleneck is usually LSTM.
+        
+        // Alternative: Use torch.compile or just optimize the Linear part which is simple.
+        // However, the prompt asks for "custom CUDA operators".
+        
+        // Let's implement a highly optimized Matrix Multiplication kernel for the FC layer,
+        // and potentially fuse it with the final selection if possible.
+    }
+}
+
+// Given the complexity of implementing a full LSTM cell in inline CUDA that beats cuDNN,
+// we will focus on optimizing the Linear layer (FC) which is often a bottleneck in small models 
+// or when not using tensor cores efficiently, and potentially fuse it with the final indexing.
+
+// Optimized Matrix Multiplication Kernel for FC: out = x @ W^T + b
+__global__ void matmul_bias_kernel(
+    const float* input,   // [batch, in_features]
+    const float* weight,  // [out_features, in_features]
+    const float* bias,    // [out_features]
+    float* output,        // [batch, out_features]
+    int batch_size,
+    int in_features,
+    int out_features
+) {
+    int batch_idx = blockIdx.x;
+    int out_idx = threadIdx.x;
+    
+    if (out_idx >= out_features) return;
+
+    float sum = 0.0f;
+    const float* w_row = weight + out_idx * in_features;
+    const float* x_row = input + batch_idx * in_features;
+    
+    for (int i = 0; i < in_features; ++i) {
+        sum += x_row[i] * w_row[i];
+    }
+    
+    output[batch_idx * out_features + out_idx] = sum + bias[out_idx];
+}
+
+// C++ wrapper for the matmul kernel
+torch::Tensor matmul_bias_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias) {
+    auto batch_size = input.size(0);
+    auto in_features = input.size(1);
+    auto out_features = weight.size(0);
+    
+    auto output = torch::zeros({batch_size, out_features}, input.options());
+    
+    const int block_size = 256; // Max threads per block
+    const int num_blocks = batch_size;
+    
+    matmul_bias_kernel<<<num_blocks, min(block_size, out_features)>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        in_features,
+        out_features
+    );
+    
+    return output;
+}
+
+// We will also define a simple LSTM cell kernel that processes one time step.
+// To replace nn.LSTM, we would need to loop over sequence length in Python or write a complex kernel.
+// Since writing a full recurrent kernel in inline CUDA is error-prone and likely slower than cuDNN,
+// we will replace the Linear layer with our optimized version and keep the LSTM as is, 
+// OR we can try to fuse the last step's linear projection if it was part of the LSTM output.
+// The model does: out = self.fc(out[:, -1, :])
+// This is a simple linear layer on the last time step.
+
+"""
+
+lstm_cpp_source = (
+    "torch::Tensor matmul_bias_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias);"
+);
+
+# Load the inline extension
+optimized_ops = load_inline(
+    name="optimized_ops",
+    cpp_sources=lstm_cpp_source,
+    cuda_sources=lstm_source,
+    functions=["matmul_bias_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.0):
+        """
+        Initialize the LSTM model with optimized CUDA operators.
+        """
+        super(ModelNew, self).__init__()
+        
+        # We keep the LSTM as is because cuDNN is highly optimized for it.
+        # Replacing it with a naive CUDA kernel in inline code is unlikely to provide speedups.
+        # However, we optimize the final Linear layer which can be fused or optimized.
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout, bidirectional=False)
+        
+        # Replace the standard Linear with our custom CUDA implementation
+        self.fc_weight = nn.Parameter(torch.randn(output_size, hidden_size))
+        self.fc_bias = nn.Parameter(torch.zeros(output_size))
+        
+    def forward(self, x, h0, c0):
+        """
+        Forward pass through the LSTM model.
+        """
+        # Forward propagate LSTM
+        out, state = self.lstm(x, (h0, c0))  # out: tensor of shape (batch_size, seq_length, hidden_size)
+        
+        # Extract the last time step output
+        last_out = out[:, -1, :]  # Shape: (batch_size, hidden_size)
+        
+        # Use custom CUDA operator for the final linear projection
+        # This fuses the matmul and bias addition in a single kernel launch
+        out = optimized_ops.matmul_bias_cuda(last_out, self.fc_weight, self.fc_bias)
+        
+        return state[1]
+
+# Note: The above ModelNew keeps the LSTM unchanged because optimizing it via inline CUDA 
+# is extremely complex and rarely beats cuDNN. The optimization focuses on the FC layer.
+# If the goal was to optimize the LSTM itself, one would need a much more sophisticated kernel 
+# handling recurrence, which is beyond the scope of simple inline examples without significant performance risk.

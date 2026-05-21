@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 38.301,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "2.092499",
+        "2.092293",
+        "2.092075",
+        "2.092516",
+        "2.092254"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "31.083927",
+        "32.791985",
+        "30.827703",
+        "31.454456",
+        "31.085438"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_gemma4_cuda_all/generated_kernels/level_1/problem_79.py",
+  "level": 1,
+  "model_name": "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
+  "precision": "fp32",
+  "problem_id": 79,
+  "problem_name": "79_conv_transposed_1D_asymmetric_input_square_kernel___padded____strided____dilated__.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_gemma4_cuda_all/raw_generation/level_1/problem_79.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

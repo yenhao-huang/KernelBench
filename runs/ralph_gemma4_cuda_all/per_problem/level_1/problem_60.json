@@ -1,0 +1,15 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 26.426,
+  "error": "KernelBench evaluator returned None.",
+  "generated_kernel_path": "runs/ralph_gemma4_cuda_all/generated_kernels/level_1/problem_60.py",
+  "level": 1,
+  "model_name": "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
+  "precision": "fp32",
+  "problem_id": 60,
+  "problem_name": "60_conv_standard_3D__square_input__asymmetric_kernel.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_gemma4_cuda_all/raw_generation/level_1/problem_60.txt",
+  "static_warnings": [],
+  "status": "evaluation_error"
+}

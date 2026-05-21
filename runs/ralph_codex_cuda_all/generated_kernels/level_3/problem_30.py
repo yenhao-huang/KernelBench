@@ -1,0 +1,74 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+avgpool_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void avgpool_tokens_kernel(const float* __restrict__ x,
+                                      float* __restrict__ out,
+                                      int B, int L, int C) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * C;
+    if (idx >= total) return;
+
+    int b = idx / C;
+    int c = idx - b * C;
+
+    float sum = 0.0f;
+    const float* base = x + b * L * C + c;
+    #pragma unroll 4
+    for (int l = 0; l < L; ++l) {
+        sum += base[l * C];
+    }
+    out[idx] = sum / (float)L;
+}
+
+torch::Tensor avgpool_tokens_cuda(torch::Tensor x) {
+    int B = (int)x.size(0);
+    int L = (int)x.size(1);
+    int C = (int)x.size(2);
+    auto out = torch::empty({B, C}, x.options());
+
+    int total = B * C;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    avgpool_tokens_kernel<<<blocks, threads>>>(x.data_ptr<float>(), out.data_ptr<float>(), B, L, C);
+    return out;
+}
+"""
+
+avgpool_cpp = "torch::Tensor avgpool_tokens_cuda(torch::Tensor x);"
+
+avgpool_ext = load_inline(
+    name="swin_v2_avgpool_tokens_ext",
+    cpp_sources=avgpool_cpp,
+    cuda_sources=avgpool_sources,
+    functions=["avgpool_tokens_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3"],
+)
+
+
+class ModelNew(Model):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.avgpool_ext = avgpool_ext
+
+    def forward_features(self, x):
+        x = self.patch_embed(x)
+        x = self.pos_drop(x)
+
+        for layer in self.layers:
+            x = layer(x)
+
+        x = self.norm(x).contiguous()
+        x = self.avgpool_ext.avgpool_tokens_cuda(x)
+        return x
+
+    def forward(self, x):
+        x = self.forward_features(x)
+        x = self.head(x)
+        return x

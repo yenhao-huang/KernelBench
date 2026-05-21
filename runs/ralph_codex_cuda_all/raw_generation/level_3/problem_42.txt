@@ -1,0 +1,212 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <vector>
+
+__device__ __forceinline__ float sigmoidf_fast(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+__global__ void gru_step_kernel(
+    const float* __restrict__ inp,
+    const float* __restrict__ prev_h,
+    float* __restrict__ next_h,
+    const float* __restrict__ w_ih,
+    const float* __restrict__ w_hh,
+    const float* __restrict__ b_ih,
+    const float* __restrict__ b_hh,
+    int B, int I, int H
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * H;
+    if (idx >= total) return;
+
+    int h = idx % H;
+    int b = idx / H;
+
+    const float* x = inp + b * I;
+    const float* hp = prev_h + b * H;
+
+    float gi_r = b_ih ? b_ih[h] : 0.0f;
+    float gi_z = b_ih ? b_ih[H + h] : 0.0f;
+    float gi_n = b_ih ? b_ih[2 * H + h] : 0.0f;
+
+    float gh_r = b_hh ? b_hh[h] : 0.0f;
+    float gh_z = b_hh ? b_hh[H + h] : 0.0f;
+    float gh_n = b_hh ? b_hh[2 * H + h] : 0.0f;
+
+    const float* wir = w_ih + h * I;
+    const float* wiz = w_ih + (H + h) * I;
+    const float* win = w_ih + (2 * H + h) * I;
+
+    for (int k = 0; k < I; ++k) {
+        float xv = x[k];
+        gi_r += wir[k] * xv;
+        gi_z += wiz[k] * xv;
+        gi_n += win[k] * xv;
+    }
+
+    const float* whr = w_hh + h * H;
+    const float* whz = w_hh + (H + h) * H;
+    const float* whn = w_hh + (2 * H + h) * H;
+
+    for (int k = 0; k < H; ++k) {
+        float hv = hp[k];
+        gh_r += whr[k] * hv;
+        gh_z += whz[k] * hv;
+        gh_n += whn[k] * hv;
+    }
+
+    float r = sigmoidf_fast(gi_r + gh_r);
+    float z = sigmoidf_fast(gi_z + gh_z);
+    float n = tanhf(gi_n + r * gh_n);
+    float old_h = hp[h];
+
+    next_h[idx] = (1.0f - z) * n + z * old_h;
+}
+
+__global__ void copy_dir_to_output_kernel(
+    const float* __restrict__ h,
+    float* __restrict__ out,
+    int B, int H, int outF, int dir
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * H;
+    if (idx >= total) return;
+
+    int hh = idx % H;
+    int b = idx / H;
+    out[b * outF + dir * H + hh] = h[idx];
+}
+
+torch::Tensor gru_hn_cuda(
+    torch::Tensor x,
+    torch::Tensor h0,
+    std::vector<torch::Tensor> weights,
+    bool batch_first,
+    bool has_bias,
+    int64_t num_layers,
+    int64_t hidden_size
+) {
+    int S = batch_first ? x.size(1) : x.size(0);
+    int B = batch_first ? x.size(0) : x.size(1);
+    int input_size = x.size(2);
+    int H = (int)hidden_size;
+
+    auto opts = x.options();
+    torch::Tensor layer_in = batch_first ? x.transpose(0, 1).contiguous() : x.contiguous();
+    torch::Tensor hn = torch::empty({num_layers * 2, B, H}, opts);
+
+    const int threads = 256;
+    const int blocks = (B * H + threads - 1) / threads;
+
+    for (int l = 0; l < num_layers; ++l) {
+        int I = (l == 0) ? input_size : 2 * H;
+        torch::Tensor layer_out = torch::empty({S, B, 2 * H}, opts);
+
+        for (int dir = 0; dir < 2; ++dir) {
+            int wi = has_bias ? (l * 2 + dir) * 4 : (l * 2 + dir) * 2;
+            torch::Tensor w_ih = weights[wi + 0].contiguous();
+            torch::Tensor w_hh = weights[wi + 1].contiguous();
+            torch::Tensor b_ih;
+            torch::Tensor b_hh;
+            const float* b_ih_ptr = nullptr;
+            const float* b_hh_ptr = nullptr;
+
+            if (has_bias) {
+                b_ih = weights[wi + 2].contiguous();
+                b_hh = weights[wi + 3].contiguous();
+                b_ih_ptr = b_ih.data_ptr<float>();
+                b_hh_ptr = b_hh.data_ptr<float>();
+            }
+
+            torch::Tensor prev = h0[l * 2 + dir].contiguous();
+            torch::Tensor next = torch::empty({B, H}, opts);
+
+            for (int step = 0; step < S; ++step) {
+                int t = dir == 0 ? step : (S - 1 - step);
+                const float* inp_ptr = layer_in.data_ptr<float>() + ((int64_t)t * B * I);
+
+                gru_step_kernel<<<blocks, threads>>>(
+                    inp_ptr,
+                    prev.data_ptr<float>(),
+                    next.data_ptr<float>(),
+                    w_ih.data_ptr<float>(),
+                    w_hh.data_ptr<float>(),
+                    b_ih_ptr,
+                    b_hh_ptr,
+                    B, I, H
+                );
+
+                copy_dir_to_output_kernel<<<blocks, threads>>>(
+                    next.data_ptr<float>(),
+                    layer_out.data_ptr<float>() + ((int64_t)t * B * 2 * H),
+                    B, H, 2 * H, dir
+                );
+
+                prev = next;
+                if (step + 1 < S) {
+                    next = torch::empty({B, H}, opts);
+                }
+            }
+
+            hn[l * 2 + dir].copy_(prev);
+        }
+
+        layer_in = layer_out;
+    }
+
+    return hn;
+}
+"""
+
+cpp_sources = r"""
+#include <torch/extension.h>
+#include <vector>
+torch::Tensor gru_hn_cuda(torch::Tensor x, torch::Tensor h0, std::vector<torch::Tensor> weights, bool batch_first, bool has_bias, int64_t num_layers, int64_t hidden_size);
+"""
+
+_gru_ext = load_inline(
+    name="custom_gru_hn_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["gru_hn_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers=3, bias=True, batch_first=False):
+        super().__init__()
+        self.gru = nn.GRU(
+            input_size,
+            hidden_size,
+            num_layers,
+            bias=bias,
+            batch_first=batch_first,
+            dropout=0,
+            bidirectional=True,
+        )
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.batch_first = batch_first
+        self.bias = bias
+
+    def forward(self, x, h0):
+        return _gru_ext.gru_hn_cuda(
+            x,
+            h0,
+            list(self.gru._flat_weights),
+            self.batch_first,
+            self.bias,
+            self.num_layers,
+            self.hidden_size,
+        )
+```

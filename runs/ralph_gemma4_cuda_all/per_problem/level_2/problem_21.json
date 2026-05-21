@@ -1,0 +1,44 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 37.8,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "0.578605",
+        "0.578573",
+        "0.578614",
+        "0.578621",
+        "0.578595"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "2.342567",
+        "2.343966",
+        "2.343851",
+        "2.343287",
+        "2.342779"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_gemma4_cuda_all/generated_kernels/level_2/problem_21.py",
+  "level": 2,
+  "model_name": "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
+  "precision": "fp32",
+  "problem_id": 21,
+  "problem_name": "21_Conv2d_Add_Scale_Sigmoid_GroupNorm.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_gemma4_cuda_all/raw_generation/level_2/problem_21.txt",
+  "static_warnings": [
+    "Uses torch.nn compute layer (only containers, Parameter, init allowed)"
+  ],
+  "status": "evaluated"
+}

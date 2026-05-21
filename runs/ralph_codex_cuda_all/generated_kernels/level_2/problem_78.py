@@ -1,0 +1,168 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <float.h>
+
+__global__ void pool_sum_fused_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ out,
+    int N, int Cin, int Din, int Hin, int Win,
+    int Cout, int K, int stride, int padding,
+    int Dout2, int Hout2, int Wout2
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * Dout2 * Hout2 * Wout2;
+    if (idx >= total) return;
+
+    int ow2 = idx % Wout2;
+    int t = idx / Wout2;
+    int oh2 = t % Hout2;
+    t /= Hout2;
+    int od2 = t % Dout2;
+    int n = t / Dout2;
+
+    float sum = 0.0f;
+
+    int d_start = od2 * 6;
+    int h_start = oh2 * 6;
+    int w_start = ow2 * 6;
+
+    for (int co = 0; co < Cout; ++co) {
+        float maxv = -FLT_MAX;
+
+        for (int dz = 0; dz < 6; ++dz) {
+            int od = d_start + dz;
+            for (int hy = 0; hy < 6; ++hy) {
+                int oh = h_start + hy;
+                for (int wx = 0; wx < 6; ++wx) {
+                    int ow = w_start + wx;
+                    float val = b ? b[co] : 0.0f;
+
+                    for (int ci = 0; ci < Cin; ++ci) {
+                        for (int kd = 0; kd < K; ++kd) {
+                            int td = od + padding - kd;
+                            if (td < 0 || td % stride != 0) continue;
+                            int id = td / stride;
+                            if (id < 0 || id >= Din) continue;
+
+                            for (int kh = 0; kh < K; ++kh) {
+                                int th = oh + padding - kh;
+                                if (th < 0 || th % stride != 0) continue;
+                                int ih = th / stride;
+                                if (ih < 0 || ih >= Hin) continue;
+
+                                for (int kw = 0; kw < K; ++kw) {
+                                    int tw = ow + padding - kw;
+                                    if (tw < 0 || tw % stride != 0) continue;
+                                    int iw = tw / stride;
+                                    if (iw < 0 || iw >= Win) continue;
+
+                                    int x_idx = (((n * Cin + ci) * Din + id) * Hin + ih) * Win + iw;
+                                    int w_idx = (((ci * Cout + co) * K + kd) * K + kh) * K + kw;
+                                    val += x[x_idx] * w[w_idx];
+                                }
+                            }
+                        }
+                    }
+                    maxv = fmaxf(maxv, val);
+                }
+            }
+        }
+        sum += maxv;
+    }
+
+    out[idx] = sum;
+}
+
+torch::Tensor fused_convtranspose_pool_sum_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int stride,
+    int padding
+) {
+    int N = x.size(0);
+    int Cin = x.size(1);
+    int Din = x.size(2);
+    int Hin = x.size(3);
+    int Win = x.size(4);
+    int Cout = weight.size(1);
+    int K = weight.size(2);
+
+    int Dout = (Din - 1) * stride - 2 * padding + K;
+    int Hout = (Hin - 1) * stride - 2 * padding + K;
+    int Wout = (Win - 1) * stride - 2 * padding + K;
+
+    int Dout1 = (Dout - 2) / 2 + 1;
+    int Hout1 = (Hout - 2) / 2 + 1;
+    int Wout1 = (Wout - 2) / 2 + 1;
+
+    int Dout2 = (Dout1 - 3) / 3 + 1;
+    int Hout2 = (Hout1 - 3) / 3 + 1;
+    int Wout2 = (Wout1 - 3) / 3 + 1;
+
+    auto out = torch::empty({N, 1, Dout2, Hout2, Wout2}, x.options());
+
+    int total = N * Dout2 * Hout2 * Wout2;
+    int threads = 128;
+    int blocks = (total + threads - 1) / threads;
+
+    pool_sum_fused_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.defined() ? bias.data_ptr<float>() : nullptr,
+        out.data_ptr<float>(),
+        N, Cin, Din, Hin, Win, Cout, K, stride, padding,
+        Dout2, Hout2, Wout2
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor fused_convtranspose_pool_sum_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int stride,
+    int padding
+);
+"""
+
+_fused_mod = load_inline(
+    name="fused_convtranspose3d_pool_sum_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["fused_convtranspose_pool_sum_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(in_channels, out_channels, kernel_size, kernel_size, kernel_size))
+        self.bias = nn.Parameter(torch.empty(out_channels))
+        self.stride = stride
+        self.padding = padding
+        nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
+        fan_in = in_channels * kernel_size * kernel_size * kernel_size
+        bound = fan_in ** -0.5
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        return _fused_mod.fused_convtranspose_pool_sum_cuda(
+            x.contiguous(),
+            self.weight.contiguous(),
+            self.bias.contiguous(),
+            self.stride,
+            self.padding,
+        )

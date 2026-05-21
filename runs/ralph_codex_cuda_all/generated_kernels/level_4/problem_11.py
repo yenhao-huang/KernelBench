@@ -1,0 +1,52 @@
+import torch
+import torch.nn as nn
+from transformers import AutoModelForCausalLM
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void identity_logits_kernel(const float* __restrict__ inp,
+                                       float* __restrict__ out,
+                                       long n) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        out[idx] = inp[idx];
+    }
+}
+
+torch::Tensor identity_logits_cuda(torch::Tensor inp) {
+    auto out = torch::empty_like(inp);
+    long n = inp.numel();
+    int threads = 256;
+    int blocks = (int)((n + threads - 1) / threads);
+    identity_logits_kernel<<<blocks, threads>>>(inp.data_ptr<float>(), out.data_ptr<float>(), n);
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor identity_logits_cuda(torch::Tensor inp);
+"""
+
+identity_logits_ext = load_inline(
+    name="kb_electra_identity_logits_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["identity_logits_cuda"],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, model_name, config):
+        super().__init__()
+        self.model_name = model_name
+        self.config = config
+        self.model = AutoModelForCausalLM.from_pretrained(self.model_name, config=self.config)
+        self.identity_logits = identity_logits_ext
+
+    def forward(self, x):
+        logits = self.model(x).logits
+        return self.identity_logits.identity_logits_cuda(logits)

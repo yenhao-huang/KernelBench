@@ -1,0 +1,195 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for Conv2d + Mish fusion
+# This combines the convolution operation with two sequential Mish activations into a single kernel pass.
+# Mish(x) = x * tanh(softplus(x)) = x * tanh(ln(1 + exp(x)))
+# We compute this element-wise after the convolution.
+
+conv_mish_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+// Helper for Mish activation: x * tanh(softplus(x))
+__device__ inline float mish(float x) {
+    // softplus(x) = ln(1 + exp(x))
+    // To avoid overflow in exp(x), we use the stable formulation:
+    // if x > threshold, softplus(x) ~ x
+    // else softplus(x) = ln(1 + exp(x))
+    
+    float sp;
+    if (x > 20.0f) {
+        sp = x;
+    } else {
+        sp = log1pf(expf(x));
+    }
+    return x * tanhf(sp);
+}
+
+__global__ void conv_mish_kernel(
+    const float* input, 
+    const float* weight, 
+    const float* bias, 
+    float* output, 
+    int batch_size, 
+    int in_channels, 
+    int out_channels, 
+    int height, 
+    int width, 
+    int kernel_h, 
+    int kernel_w,
+    int pad_h,
+    int pad_w,
+    int stride_h,
+    int stride_w
+) {
+    // Each thread handles one output element
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    int total_elements = batch_size * out_channels * height * width;
+    if (idx >= total_elements) return;
+
+    // Decompose index into spatial and channel dimensions
+    int w_idx = idx % width;
+    int h_idx = (idx / width) % height;
+    int c_out_idx = (idx / (width * height)) % out_channels;
+    int b_idx = idx / (width * height * out_channels);
+
+    float sum = 0.0f;
+    
+    // Iterate over input channels and kernel dimensions
+    for (int c_in = 0; c_in < in_channels; ++c_in) {
+        for (int kh = 0; kh < kernel_h; ++kh) {
+            for (int kw = 0; kw < kernel_w; ++kw) {
+                // Calculate input coordinates with padding and stride
+                int h_in = h_idx * stride_h + kh - pad_h;
+                int w_in = w_idx * stride_w + kw - pad_w;
+
+                // Check bounds
+                if (h_in >= 0 && h_in < height + 2 * pad_h && 
+                    w_in >= 0 && w_in < width + 2 * pad_w) {
+                    
+                    // Input tensor layout: [N, C, H, W]
+                    int input_idx = b_idx * in_channels * (height + 2 * pad_h) * (width + 2 * pad_w) 
+                                  + c_in * (height + 2 * pad_h) * (width + 2 * pad_w) 
+                                  + h_in * (width + 2 * pad_w) 
+                                  + w_in;
+                    
+                    // Weight tensor layout: [Out, In, H, W]
+                    int weight_idx = c_out_idx * in_channels * kernel_h * kernel_w 
+                                   + c_in * kernel_h * kernel_w 
+                                   + kh * kernel_w 
+                                   + kw;
+
+                    sum += input[input_idx] * weight[weight_idx];
+                }
+            }
+        }
+    }
+
+    // Add bias if present (assuming bias is always present for simplicity in this fused op, 
+    // or handle null check if needed. Here we assume bias exists as per nn.Conv2d default)
+    sum += bias[c_out_idx];
+
+    // Apply Mish activation twice
+    float out_val = mish(sum);
+    out_val = mish(out_val);
+
+    output[idx] = out_val;
+}
+
+torch::Tensor conv_mish_cuda(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    torch::Tensor bias
+) {
+    auto batch_size = input.size(0);
+    auto in_channels = input.size(1);
+    auto height = input.size(2);
+    auto width = input.size(3);
+    
+    auto out_channels = weight.size(0);
+    auto kernel_h = weight.size(2);
+    auto kernel_w = weight.size(3);
+    
+    // Assuming padding and stride are 1 for simplicity in this specific optimization example,
+    // or we can extract them from the original conv if passed. 
+    // For a general solution matching nn.Conv2d(3), we assume pad=1, stride=1.
+    int pad_h = 1;
+    int pad_w = 1;
+    int stride_h = 1;
+    int stride_w = 1;
+
+    auto output = torch::zeros({batch_size, out_channels, height, width}, input.options());
+
+    const int block_size = 256;
+    int total_elements = batch_size * out_channels * height * width;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    conv_mish_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        in_channels,
+        out_channels,
+        height,
+        width,
+        kernel_h,
+        kernel_w,
+        pad_h,
+        pad_w,
+        stride_h,
+        stride_w
+    );
+
+    return output;
+}
+"""
+
+conv_mish_cpp_source = (
+    "torch::Tensor conv_mish_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias);"
+)
+
+# Compile the inline CUDA code
+conv_mish_module = load_inline(
+    name="conv_mish",
+    cpp_sources=conv_mish_cpp_source,
+    cuda_sources=conv_mish_source,
+    functions=["conv_mish_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs a convolution, applies Mish twice, 
+    using a custom fused CUDA operator.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        
+        # Initialize weights and bias manually to match nn.Conv2d behavior
+        # We need these tensors to pass to the custom CUDA kernel
+        self.register_buffer('weight', torch.empty(out_channels, in_channels, kernel_size, kernel_size))
+        self.register_buffer('bias', torch.empty(out_channels))
+        
+        # Initialize weights using Kaiming uniform as default for Conv2d
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        # Use the custom fused operator
+        return conv_mish_module.conv_mish_cuda(x, self.weight, self.bias)
+
+import math

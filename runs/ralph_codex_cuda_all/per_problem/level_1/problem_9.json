@@ -1,0 +1,29 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 57.603,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "runtime_error": "CUDA out of memory. Tried to allocate 4.00 GiB. GPU 0 has a total capacity of 23.52 GiB of which 840.44 MiB is free. Including non-PyTorch memory, this process has 17.47 GiB memory in use. Of the a...",
+      "runtime_error_name": "torch.OutOfMemoryError",
+      "runtime_error_traceback": "Traceback (most recent call last):\n  File \"/workspace/external/KernelBench/src/kernelbench/eval.py\", line 804, in run_and_check_correctness\n    if not torch.allclose(\ntorch.OutOfMemoryError: CUDA out of memory. Tried to allocate 4.00 GiB. GPU 0 has a total capacity of 23.52 GiB of which 840.44 MiB is free. Including non-PyTorch memory, this process has 17.47 GiB memory in use. Of the allocated memory 17.02 GiB is allocated by PyTorch, and 3.88 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)\n"
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_codex_cuda_all/generated_kernels/level_1/problem_9.py",
+  "level": 1,
+  "model_name": "codex-gpt-5.5",
+  "precision": "fp32",
+  "problem_id": 9,
+  "problem_name": "9_Tall_skinny_matrix_multiplication_.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_codex_cuda_all/raw_generation/level_1/problem_9.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

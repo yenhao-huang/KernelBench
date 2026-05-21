@@ -1,0 +1,84 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+elu_cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdint.h>
+
+__device__ __forceinline__ float elu_val(float x, float alpha) {
+    return x > 0.0f ? x : alpha * (expf(x) - 1.0f);
+}
+
+__global__ void elu_kernel(const float* __restrict__ x, float* __restrict__ out, int64_t n, float alpha) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        out[idx] = elu_val(x[idx], alpha);
+    }
+}
+
+__global__ void elu_kernel_vec4(const float4* __restrict__ x, float4* __restrict__ out, int64_t n4, float alpha) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n4) {
+        float4 v = x[idx];
+        v.x = elu_val(v.x, alpha);
+        v.y = elu_val(v.y, alpha);
+        v.z = elu_val(v.z, alpha);
+        v.w = elu_val(v.w, alpha);
+        out[idx] = v;
+    }
+}
+
+torch::Tensor elu_forward_cuda(torch::Tensor x, double alpha_d) {
+    auto out = torch::empty_like(x);
+    int64_t n = x.numel();
+    if (n == 0) return out;
+
+    const float alpha = static_cast<float>(alpha_d);
+    const float* x_ptr = x.data_ptr<float>();
+    float* out_ptr = out.data_ptr<float>();
+
+    const int threads = 256;
+    bool vec_ok = (((uintptr_t)x_ptr & 15) == 0) && (((uintptr_t)out_ptr & 15) == 0) && ((n & 3) == 0);
+
+    if (vec_ok) {
+        int64_t n4 = n >> 2;
+        int blocks = (int)((n4 + threads - 1) / threads);
+        elu_kernel_vec4<<<blocks, threads>>>(
+            reinterpret_cast<const float4*>(x_ptr),
+            reinterpret_cast<float4*>(out_ptr),
+            n4,
+            alpha
+        );
+    } else {
+        int blocks = (int)((n + threads - 1) / threads);
+        elu_kernel<<<blocks, threads>>>(x_ptr, out_ptr, n, alpha);
+    }
+
+    return out;
+}
+"""
+
+elu_cpp_source = "torch::Tensor elu_forward_cuda(torch::Tensor x, double alpha_d);"
+
+elu_ext = load_inline(
+    name="elu_inline_cuda_ext",
+    cpp_sources=elu_cpp_source,
+    cuda_sources=elu_cuda_source,
+    functions=["elu_forward_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, alpha: float = 1.0):
+        super().__init__()
+        self.alpha = float(alpha)
+        self.elu_ext = elu_ext
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.elu_ext.elu_forward_cuda(x, self.alpha)
+```

@@ -1,0 +1,16 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 90.495,
+  "error": "CUDA error: an illegal memory access was encountered\nSearch for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n",
+  "error_type": "torch.AcceleratorError",
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu0_chat/generated_kernels/level_1/problem_6.py",
+  "level": 1,
+  "model_name": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+  "precision": "fp32",
+  "problem_id": 6,
+  "problem_name": "6_Matmul_with_large_K_dimension_.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu0_chat/raw_generation/level_1/problem_6.txt",
+  "status": "generation_error",
+  "traceback": "Traceback (most recent call last):\n  File \"/workspace/external/KernelBench/scripts/ralph_eval_gemma4_cuda_all.py\", line 283, in _evaluate_one\n    eval_result = eval_kernel_against_ref(\n  File \"/workspace/external/KernelBench/src/kernelbench/eval.py\", line 698, in eval_kernel_against_ref\n    graceful_eval_cleanup(context, device, tempfile)\n  File \"/workspace/external/KernelBench/src/kernelbench/eval.py\", line 233, in graceful_eval_cleanup\n    torch.cuda.empty_cache()\n  File \"/workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/cuda/memory.py\", line 280, in empty_cache\n    torch._C._cuda_emptyCache()\ntorch.AcceleratorError: CUDA error: an illegal memory access was encountered\nSearch for `cudaErrorIllegalAddress' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n\n"
+}

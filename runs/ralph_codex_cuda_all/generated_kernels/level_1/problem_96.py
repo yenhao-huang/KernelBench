@@ -1,0 +1,84 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+smooth_l1_mean_cpp_source = """
+torch::Tensor smooth_l1_mean_cuda(torch::Tensor predictions, torch::Tensor targets);
+"""
+
+smooth_l1_mean_cuda_source = """
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+
+__global__ void smooth_l1_mean_kernel(const float* __restrict__ predictions,
+                                      const float* __restrict__ targets,
+                                      float* __restrict__ out,
+                                      long long n) {
+    __shared__ float smem[256];
+
+    int tid = threadIdx.x;
+    long long stride = (long long)blockDim.x * gridDim.x;
+    long long idx = (long long)blockIdx.x * blockDim.x + tid;
+
+    float sum = 0.0f;
+    for (; idx < n; idx += stride) {
+        float d = predictions[idx] - targets[idx];
+        float a = fabsf(d);
+        sum += (a < 1.0f) ? (0.5f * d * d) : (a - 0.5f);
+    }
+
+    smem[tid] = sum;
+    __syncthreads();
+
+    for (int offset = 128; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            smem[tid] += smem[tid + offset];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        atomicAdd(out, smem[0] / (float)n);
+    }
+}
+
+torch::Tensor smooth_l1_mean_cuda(torch::Tensor predictions, torch::Tensor targets) {
+    auto out = torch::empty({}, predictions.options());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaMemsetAsync(out.data_ptr<float>(), 0, sizeof(float), stream);
+
+    long long n = predictions.numel();
+    const int threads = 256;
+    int blocks = (int)((n + threads - 1) / threads);
+    if (blocks > 4096) {
+        blocks = 4096;
+    }
+
+    smooth_l1_mean_kernel<<<blocks, threads, 0, stream>>>(
+        predictions.data_ptr<float>(),
+        targets.data_ptr<float>(),
+        out.data_ptr<float>(),
+        n
+    );
+
+    return out;
+}
+"""
+
+smooth_l1_mean_ext = load_inline(
+    name="smooth_l1_mean_ext",
+    cpp_sources=smooth_l1_mean_cpp_source,
+    cuda_sources=smooth_l1_mean_cuda_source,
+    functions=["smooth_l1_mean_cuda"],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.smooth_l1_mean_ext = smooth_l1_mean_ext
+
+    def forward(self, predictions, targets):
+        return self.smooth_l1_mean_ext.smooth_l1_mean_cuda(predictions, targets)

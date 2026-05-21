@@ -1,0 +1,116 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+conv2d_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+#define TILE_H 8
+#define TILE_W 16
+#define IC 32
+#define KH 5
+#define KW 9
+
+__global__ void conv2d_5x9_kernel(const float* __restrict__ x,
+                                  const float* __restrict__ w,
+                                  float* __restrict__ y,
+                                  int N, int OC, int H, int W,
+                                  int OH, int OW) {
+    __shared__ float tile[TILE_H + KH - 1][TILE_W + KW - 1];
+
+    int tile_x = blockIdx.x;
+    int tile_y = blockIdx.y;
+    int oc = blockIdx.z % OC;
+    int n = blockIdx.z / OC;
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int ox = tile_x * TILE_W + tx;
+    int oy = tile_y * TILE_H + ty;
+
+    float acc = 0.0f;
+
+    for (int c = 0; c < IC; ++c) {
+        for (int ly = ty; ly < TILE_H + KH - 1; ly += TILE_H) {
+            int iy = tile_y * TILE_H + ly;
+            for (int lx = tx; lx < TILE_W + KW - 1; lx += TILE_W) {
+                int ix = tile_x * TILE_W + lx;
+                tile[ly][lx] = __ldg(x + ((n * IC + c) * H + iy) * W + ix);
+            }
+        }
+
+        __syncthreads();
+
+        if (oy < OH && ox < OW) {
+            #pragma unroll
+            for (int ky = 0; ky < KH; ++ky) {
+                #pragma unroll
+                for (int kx = 0; kx < KW; ++kx) {
+                    float xv = tile[ty + ky][tx + kx];
+                    float wv = __ldg(w + ((oc * IC + c) * KH + ky) * KW + kx);
+                    acc = fmaf(xv, wv, acc);
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (oy < OH && ox < OW) {
+        y[((n * OC + oc) * OH + oy) * OW + ox] = acc;
+    }
+}
+
+torch::Tensor conv2d_5x9_cuda(torch::Tensor x, torch::Tensor weight) {
+    int N = x.size(0);
+    int OC = weight.size(0);
+    int H = x.size(2);
+    int W = x.size(3);
+    int OH = H - 4;
+    int OW = W - 8;
+
+    auto y = torch::empty({N, OC, OH, OW}, x.options());
+
+    dim3 block(TILE_W, TILE_H);
+    dim3 grid((OW + TILE_W - 1) / TILE_W,
+              (OH + TILE_H - 1) / TILE_H,
+              N * OC);
+
+    conv2d_5x9_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        y.data_ptr<float>(),
+        N, OC, H, W, OH, OW
+    );
+
+    return y;
+}
+"""
+
+conv2d_cpp = "torch::Tensor conv2d_5x9_cuda(torch::Tensor x, torch::Tensor weight);"
+
+conv2d_ext = load_inline(
+    name="kb_conv2d_5x9_direct_v1",
+    cpp_sources=conv2d_cpp,
+    cuda_sources=conv2d_source,
+    functions=["conv2d_5x9_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple,
+                 stride: int = 1, padding: int = 0, dilation: int = 1,
+                 groups: int = 1, bias: bool = False):
+        super().__init__()
+        self.conv2d = nn.Conv2d(
+            in_channels, out_channels, kernel_size,
+            stride=stride, padding=padding, dilation=dilation,
+            groups=groups, bias=bias
+        )
+        self.ext = conv2d_ext
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.ext.conv2d_5x9_cuda(x.contiguous(), self.conv2d.weight.contiguous())

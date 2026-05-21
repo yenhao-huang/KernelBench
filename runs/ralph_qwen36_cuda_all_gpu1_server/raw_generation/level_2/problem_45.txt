@@ -1,0 +1,429 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernels for Gemm (Matrix Multiplication), Sigmoid, and LogSumExp
+# We will fuse the operations where possible or create highly optimized individual kernels.
+# Given the structure: Linear -> Sigmoid -> Linear -> LogSumExp
+# We can optimize:
+# 1. The first GEMM (Linear1)
+# 2. The Sigmoid activation
+# 3. The second GEMM (Linear2)
+# 4. The LogSumExp reduction
+
+# Note: For maximum performance in a real scenario, one might fuse Linear1 + Sigmoid + Linear2 into a single kernel 
+# if the intermediate tensor doesn't need to be materialized, but standard practice often keeps activations separate 
+# for memory layout reasons unless specifically fused. However, since we are replacing operators, let's create 
+# optimized kernels for each step and potentially fuse the last two steps (Linear2 + LogSumExp) or just optimize individually.
+# Let's stick to optimizing the core heavy hitters: GEMM and the reduction.
+
+custom_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper for atomic max/add if needed, but here we use standard reductions
+
+// 1. Optimized GEMM Kernel (General Matrix Multiply)
+// Computes C = A * B^T + Bias (if bias is provided, otherwise just matmul)
+// A: [M, K], B: [N, K] -> C: [M, N]
+// We assume no bias for simplicity in the raw kernel, but we can add it.
+// To keep it simple and robust, let's implement a standard tiled GEMM or use cublas if allowed? 
+// The prompt asks for custom CUDA operators. Writing a full tiled GEMM from scratch is complex.
+// However, for "speedups", using cuBLAS via inline binding is often the most practical "custom" wrapper 
+// unless we are doing something specific like fused activations.
+// BUT, the example shows writing raw kernels. Let's write a simple but effective kernel for small-medium sizes 
+// or use a very optimized approach. 
+// Actually, for large matrices (2048x4096), a naive kernel is slower than cuBLAS.
+// The prompt implies "replace pytorch operators". PyTorch uses cuBLAS under the hood for Linear.
+// To get speedups, we usually look at FUSION. 
+// Let's fuse: Linear1 -> Sigmoid -> Linear2 -> LogSumExp into a SINGLE kernel? 
+// That might be too complex for inline code without errors.
+// Alternative: Fuse Linear2 and LogSumExp. Or just optimize the GEMM with bias addition fused.
+
+// Let's implement a fused GEMM + Bias + Activation kernel for the first layer, 
+// and another fused GEMM + LogSumExp for the second? 
+// Actually, let's look at the constraints. "Replace pytorch operators".
+// If we just call cuBLAS from CUDA, it's not really a "custom operator" in the sense of new logic, 
+// but it is a custom wrapper. However, the example shows raw kernels.
+// Let's try to write a simple, correct, and reasonably optimized GEMM kernel for FP32.
+// For 2048x4096, shared memory tiling is essential.
+
+__global__ void gemm_kernel(const float* A, const float* B, const float* bias, float* C, 
+                            int M, int N, int K) {
+    // Block dimensions
+    const int BLOCK_SIZE = 32;
+    __shared__ float As[BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ float Bs[BLOCK_SIZE][BLOCK_SIZE];
+
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int row = by * BLOCK_SIZE + ty;
+    int col = bx * BLOCK_SIZE + tx;
+
+    float sum = 0.0f;
+
+    // Loop over K in tiles
+    for (int k = 0; k < (K + BLOCK_SIZE - 1) / BLOCK_SIZE; ++k) {
+        // Load A tile
+        if (row < M && k * BLOCK_SIZE + tx < K) {
+            As[ty][tx] = A[row * K + k * BLOCK_SIZE + tx];
+        } else {
+            As[ty][tx] = 0.0f;
+        }
+
+        // Load B tile (B is stored as [N, K], we access B[col][k*BLOCK...] which is B[col*K + ...])
+        if (col < N && k * BLOCK_SIZE + ty < K) {
+            Bs[ty][tx] = B[col * K + k * BLOCK_SIZE + ty];
+        } else {
+            Bs[ty][tx] = 0.0f;
+        }
+
+        __syncthreads();
+
+        // Compute partial dot product
+        for (int i = 0; i < BLOCK_SIZE; ++i) {
+            sum += As[ty][i] * Bs[i][tx];
+        }
+
+        __syncthreads();
+    }
+
+    // Write output
+    if (row < M && col < N) {
+        float val = sum;
+        if (bias != nullptr) {
+            val += bias[col]; // Bias is usually 1D vector of size N, added to each row
+        }
+        C[row * N + col] = val;
+    }
+}
+
+// Sigmoid Kernel
+__global__ void sigmoid_kernel(const float* input, float* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float x = input[idx];
+        // Numerically stable sigmoid: 1 / (1 + exp(-x))
+        // For large positive x, exp(-x) is small. For large negative x, exp(-x) is huge.
+        // Better: if x >= 0, 1/(1+exp(-x)); else exp(x)/(1+exp(x))
+        float y;
+        if (x >= 0) {
+            y = 1.0f / (1.0f + expf(-x));
+        } else {
+            float ex = expf(x);
+            y = ex / (1.0f + ex);
+        }
+        output[idx] = y;
+    }
+}
+
+// LogSumExp Kernel
+// Computes log(sum(exp(x))) along dim 1 for each row.
+// Input: [M, N], Output: [M]
+__global__ void logsumexp_kernel(const float* input, float* output, int M, int N) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < M) {
+        // Find max for numerical stability
+        float max_val = -INFINITY;
+        for (int j = 0; j < N; ++j) {
+            if (input[row * N + j] > max_val) {
+                max_val = input[row * N + j];
+            }
+        }
+
+        // Sum exp(x - max)
+        float sum_exp = 0.0f;
+        for (int j = 0; j < N; ++j) {
+            sum_exp += expf(input[row * N + j] - max_val);
+        }
+
+        output[row] = logf(sum_exp) + max_val;
+    }
+}
+
+// Fused GEMM + Sigmoid Kernel for the first layer to save memory bandwidth
+__global__ void gemm_sigmoid_kernel(const float* A, const float* B, const float* bias, float* C, 
+                                    int M, int N, int K) {
+    const int BLOCK_SIZE = 32;
+    __shared__ float As[BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ float Bs[BLOCK_SIZE][BLOCK_SIZE];
+
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int row = by * BLOCK_SIZE + ty;
+    int col = bx * BLOCK_SIZE + tx;
+
+    float sum = 0.0f;
+
+    for (int k = 0; k < (K + BLOCK_SIZE - 1) / BLOCK_SIZE; ++k) {
+        if (row < M && k * BLOCK_SIZE + tx < K) {
+            As[ty][tx] = A[row * K + k * BLOCK_SIZE + tx];
+        } else {
+            As[ty][tx] = 0.0f;
+        }
+
+        if (col < N && k * BLOCK_SIZE + ty < K) {
+            Bs[ty][tx] = B[col * K + k * BLOCK_SIZE + ty];
+        } else {
+            Bs[ty][tx] = 0.0f;
+        }
+
+        __syncthreads();
+
+        for (int i = 0; i < BLOCK_SIZE; ++i) {
+            sum += As[ty][i] * Bs[i][tx];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        float val = sum;
+        if (bias != nullptr) {
+            val += bias[col];
+        }
+        // Apply Sigmoid
+        if (val >= 0) {
+            C[row * N + col] = 1.0f / (1.0f + expf(-val));
+        } else {
+            float ex = expf(val);
+            C[row * N + col] = ex / (1.0f + ex);
+        }
+    }
+}
+
+// Fused GEMM + LogSumExp Kernel for the second layer
+// Input A: [M, K], B: [N, K], Bias: [N]
+// Output: [M]
+__global__ void gemm_logsumexp_kernel(const float* A, const float* B, const float* bias, float* output, 
+                                      int M, int N, int K) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < M) {
+        // We need to compute the dot product for each column j in [0, N)
+        // Then apply LogSumExp over the results.
+        
+        float max_val = -INFINITY;
+        float temp_vals[32]; // Assuming N <= 1024, but we can't store all in registers easily if N is large.
+                             // However, N=1024 is small enough to process in blocks or just compute on the fly?
+                             // Computing on the fly for LogSumExp requires two passes (max then sum).
+        
+        // Pass 1: Compute max of the linear output over all j
+        // Since we can't store all N outputs, we do a reduction-like approach or just iterate.
+        // Iterating is fine for N=1024.
+        
+        float current_max = -INFINITY;
+        
+        // To optimize, we can tile the B matrix access? 
+        // For simplicity and correctness with N=1024, we'll just loop.
+        // But wait, doing a full GEMM row for each thread is O(N*K).
+        // With M=16384, N=1024, K=4096.
+        
+        // Let's compute the linear output for this row into a temporary buffer? 
+        // No, too much shared memory.
+        // We can do two passes over K for each j? No.
+        
+        // Better approach: Use shared memory to store the intermediate results for this row if N is small.
+        // N=1024. 1024 floats = 4KB. Shared memory per block is usually 48KB+.
+        // We can have one thread block handle multiple rows? Or one thread per row?
+        // If one thread per row, we need to store 1024 values. That fits in shared memory if we allocate it dynamically or statically large enough.
+        
+        // Let's use a grid-stride loop or just assume N is small enough for registers? No.
+        // Let's use shared memory for the intermediate outputs of size N.
+        
+        extern __shared__ float sdata[];
+        
+        // Each thread computes a partial dot product for a subset of K?
+        // Or each thread computes one element of the output vector (size N)?
+        // If we have 1024 threads per block, each thread computes one j.
+        // But M=16384. We need many blocks.
+        
+        // Let's change strategy: One block handles one row? No, too slow.
+        // Standard GEMM is better. Then separate LogSumExp.
+        // The prompt allows replacing multiple operators.
+        // Let's stick to separate optimized kernels for clarity and correctness, 
+        // but fuse the bias addition into GEMM.
+        
+        // Actually, let's just implement the standard GEMM + Bias and Sigmoid separately as they are well-defined.
+        // And a specialized LogSumExp.
+    }
+}
+
+// We will expose functions that call these kernels.
+
+torch::Tensor gemm_sigmoid_cuda(torch::Tensor A, torch::Tensor B, torch::Tensor bias) {
+    auto M = A.size(0);
+    auto K = A.size(1);
+    auto N = B.size(0); // B is [N, K] in PyTorch Linear, but stored as [K, N] in memory? 
+                        // PyTorch Linear: out = x @ W.T + b. W is [out_features, in_features].
+                        // So if A is [M, K], B should be [N, K] for A @ B^T?
+                        // In PyTorch: torch.nn.Linear(in, out) has weight [out, in].
+                        // x (M, in) @ W.T (in, out) -> (M, out).
+                        // So if we pass B as the weight matrix [N, K], we need to transpose it or handle layout.
+                        // The kernel above assumes A is [M, K] and B is [N, K] and computes A @ B^T.
+                        // PyTorch Linear weights are stored as [out_features, in_features].
+                        // So if we pass the weight tensor directly, it is [N, K].
+                        // The kernel expects B to be [N, K] where B[j][k] is accessed.
+                        // A @ B^T means C[i][j] = sum_k A[i][k] * B[j][k].
+                        // This matches the kernel logic: As[ty][tx] = A[row][col_in_K], Bs[ty][tx] = B[col][row_in_K]?
+                        // Wait. In the kernel:
+                        // As[ty][tx] = A[row * K + k*BLOCK + tx]. Row is M-index, tx is K-index. Correct.
+                        // Bs[ty][tx] = B[col * K + k*BLOCK + ty]. Col is N-index, ty is K-index. Correct.
+                        // So this kernel computes C = A @ B^T.
+    
+    auto out = torch::empty({M, N}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    
+    const int block_size = 32;
+    dim3 grid((N + block_size - 1) / block_size, (M + block_size - 1) / block_size);
+    dim3 threads(block_size, block_size);
+    
+    gemm_sigmoid_kernel<<<grid, threads>>>(
+        A.data_ptr<float>(), 
+        B.data_ptr<float>(), 
+        bias != nullptr ? bias.data_ptr<float>() : nullptr, 
+        out.data_ptr<float>(), 
+        M, N, K
+    );
+    
+    return out;
+}
+
+torch::Tensor gemm_cuda(torch::Tensor A, torch::Tensor B, torch::Tensor bias) {
+    auto M = A.size(0);
+    auto K = A.size(1);
+    auto N = B.size(0);
+    
+    auto out = torch::empty({M, N}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    
+    const int block_size = 32;
+    dim3 grid((N + block_size - 1) / block_size, (M + block_size - 1) / block_size);
+    dim3 threads(block_size, block_size);
+    
+    gemm_kernel<<<grid, threads>>>(
+        A.data_ptr<float>(), 
+        B.data_ptr<float>(), 
+        bias != nullptr ? bias.data_ptr<float>() : nullptr, 
+        out.data_ptr<float>(), 
+        M, N, K
+    );
+    
+    return out;
+}
+
+torch::Tensor sigmoid_cuda(torch::Tensor input) {
+    auto size = input.numel();
+    auto out = torch::empty_like(input);
+    
+    const int block_size = 256;
+    dim3 grid((size + block_size - 1) / block_size);
+    dim3 threads(block_size);
+    
+    sigmoid_kernel<<<grid, threads>>>(input.data_ptr<float>(), out.data_ptr<float>(), size);
+    
+    return out;
+}
+
+torch::Tensor logsumexp_cuda(torch::Tensor input) {
+    // Input: [M, N], Output: [M]
+    auto M = input.size(0);
+    auto N = input.size(1);
+    auto out = torch::empty({M}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+    
+    const int block_size = 256;
+    dim3 grid((M + block_size - 1) / block_size);
+    dim3 threads(block_size);
+    
+    logsumexp_kernel<<<grid, threads>>>(input.data_ptr<float>(), out.data_ptr<float>(), M, N);
+    
+    return out;
+}
+
+"""
+
+custom_cpp_source = """
+torch::Tensor gemm_sigmoid_cuda(torch::Tensor A, torch::Tensor B, torch::Tensor bias);
+torch::Tensor gemm_cuda(torch::Tensor A, torch::Tensor B, torch::Tensor bias);
+torch::Tensor sigmoid_cuda(torch::Tensor input);
+torch::Tensor logsumexp_cuda(torch::Tensor input);
+"""
+
+# Load the inline extension
+custom_ops = load_inline(
+    name="custom_ops",
+    cpp_sources=custom_cpp_source,
+    cuda_sources=custom_cuda_source,
+    functions=["gemm_sigmoid_cuda", "gemm_cuda", "sigmoid_cuda", "logsumexp_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model using custom CUDA operators.
+    Fuses Linear1 and Sigmoid into a single GEMM+Sigmoid kernel.
+    Uses optimized GEMM for Linear2.
+    Uses optimized LogSumExp reduction.
+    """
+    def __init__(self, input_size, hidden_size, output_size):
+        super(ModelNew, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+        
+        # Initialize weights and biases manually to ensure they are on CUDA
+        # We need to register them as parameters so they can be trained
+        self.register_parameter('weight1', nn.Parameter(torch.randn(output_size, input_size))) # Wait, Linear1 is input->hidden
+        # Correction:
+        # linear1: input_size -> hidden_size. Weight shape: [hidden_size, input_size]
+        # linear2: hidden_size -> output_size. Weight shape: [output_size, hidden_size]
+        
+        self.weight1 = nn.Parameter(torch.randn(hidden_size, input_size))
+        self.bias1 = nn.Parameter(torch.zeros(hidden_size))
+        self.weight2 = nn.Parameter(torch.randn(output_size, hidden_size))
+        self.bias2 = nn.Parameter(torch.zeros(output_size))
+
+    def forward(self, x):
+        # x: [batch_size, input_size]
+        
+        # Step 1: Linear1 + Sigmoid fused
+        # Custom kernel expects A=[M, K], B=[N, K] for A @ B^T
+        # PyTorch Linear: out = x @ W.T + b. W is [out_features, in_features].
+        # So W1 is [hidden_size, input_size].
+        # x is [batch_size, input_size].
+        # We want to compute x @ W1^T.
+        # Our kernel gemm_sigmoid_cuda(A, B, bias) computes A @ B^T + bias.
+        # So we pass x as A, weight1 as B.
+        
+        h = custom_ops.gemm_sigmoid_cuda(x, self.weight1, self.bias1)
+        
+        # Step 2: Linear2
+        # h is [batch_size, hidden_size]
+        # weight2 is [output_size, hidden_size]
+        # We want h @ W2^T + b2
+        
+        z = custom_ops.gemm_cuda(h, self.weight2, self.bias2)
+        
+        # Step 3: LogSumExp over dim 1 (features)
+        # z is [batch_size, output_size]
+        # logsumexp expects input [M, N], returns [M]
+        
+        out = custom_ops.logsumexp_cuda(z)
+        
+        return out
+
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size)]
+
+def get_init_inputs():
+    return [input_size, hidden_size, output_size]
+```

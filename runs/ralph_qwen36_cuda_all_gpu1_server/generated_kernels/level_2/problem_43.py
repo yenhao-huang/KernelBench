@@ -1,0 +1,266 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernels for Conv3d + MaxPool3d + LogSumExp + ReLU fusion
+# We will implement a fused kernel that performs:
+# 1. Conv3d (im2col + gemm or direct convolution)
+# 2. MaxPool3d
+# 3. LogSumExp over the channel dimension
+# 4. ReLU
+
+# Note: Implementing a full optimized Conv3d from scratch in inline CUDA is extremely complex 
+# and usually slower than cuDNN unless highly specialized. However, for the sake of this exercise 
+# and to demonstrate operator fusion benefits on the subsequent layers (which are often bottlenecks 
+# or have high overhead), we will focus on fusing MaxPool3d, LogSumExp, and ReLU into a single kernel.
+# We will keep the Conv3d as is because cuDNN's conv3d is heavily optimized.
+# However, to strictly follow "replace pytorch operators", we can replace the sequence 
+# max_pool -> logsumexp -> relu with a custom fused kernel.
+
+fused_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+#define MAX_CHANNELS 1024 // Adjust based on expected max channels, or use dynamic allocation if needed. 
+                          // For this example, we assume a reasonable upper bound or handle via grid-stride loops.
+                          // Actually, let's make it generic using shared memory or just global memory with atomicMax for pooling?
+                          // MaxPool3d over spatial dims (D, H, W) keeping C constant.
+                          // LogSumExp over C dimension.
+
+// Helper for logsumexp
+__device__ inline float warpReduceLogSumExp(float val) {
+    // This is tricky because logsumexp is not associative in the same way as sum.
+    // We need to compute max and sum of exp(x - max).
+    // Standard approach: 
+    // 1. Find max in warp.
+    // 2. Compute sum(exp(val - max)) in warp.
+    // 3. Return max + log(sum).
+    
+    // For simplicity in a single kernel without complex shared memory management for arbitrary C,
+    // we might process one sample (batch, d, h, w) at a time if C is small, or use atomic operations.
+    // Given the constraints of inline CUDA and complexity, let's implement a simpler version:
+    // We will launch one thread per output element (B, D', H', W').
+    // Each thread will iterate over all channels to compute LogSumExp.
+    
+    return val; 
+}
+
+__global__ void fused_maxpool_logsumexp_relu_kernel(
+    const float* input,      // Output of Conv3d: [N, C, D, H, W]
+    float* output,           // Final output: [N, 1, D/2, H/2, W/2]
+    int N, int C, int D, int H, int W,
+    int pool_size,           // 2
+    int stride_pool          // 2
+) {
+    // Output dimensions after pooling:
+    int out_D = (D - pool_size) / stride_pool + 1;
+    int out_H = (H - pool_size) / stride_pool + 1;
+    int out_W = (W - pool_size) / stride_pool + 1;
+
+    // Each thread handles one output element: (n, d_out, h_out, w_out)
+    // The output has shape [N, 1, out_D, out_H, out_W]
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * out_D * out_H * out_W;
+
+    if (idx >= total_elements) return;
+
+    // Decode index to coordinates
+    int w_out = idx % out_W;
+    int temp = idx / out_W;
+    int h_out = temp % out_H;
+    int d_out = temp / out_H;
+    int n = d_out * out_H * out_W + h_out * out_W + w_out; // Wait, this logic is slightly off for linear indexing
+    
+    // Correct decoding:
+    // idx = n * (out_D * out_H * out_W) + d_out * (out_H * out_W) + h_out * out_W + w_out
+    int spatial_size = out_D * out_H * out_W;
+    n = idx / spatial_size;
+    int rem = idx % spatial_size;
+    w_out = rem % out_W;
+    rem /= out_W;
+    h_out = rem % out_H;
+    d_out = rem / out_H;
+
+    // Compute the corresponding input coordinates for MaxPool3d
+    // Input D, H, W. Pool kernel 2x2x2, stride 2.
+    // For a given output coordinate (d_out, h_out, w_out), the input region is:
+    // d_in_start = d_out * stride_pool
+    // h_in_start = h_out * stride_pool
+    // w_in_start = w_out * stride_pool
+    
+    int d_in_start = d_out * stride_pool;
+    int h_in_start = h_out * stride_pool;
+    int w_in_start = w_out * stride_pool;
+
+    // We need to compute LogSumExp over C for the max pooled values.
+    // Step 1: Find Max value across all channels and spatial pool region for this output location.
+    float max_val = -INFINITY;
+    
+    // Iterate over all channels
+    for (int c = 0; c < C; ++c) {
+        // Iterate over the 2x2x2 pool region
+        for (int dz = 0; dz < pool_size; ++dz) {
+            int d_idx = d_in_start + dz;
+            if (d_idx >= D) continue;
+            
+            for (int dh = 0; dh < pool_size; ++dh) {
+                int h_idx = h_in_start + dh;
+                if (h_idx >= H) continue;
+
+                for (int dw = 0; dw < pool_size; ++dw) {
+                    int w_idx = w_in_start + dw;
+                    if (w_idx >= W) continue;
+
+                    // Linear index in input tensor [N, C, D, H, W]
+                    // Strides: C*D*H*W, D*H*W, H*W, W, 1
+                    int input_idx = n * (C * D * H * W) + 
+                                    c * (D * H * W) + 
+                                    d_idx * (H * W) + 
+                                    h_idx * W + 
+                                    w_idx;
+                    
+                    float val = input[input_idx];
+                    if (val > max_val) {
+                        max_val = val;
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 2: Compute Sum(exp(val - max_val)) across all channels and spatial pool region
+    float sum_exp = 0.0f;
+    
+    for (int c = 0; c < C; ++c) {
+        for (int dz = 0; dz < pool_size; ++dz) {
+            int d_idx = d_in_start + dz;
+            if (d_idx >= D) continue;
+            
+            for (int dh = 0; dh < pool_size; ++dh) {
+                int h_idx = h_in_start + dh;
+                if (h_idx >= H) continue;
+
+                for (int dw = 0; dw < pool_size; ++dw) {
+                    int w_idx = w_in_start + dw;
+                    if (w_idx >= W) continue;
+
+                    int input_idx = n * (C * D * H * W) + 
+                                    c * (D * H * W) + 
+                                    d_idx * (H * W) + 
+                                    h_idx * W + 
+                                    w_idx;
+                    
+                    float val = input[input_idx];
+                    sum_exp += expf(val - max_val);
+                }
+            }
+        }
+    }
+
+    // Step 3: LogSumExp = max_val + log(sum_exp)
+    float lse = max_val + logf(sum_exp);
+
+    // Step 4: ReLU
+    if (lse < 0.0f) {
+        lse = 0.0f;
+    }
+
+    // Write to output tensor [N, 1, out_D, out_H, out_W]
+    // Strides for output: 1 * out_D * out_H * out_W (for N), 0 (for C=1), etc.
+    int output_idx = n * (1 * out_D * out_H * out_W) + 
+                     0 * (out_D * out_H * out_W) + 
+                     d_out * (out_H * out_W) + 
+                     h_out * out_W + 
+                     w_out;
+                     
+    output[output_idx] = lse;
+}
+
+torch::Tensor fused_maxpool_logsumexp_relu(torch::Tensor input) {
+    // Input shape: [N, C, D, H, W]
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(input.dim() == 5, "Input must be 5D");
+
+    auto N = input.size(0);
+    auto C = input.size(1);
+    auto D = input.size(2);
+    auto H = input.size(3);
+    auto W = input.size(4);
+
+    int pool_size = 2;
+    int stride_pool = 2;
+
+    int out_D = (D - pool_size) / stride_pool + 1;
+    int out_H = (H - pool_size) / stride_pool + 1;
+    int out_W = (W - pool_size) / stride_pool + 1;
+
+    // Output shape: [N, 1, out_D, out_H, out_W]
+    auto output = torch::zeros({N, 1, out_D, out_H, out_W}, input.options());
+
+    const int block_size = 256;
+    int total_elements = N * out_D * out_H * out_W;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    fused_maxpool_logsumexp_relu_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        output.data_ptr<float>(),
+        N, C, D, H, W,
+        pool_size, stride_pool
+    );
+
+    // Check for errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA error in fused kernel: ") + cudaGetErrorString(err));
+    }
+
+    return output;
+}
+"""
+
+fused_ops_cpp_source = (
+    "torch::Tensor fused_maxpool_logsumexp_relu(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_source,
+    functions=["fused_maxpool_logsumexp_relu"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model that replaces MaxPool3d, LogSumExp, and ReLU with a custom fused CUDA operator.
+    Conv3d is left as PyTorch's nn.Conv3d to leverage cuDNN optimizations.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        # We do not use nn.MaxPool3d anymore
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, in_channels, depth, height, width)
+        Returns:
+            Output tensor of shape (batch_size, 1, depth', height', width')
+            Note: The output channel dimension is reduced to 1 due to LogSumExp over dim=1.
+        """
+        x = self.conv(x)
+        # Replace max_pool -> logsumexp -> relu with fused custom operator
+        x = fused_ops.fused_maxpool_logsumexp_relu(x)
+        return x
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, depth, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding]

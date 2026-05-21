@@ -1,0 +1,125 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void colsum_kernel(const float* __restrict__ w, float* __restrict__ coeff, int in_f, int out_f) {
+    int col = blockIdx.x;
+    int tid = threadIdx.x;
+    float acc = 0.0f;
+
+    for (int row = tid; row < out_f; row += blockDim.x) {
+        acc += w[row * in_f + col];
+    }
+
+    __shared__ float smem[256];
+    smem[tid] = acc;
+    __syncthreads();
+
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) smem[tid] += smem[tid + stride];
+        __syncthreads();
+    }
+
+    if (tid == 0) coeff[col] = smem[0];
+}
+
+__global__ void bias_sum_kernel(const float* __restrict__ bias, float* __restrict__ out, int out_f) {
+    int tid = threadIdx.x;
+    float acc = 0.0f;
+
+    for (int i = tid; i < out_f; i += blockDim.x) {
+        acc += bias[i];
+    }
+
+    __shared__ float smem[256];
+    smem[tid] = acc;
+    __syncthreads();
+
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) smem[tid] += smem[tid + stride];
+        __syncthreads();
+    }
+
+    if (tid == 0) out[0] = smem[0];
+}
+
+__global__ void final_dot_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ coeff,
+    const float* __restrict__ bias_sum,
+    float* __restrict__ out,
+    int batch,
+    int in_f
+) {
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+    float acc = 0.0f;
+
+    const float* xb = x + b * in_f;
+    for (int i = tid; i < in_f; i += blockDim.x) {
+        acc += xb[i] * coeff[i];
+    }
+
+    __shared__ float smem[256];
+    smem[tid] = acc;
+    __syncthreads();
+
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) smem[tid] += smem[tid + stride];
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out[b] = smem[0] + bias_sum[0];
+    }
+}
+
+torch::Tensor fused_linear_reduce_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias) {
+    int batch = x.size(0);
+    int in_f = x.size(1);
+    int out_f = weight.size(0);
+
+    auto coeff = torch::empty({in_f}, x.options());
+    auto bsum = torch::empty({1}, x.options());
+    auto out = torch::empty({batch, 1}, x.options());
+
+    const int threads = 256;
+
+    colsum_kernel<<<in_f, threads>>>(weight.data_ptr<float>(), coeff.data_ptr<float>(), in_f, out_f);
+    bias_sum_kernel<<<1, threads>>>(bias.data_ptr<float>(), bsum.data_ptr<float>(), out_f);
+    final_dot_kernel<<<batch, threads>>>(x.data_ptr<float>(), coeff.data_ptr<float>(), bsum.data_ptr<float>(), out.data_ptr<float>(), batch, in_f);
+
+    return out;
+}
+"""
+
+cpp_sources = "torch::Tensor fused_linear_reduce_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias);"
+
+fused_linear_reduce = load_inline(
+    name="fused_linear_reduce_kernelbench",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["fused_linear_reduce_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
+
+    def forward(self, x):
+        return fused_linear_reduce.fused_linear_reduce_cuda(
+            x.contiguous(),
+            self.linear.weight.contiguous(),
+            self.linear.bias.contiguous(),
+        )
+```

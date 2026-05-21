@@ -1,0 +1,247 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for the Inception-like block
+# This kernel fuses: Conv2d(1x1) + ReLU, Conv2d(3x3) + ReLU, and Concat along channel dimension.
+# It assumes input is (N, C, H, W) and outputs (N, C1+C2, H, W).
+inception_block_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper for 1x1 Conv + ReLU
+__global__ void conv1x1_relu_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight, // Shape: [out_ch, in_ch, 1, 1] -> flattened to [out_ch * in_ch]
+    const float* __restrict__ bias,
+    float* __restrict__ output,
+    int batch_size,
+    int in_channels,
+    int out_channels,
+    int height,
+    int width) 
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * out_channels * height * width;
+    
+    if (idx < total_elements) {
+        // Map linear index to coordinates: n, c_out, h, w
+        int temp = idx;
+        int w = temp % width;
+        temp /= width;
+        int h = temp % height;
+        temp /= height;
+        int c_out = temp % out_channels;
+        int n = temp / out_channels;
+
+        float sum = 0.0f;
+        if (bias != nullptr) {
+            sum = bias[c_out];
+        }
+        
+        // Perform dot product over input channels
+        for (int c_in = 0; c_in < in_channels; ++c_in) {
+            // Weight index: out_ch * in_ch + c_in (since kernel is 1x1, spatial dims are ignored)
+            // Input index: n * in_ch * H * W + c_in * H * W + h * W + w
+            int weight_idx = c_out * in_channels + c_in;
+            int input_idx = ((n * in_channels + c_in) * height + h) * width + w;
+            
+            sum += input[input_idx] * weight[weight_idx];
+        }
+        
+        // Apply ReLU
+        output[idx] = (sum > 0.0f) ? sum : 0.0f;
+    }
+}
+
+// Helper for 3x3 Conv + ReLU with padding=1
+__global__ void conv3x3_relu_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight, // Shape: [out_ch, in_ch, 3, 3] -> flattened to [out_ch * in_ch * 9]
+    const float* __restrict__ bias,
+    float* __restrict__ output,
+    int batch_size,
+    int in_channels,
+    int out_channels,
+    int height,
+    int width) 
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * out_channels * height * width;
+    
+    if (idx < total_elements) {
+        // Map linear index to coordinates: n, c_out, h, w
+        int temp = idx;
+        int w = temp % width;
+        temp /= width;
+        int h = temp % height;
+        temp /= height;
+        int c_out = temp % out_channels;
+        int n = temp / out_channels;
+
+        float sum = 0.0f;
+        if (bias != nullptr) {
+            sum = bias[c_out];
+        }
+        
+        // Iterate over input channels and 3x3 kernel
+        for (int c_in = 0; c_in < in_channels; ++c_in) {
+            for (int ky = -1; ky <= 1; ++ky) {
+                for (int kx = -1; kx <= 1; ++kx) {
+                    int ny = h + ky;
+                    int nx = w + kx;
+                    
+                    // Handle padding: if out of bounds, treat as 0.0f
+                    float val = 0.0f;
+                    if (ny >= 0 && ny < height && nx >= 0 && nx < width) {
+                        int input_idx = ((n * in_channels + c_in) * height + ny) * width + nx;
+                        val = input[input_idx];
+                    }
+                    
+                    // Weight index: out_ch * in_ch * 9 + c_in * 9 + (ky+1)*3 + (kx+1)
+                    int weight_idx = c_out * in_channels * 9 + c_in * 9 + (ky + 1) * 3 + (kx + 1);
+                    
+                    sum += val * weight[weight_idx];
+                }
+            }
+        }
+        
+        // Apply ReLU
+        output[idx] = (sum > 0.0f) ? sum : 0.0f;
+    }
+}
+
+torch::Tensor inception_block_cuda(
+    torch::Tensor input,
+    torch::Tensor weight1x1,
+    torch::Tensor bias1x1,
+    torch::Tensor weight3x3,
+    torch::Tensor bias3x3) 
+{
+    auto batch_size = input.size(0);
+    auto in_channels = input.size(1);
+    auto height = input.size(2);
+    auto width = input.size(3);
+    
+    auto out_ch1x1 = weight1x1.size(0);
+    auto out_ch3x3 = weight3x3.size(0);
+    
+    // Allocate output tensors
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(input.device());
+    torch::Tensor out1x1 = torch::empty({batch_size, out_ch1x1, height, width}, options);
+    torch::Tensor out3x3 = torch::empty({batch_size, out_ch3x3, height, width}, options);
+    
+    const int block_size = 256;
+    int total_elements_1x1 = batch_size * out_ch1x1 * height * width;
+    int total_elements_3x3 = batch_size * out_ch3x3 * height * width;
+    
+    int num_blocks_1x1 = (total_elements_1x1 + block_size - 1) / block_size;
+    int num_blocks_3x3 = (total_elements_3x3 + block_size - 1) / block_size;
+
+    // Launch 1x1 Conv + ReLU kernel
+    conv1x1_relu_kernel<<<num_blocks_1x1, block_size>>>(
+        input.data_ptr<float>(),
+        weight1x1.data_ptr<float>(),
+        bias1x1.numel() > 0 ? bias1x1.data_ptr<float>() : nullptr,
+        out1x1.data_ptr<float>(),
+        batch_size, in_channels, out_ch1x1, height, width
+    );
+
+    // Launch 3x3 Conv + ReLU kernel
+    conv3x3_relu_kernel<<<num_blocks_3x3, block_size>>>(
+        input.data_ptr<float>(),
+        weight3x3.data_ptr<float>(),
+        bias3x3.numel() > 0 ? bias3x3.data_ptr<float>() : nullptr,
+        out3x3.data_ptr<float>(),
+        batch_size, in_channels, out_ch3x3, height, width
+    );
+
+    // Concatenate along channel dimension (dim=1)
+    torch::Tensor output = torch::cat({out1x1, out3x3}, 1);
+    
+    return output;
+}
+"""
+
+inception_block_cpp_source = (
+    "torch::Tensor inception_block_cuda("
+    "torch::Tensor input,"
+    "torch::Tensor weight1x1,"
+    "torch::Tensor bias1x1,"
+    "torch::Tensor weight3x3,"
+    "torch::Tensor bias3x3"
+    ");"
+);
+
+// Compile the inline CUDA code
+inception_block = load_inline(
+    name="inception_block",
+    cpp_sources=inception_block_cpp_source,
+    cuda_sources=inception_block_source,
+    functions=["inception_block_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, squeeze_channels, expand1x1_channels, expand3x3_channels):
+        """
+        :param in_channels: Number of input channels
+        :param squeeze_channels: Number of output channels for the squeeze layer (used as input to both branches)
+        :param expand1x1_channels: Number of output channels for the 1x1 expand layer
+        :param expand3x3_channels: Number of output channels for the 3x3 expand layer
+        """
+        super(ModelNew, self).__init__()
+        
+        # Store parameters to be passed to CUDA kernel
+        self.register_buffer('weight1x1', torch.empty(0))
+        self.register_buffer('bias1x1', torch.empty(0))
+        self.register_buffer('weight3x3', torch.empty(0))
+        self.register_buffer('bias3x3', torch.empty(0))
+        
+        self.in_channels = in_channels
+        self.squeeze_channels = squeeze_channels
+        self.expand1x1_channels = expand1x1_channels
+        self.expand3x3_channels = expand3x3_channels
+
+    def forward(self, x):
+        """
+        :param x: Input tensor, shape (batch_size, in_channels, height, width)
+        :return: Output tensor, shape (batch_size, expand1x1_channels + expand3x3_channels, height, width)
+        """
+        # The custom CUDA operator expects the weights and biases to be registered buffers.
+        # In a real deployment scenario, these would be loaded from a checkpoint.
+        # For this optimization, we assume the model has been initialized with valid weights.
+        
+        return inception_block.inception_block_cuda(
+            x,
+            self.weight1x1,
+            self.bias1x1,
+            self.weight3x3,
+            self.bias3x3
+        )
+
+# Test code
+batch_size = 128
+num_input_features = 3
+num_output_features = 64
+height, width = 256, 256
+squeeze_channels = 6
+expand1x1_channels = 64
+expand3x3_channels = 64
+
+def get_inputs():
+    return [torch.rand(batch_size, num_input_features, height, width)]
+
+def get_init_inputs():
+    # Return the parameters required to initialize the model weights
+    # We need to generate random weights for the custom operator to use
+    w1x1 = torch.randn(expand1x1_channels, squeeze_channels, 1, 1)
+    b1x1 = torch.zeros(expand1x1_channels)
+    w3x3 = torch.randn(expand3x3_channels, squeeze_channels, 3, 3)
+    b3x3 = torch.zeros(expand3x3_channels)
+    return [num_input_features, squeeze_channels, expand1x1_channels, expand3x3_channels, w1x1, b1x1, w3x3, b3x3]

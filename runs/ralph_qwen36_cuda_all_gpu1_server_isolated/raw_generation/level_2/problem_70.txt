@@ -1,0 +1,157 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for Gemm_Sigmoid_Scaling_ResidualAdd
+# This fuses: Linear (GEMM) -> Sigmoid -> Scaling -> Residual Add
+# We use a simple GEMM implementation for demonstration, but in practice one would use CUTLASS or cuBLAS.
+# However, to keep it self-contained and compilable without external libraries like CUTLASS, 
+# we will implement a basic row-major GEMM kernel fused with the rest of the operations.
+# Note: For production, using torch.nn.Linear (which uses cuBLAS) is often faster than a naive CUDA GEMM.
+# But to demonstrate "custom CUDA operators" replacing PyTorch ops as requested, we replace the entire forward logic.
+
+gemm_sigmoid_scaling_residual_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper for sigmoid
+__device__ inline float sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+// Kernel for fused GEMM + Sigmoid + Scaling + Residual Add
+// Output = (Input @ Weight^T) * scaling_factor + Input
+// Note: The original model does x = gemm(x), then residual add with original_x.
+// So: out[i][j] = sigmoid(sum_k(x[i][k] * w[j][k])) * scale + x[i][j]
+// Wait, the residual is added to the Scaled Sigmoid output? 
+// Let's re-read the model:
+// x = self.gemm(x)  -> [B, H]
+// original_x = x    -> [B, H]
+// x = torch.sigmoid(x) -> [B, H]
+// x = x * scaling_factor -> [B, H]
+// x = x + original_x -> [B, H]
+// So: out[i][j] = sigmoid(gemm_out[i][j]) * scale + gemm_out[i][j]
+
+__global__ void fused_gemm_sigmoid_scaling_residual_kernel(
+    const float* __restrict__ input, 
+    const float* __restrict__ weight, 
+    const float* __restrict__ residual_input, // This is the original x before GEMM? No, wait.
+    float* __restrict__ output, 
+    int batch_size, 
+    int input_size, 
+    int hidden_size, 
+    float scaling_factor) 
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < batch_size && col < hidden_size) {
+        // Compute GEMM for this element: sum_k(input[row][k] * weight[col][k])
+        float sum = 0.0f;
+        for (int k = 0; k < input_size; ++k) {
+            sum += input[row * input_size + k] * weight[col * input_size + k];
+        }
+        
+        // Apply Sigmoid
+        float sig = sigmoid(sum);
+        
+        // Apply Scaling
+        float scaled = sig * scaling_factor;
+        
+        // Add Residual (original_x)
+        // Note: In the original code, residual is added to the scaled sigmoid output.
+        // The residual input is the same as the input tensor passed in? 
+        // Yes, x = gemm(x), original_x = x. So residual_input should be the same as 'input'.
+        float out_val = scaled + residual_input[row * hidden_size + col];
+        
+        output[row * hidden_size + col] = out_val;
+    }
+}
+
+torch::Tensor fused_gemm_sigmoid_scaling_residual_cuda(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    float scaling_factor) 
+{
+    auto batch_size = input.size(0);
+    auto input_size = input.size(1);
+    auto hidden_size = weight.size(0); // Weight is [hidden_size, input_size] in nn.Linear
+    
+    auto output = torch::zeros({batch_size, hidden_size}, input.options());
+
+    dim3 threadsPerBlock(32, 32);
+    dim3 numBlocks((hidden_size + threadsPerBlock.x - 1) / threadsPerBlock.x, 
+                   (batch_size + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    fused_gemm_sigmoid_scaling_residual_kernel<<<numBlocks, threadsPerBlock>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        input.data_ptr<float>(), // residual is same as input
+        output.data_ptr<float>(),
+        batch_size,
+        input_size,
+        hidden_size,
+        scaling_factor
+    );
+
+    return output;
+}
+"""
+
+fused_gemm_sigmoid_scaling_residual_cpp_source = (
+    "torch::Tensor fused_gemm_sigmoid_scaling_residual_cuda(torch::Tensor input, torch::Tensor weight, float scaling_factor);"
+)
+
+# Compile the inline CUDA code
+fused_kernel = load_inline(
+    name="fused_gemm_sigmoid_scaling_residual",
+    cpp_sources=fused_gemm_sigmoid_scaling_residual_cpp_source,
+    cuda_sources=gemm_sigmoid_scaling_residual_source,
+    functions=["fused_gemm_sigmoid_scaling_residual_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model implementing the pattern "Gemm_Sigmoid_Scaling_ResidualAdd" 
+    with a custom fused CUDA operator.
+    """
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super(ModelNew, self).__init__()
+        # We still need to store the weight matrix for the forward pass
+        # In a real scenario, you might initialize this via nn.Linear and then extract weights,
+        # or just use nn.Linear and replace the forward. Here we mimic the structure.
+        self.weight = nn.Parameter(torch.randn(hidden_size, input_size))
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        """
+        Forward pass using the custom fused CUDA kernel.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, input_size).
+            
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, hidden_size).
+        """
+        return fused_kernel.fused_gemm_sigmoid_scaling_residual_cuda(x, self.weight, self.scaling_factor)
+
+
+# Helper functions to match the interface expected by the prompt's testing harness
+def get_inputs():
+    batch_size = 1024
+    input_size = 8192
+    hidden_size = 8192
+    return [torch.rand(batch_size, input_size)]
+
+def get_init_inputs():
+    input_size = 8192
+    hidden_size = 8192
+    scaling_factor = 2.0
+    return [input_size, hidden_size, scaling_factor]
+```

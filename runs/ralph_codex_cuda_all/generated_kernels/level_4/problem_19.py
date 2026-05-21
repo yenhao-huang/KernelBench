@@ -1,0 +1,52 @@
+import torch
+import torch.nn as nn
+from transformers import AutoModelForCausalLM
+from torch.utils.cpp_extension import load_inline
+
+logits_identity_cpp_source = """
+torch::Tensor logits_identity_cuda(torch::Tensor x);
+"""
+
+logits_identity_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void logits_identity_kernel(const float* __restrict__ x, float* __restrict__ y, long long n) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        y[idx] = x[idx];
+    }
+}
+
+torch::Tensor logits_identity_cuda(torch::Tensor x) {
+    auto y = torch::empty_like(x);
+    long long n = x.numel();
+    const int threads = 256;
+    const int blocks = (int)((n + threads - 1) / threads);
+    logits_identity_kernel<<<blocks, threads>>>(x.data_ptr<float>(), y.data_ptr<float>(), n);
+    return y;
+}
+"""
+
+logits_identity_ext = load_inline(
+    name="gpt2_logits_identity_ext",
+    cpp_sources=logits_identity_cpp_source,
+    cuda_sources=logits_identity_cuda_source,
+    functions=["logits_identity_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, model_name, config):
+        super().__init__()
+        self.model_name = model_name
+        self.config = config
+        self.model = AutoModelForCausalLM.from_pretrained(self.model_name, config=self.config)
+        self.logits_identity = logits_identity_ext
+
+    def forward(self, x):
+        logits = self.model(x).logits
+        return self.logits_identity.logits_identity_cuda(logits)

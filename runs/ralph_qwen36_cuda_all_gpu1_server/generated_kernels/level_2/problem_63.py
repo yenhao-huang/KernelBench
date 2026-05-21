@@ -1,0 +1,195 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused Linear + ReLU + Div
+# This kernel performs: out = max(0, (x @ W^T) / divisor)
+# We assume x is [batch, in_features], W is [out_features, in_features]
+# The output is [batch, out_features]
+
+custom_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+__global__ void fused_linear_relu_div_kernel(
+    const float* __restrict__ x,      // [batch_size, in_features]
+    const float* __restrict__ weight, // [out_features, in_features]
+    float* __restrict__ out,          // [batch_size, out_features]
+    int batch_size,
+    int in_features,
+    int out_features,
+    float divisor
+) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y; // batch index
+    int col = blockIdx.x * blockDim.x + threadIdx.x; // output feature index
+
+    if (row < batch_size && col < out_features) {
+        float sum = 0.0f;
+        const float* x_row = x + row * in_features;
+        const float* w_col = weight + col * in_features; // Weight is stored as [out, in], so we iterate over in_features
+
+        // Manual matrix multiplication: dot product of x_row and w_col
+        for (int i = 0; i < in_features; ++i) {
+            sum += x_row[i] * w_col[i];
+        }
+
+        // Apply ReLU and Division
+        float val = sum / divisor;
+        if (val < 0.0f) {
+            val = 0.0f;
+        }
+        
+        out[row * out_features + col] = val;
+    }
+}
+
+torch::Tensor fused_linear_relu_div_cuda(torch::Tensor x, torch::Tensor weight, float divisor) {
+    auto batch_size = x.size(0);
+    auto in_features = x.size(1);
+    auto out_features = weight.size(0);
+
+    auto out = torch::zeros({batch_size, out_features}, x.options());
+
+    const int block_x = 32;
+    const int block_y = 32;
+    
+    dim3 threads(block_x, block_y);
+    dim3 blocks((out_features + block_x - 1) / block_x, (batch_size + block_y - 1) / block_y);
+
+    fused_linear_relu_div_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        in_features,
+        out_features,
+        divisor
+    );
+
+    return out;
+}
+"""
+
+custom_cpp_source = (
+    "torch::Tensor fused_linear_relu_div_cuda(torch::Tensor x, torch::Tensor weight, float divisor);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=custom_cpp_source,
+    cuda_sources=custom_cuda_source,
+    functions=["fused_linear_relu_div_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using a custom fused CUDA operator for Linear + ReLU + Div.
+    """
+    def __init__(self, in_features, out_features, divisor):
+        super(ModelNew, self).__init__()
+        self.linear_weight = nn.Parameter(torch.randn(out_features, in_features))
+        # Note: The original model uses nn.Linear which includes a bias. 
+        # However, the prompt's example architecture does not explicitly show bias usage in forward, 
+        # but nn.Linear defaults to bias=True. 
+        # To strictly match the behavior of nn.Linear(in_features, out_features), we need to handle bias.
+        # The custom kernel above does NOT include bias. 
+        # To be fully compatible with nn.Linear (which has bias by default), we should either:
+        # 1. Add bias handling in the kernel.
+        # 2. Or assume the user wants to replicate the exact behavior including bias.
+        
+        # Let's update the kernel to include bias for full compatibility with nn.Linear.
+        # Re-defining the kernel source to include bias.
+        
+        custom_cuda_source_with_bias = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_linear_relu_div_kernel(
+    const float* __restrict__ x,      // [batch_size, in_features]
+    const float* __restrict__ weight, // [out_features, in_features]
+    const float* __restrict__ bias,   // [out_features]
+    float* __restrict__ out,          // [batch_size, out_features]
+    int batch_size,
+    int in_features,
+    int out_features,
+    float divisor
+) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y; // batch index
+    int col = blockIdx.x * blockDim.x + threadIdx.x; // output feature index
+
+    if (row < batch_size && col < out_features) {
+        float sum = 0.0f;
+        const float* x_row = x + row * in_features;
+        const float* w_col = weight + col * in_features; 
+
+        for (int i = 0; i < in_features; ++i) {
+            sum += x_row[i] * w_col[i];
+        }
+
+        // Add bias
+        sum += bias[col];
+
+        // Apply ReLU and Division
+        float val = sum / divisor;
+        if (val < 0.0f) {
+            val = 0.0f;
+        }
+        
+        out[row * out_features + col] = val;
+    }
+}
+
+torch::Tensor fused_linear_relu_div_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float divisor) {
+    auto batch_size = x.size(0);
+    auto in_features = x.size(1);
+    auto out_features = weight.size(0);
+
+    auto out = torch::zeros({batch_size, out_features}, x.options());
+
+    const int block_x = 32;
+    const int block_y = 32;
+    
+    dim3 threads(block_x, block_y);
+    dim3 blocks((out_features + block_x - 1) / block_x, (batch_size + block_y - 1) / block_y);
+
+    fused_linear_relu_div_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        in_features,
+        out_features,
+        divisor
+    );
+
+    return out;
+}
+"""
+
+        custom_cpp_source_with_bias = (
+            "torch::Tensor fused_linear_relu_div_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, float divisor);"
+        )
+
+        # Reload with bias support
+        self.fused_ops = load_inline(
+            name="fused_ops_bias",
+            cpp_sources=custom_cpp_source_with_bias,
+            cuda_sources=custom_cuda_source_with_bias,
+            functions=["fused_linear_relu_div_cuda"],
+            verbose=False,
+            extra_cflags=["-O3"],
+            extra_ldflags=[""]
+        )
+
+        self.bias = nn.Parameter(torch.zeros(out_features))
+        self.divisor = divisor
+
+    def forward(self, x):
+        return self.fused_ops.fused_linear_relu_div_cuda(x, self.linear_weight, self.bias, self.divisor)

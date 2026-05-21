@@ -1,0 +1,153 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__device__ __forceinline__ float sigmoidf_fast(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+__global__ void fused_conv_avgpool_sigmoid_sum_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ out,
+    int N, int C_in, int H, int W, int C_out,
+    int K, int pool, int Hc, int Wc, int Hp, int Wp,
+    int total_pool
+) {
+    int n = blockIdx.x;
+    int oc = blockIdx.y;
+    int tile = blockIdx.z;
+    int tid = threadIdx.x;
+
+    extern __shared__ float sdata[];
+    float local = 0.0f;
+
+    int idx = tile * blockDim.x + tid;
+    if (idx < total_pool) {
+        int py = idx / Wp;
+        int px = idx - py * Wp;
+
+        float pooled = 0.0f;
+
+        #pragma unroll
+        for (int ry = 0; ry < 4; ++ry) {
+            #pragma unroll
+            for (int rx = 0; rx < 4; ++rx) {
+                int oy = py * pool + ry;
+                int ox = px * pool + rx;
+
+                float acc = b[oc];
+
+                #pragma unroll
+                for (int ic = 0; ic < 8; ++ic) {
+                    const float* xp = x + ((n * C_in + ic) * H + oy) * W + ox;
+                    const float* wp = w + ((oc * C_in + ic) * K) * K;
+
+                    acc += xp[0 * W + 0] * wp[0];
+                    acc += xp[0 * W + 1] * wp[1];
+                    acc += xp[0 * W + 2] * wp[2];
+                    acc += xp[1 * W + 0] * wp[3];
+                    acc += xp[1 * W + 1] * wp[4];
+                    acc += xp[1 * W + 2] * wp[5];
+                    acc += xp[2 * W + 0] * wp[6];
+                    acc += xp[2 * W + 1] * wp[7];
+                    acc += xp[2 * W + 2] * wp[8];
+                }
+
+                pooled += acc;
+            }
+        }
+
+        local = sigmoidf_fast(pooled * 0.0625f);
+    }
+
+    sdata[tid] = local;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sdata[tid] += sdata[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        atomicAdd(out + n, sdata[0]);
+    }
+}
+
+torch::Tensor fused_conv_avgpool_sigmoid_sum_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int64_t pool
+) {
+    int N = x.size(0);
+    int C_in = x.size(1);
+    int H = x.size(2);
+    int W = x.size(3);
+    int C_out = weight.size(0);
+    int K = weight.size(2);
+
+    int Hc = H - K + 1;
+    int Wc = W - K + 1;
+    int Hp = Hc / pool;
+    int Wp = Wc / pool;
+    int total_pool = Hp * Wp;
+
+    auto out = torch::zeros({N}, x.options());
+
+    const int threads = 256;
+    const int tiles = (total_pool + threads - 1) / threads;
+    dim3 grid(N, C_out, tiles);
+
+    fused_conv_avgpool_sigmoid_sum_kernel<<<grid, threads, threads * sizeof(float)>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C_in, H, W, C_out, K, (int)pool, Hc, Wc, Hp, Wp, total_pool
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor fused_conv_avgpool_sigmoid_sum_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int64_t pool
+);
+"""
+
+fused_ops = load_inline(
+    name="fused_conv_avgpool_sigmoid_sum_kernelbench",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["fused_conv_avgpool_sigmoid_sum_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.pool_kernel_size = pool_kernel_size
+        self.fused_ops = fused_ops
+
+    def forward(self, x):
+        return self.fused_ops.fused_conv_avgpool_sigmoid_sum_cuda(
+            x.contiguous(),
+            self.conv.weight.contiguous(),
+            self.conv.bias.contiguous(),
+            self.pool_kernel_size,
+        )

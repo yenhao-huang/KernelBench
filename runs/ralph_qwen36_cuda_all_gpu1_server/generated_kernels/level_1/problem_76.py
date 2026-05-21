@@ -1,0 +1,227 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA implementation for 1D Convolution with dilation and stride
+# This kernel performs im2col-like extraction implicitly or direct computation 
+# optimized for the specific constraints (FP32, large length).
+# Given the large length (524280) and moderate batch/channels, a direct 
+# block-based approach is often more memory efficient than full im2col.
+
+custom_conv1d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Kernel for 1D Convolution with dilation and stride
+// Optimized for FP32
+__global__ void conv1d_kernel(
+    const float* __restrict__ input,      // [N, C_in, L_in]
+    const float* __restrict__ weight,     // [C_out, C_in, K]
+    const float* __restrict__ bias,       // [C_out] or nullptr
+    float* __restrict__ output,           // [N, C_out, L_out]
+    int N, int C_in, int C_out, int L_in, int K, 
+    int stride, int dilation, bool has_bias) {
+    
+    // Each thread block handles a chunk of the output tensor.
+    // We map threads to (n, c_out, l_out) indices.
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C_out * ((L_in - 1) / stride + 1 - K / dilation + 1); // Approximate size calculation for grid
+    
+    // Better mapping: Use 2D or 3D grid/block if possible, but for simplicity and robustness 
+    // with large dimensions, we use a 1D grid and compute coordinates.
+    
+    if (idx >= total_elements) return;
+
+    int l_out = idx % ((L_in - K * dilation + dilation) / stride + 1); // Correct L_out formula: floor((L_in - K*dilation)/stride) + 1
+    // Let's recalculate L_out strictly:
+    int L_out = (L_in - K * dilation) / stride + 1;
+    
+    if (l_out >= L_out) return;
+
+    int c_out_idx = (idx / L_out) % C_out;
+    int n_idx = idx / (C_out * L_out);
+
+    float sum = 0.0f;
+    
+    // Loop over input channels and kernel size
+    for (int k = 0; k < K; ++k) {
+        int l_in = l_out * stride + k * dilation;
+        
+        // Check bounds for l_in just in case, though logic above should hold
+        if (l_in >= L_in) continue;
+
+        for (int c_in = 0; c_in < C_in; ++c_in) {
+            float w = weight[c_out_idx * C_in * K + c_in * K + k];
+            float inp = input[n_idx * C_in * L_in + c_in * L_in + l_in];
+            sum += w * inp;
+        }
+    }
+
+    if (has_bias) {
+        sum += bias[c_out_idx];
+    }
+
+    output[idx] = sum;
+}
+
+torch::Tensor conv1d_cuda(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    torch::Tensor bias) {
+    
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(weight.is_cuda(), "Weight must be a CUDA tensor");
+    TORCH_CHECK(bias.numel() == 0 || (bias.is_cuda() && bias.numel() == weight.size(0)), 
+                "Bias must be a CUDA tensor with size equal to out_channels");
+
+    auto N = input.size(0);
+    auto C_in = input.size(1);
+    auto L_in = input.size(2);
+    
+    auto C_out = weight.size(0);
+    auto K = weight.size(2); // Kernel size
+    
+    int stride = 1; // Default, but we need to pass it. 
+    // Since the function signature in load_inline is fixed, we can't easily pass stride/dilation 
+    // unless we wrap it or use a factory function. 
+    // To keep it simple and compliant with the example structure, I will hardcode stride=1, dilation=1 
+    // OR modify the wrapper to accept these args.
+    // The prompt allows "custom CUDA operators". I will create a wrapper that accepts stride/dilation.
+    
+    // However, load_inline functions are static. I will define a function that takes stride and dilation.
+    
+    return torch::zeros({N, C_out, 1}, input.options()); // Placeholder to ensure compilation structure
+}
+
+// We need a more flexible signature for the Python wrapper to pass stride/dilation
+torch::Tensor conv1d_cuda_strided_dilated(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    torch::Tensor bias,
+    int stride,
+    int dilation) {
+    
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(weight.is_cuda(), "Weight must be a CUDA tensor");
+    TORCH_CHECK(bias.numel() == 0 || (bias.is_cuda() && bias.numel() == weight.size(0)), 
+                "Bias must be a CUDA tensor with size equal to out_channels");
+
+    auto N = input.size(0);
+    auto C_in = input.size(1);
+    auto L_in = input.size(2);
+    
+    auto C_out = weight.size(0);
+    auto K = weight.size(2); // Kernel size
+    
+    int L_out = (L_in - K * dilation) / stride + 1;
+    if (L_out < 1) L_out = 0;
+
+    auto output = torch::zeros({N, C_out, L_out}, input.options());
+    
+    const float* in_ptr = input.data_ptr<float>();
+    const float* w_ptr = weight.data_ptr<float>();
+    const float* b_ptr = bias.numel() > 0 ? bias.data_ptr<float>() : nullptr;
+    float* out_ptr = output.data_ptr<float>();
+
+    int total_elements = N * C_out * L_out;
+    
+    if (total_elements == 0) {
+        return output;
+    }
+
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    bool has_bias = bias.numel() > 0;
+
+    conv1d_kernel<<<num_blocks, block_size>>>(
+        in_ptr, w_ptr, b_ptr, out_ptr,
+        N, C_in, C_out, L_in, K, 
+        stride, dilation, has_bias
+    );
+
+    // Check for kernel launch errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA Error: %s\\n", cudaGetErrorString(err));
+    }
+
+    return output;
+}
+"""
+
+custom_conv1d_cpp_source = (
+    "torch::Tensor conv1d_cuda_strided_dilated(torch::Tensor input, torch::Tensor weight, torch::Tensor bias, int stride, int dilation);"
+)
+
+# Compile the inline CUDA code
+conv1d_module = load_inline(
+    name="conv1d_custom",
+    cpp_sources=custom_conv1d_cpp_source,
+    cuda_sources=custom_conv1d_source,
+    functions=["conv1d_cuda_strided_dilated"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, dilation: int = 1, bias: bool = False):
+        super(ModelNew, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.dilation = dilation
+        self.has_bias = bias
+        
+        # Initialize weights and biases as buffers so they are part of the module state
+        # but we handle them manually in the forward pass to pass to CUDA
+        self.weight = nn.Parameter(torch.randn(out_channels, in_channels, kernel_size))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_channels))
+        else:
+            self.register_buffer('bias', torch.zeros(0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the 1D convolution using custom CUDA operator.
+        """
+        # Ensure inputs are contiguous and on CUDA
+        if not x.is_contiguous():
+            x = x.contiguous()
+        
+        weight = self.weight
+        bias = self.bias
+        
+        # Call the custom CUDA kernel
+        out = conv1d_module.conv1d_cuda_strided_dilated(x, weight, bias, self.stride, self.dilation)
+        
+        return out
+
+# Helper functions to match the expected interface for testing/evaluation if needed
+def get_inputs():
+    batch_size = 64
+    in_channels = 64
+    out_channels = 128
+    kernel_size = 3
+    length = 524280
+    stride = 3
+    dilation = 4
+    
+    x = torch.rand(batch_size, in_channels, length).cuda()
+    return [x]
+
+def get_init_inputs():
+    batch_size = 64
+    in_channels = 64
+    out_channels = 128
+    kernel_size = 3
+    stride = 3
+    dilation = 4
+    
+    # Return parameters needed to initialize the model
+    return [in_channels, out_channels, kernel_size, stride, dilation]

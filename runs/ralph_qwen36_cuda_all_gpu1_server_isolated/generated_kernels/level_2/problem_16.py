@@ -1,0 +1,158 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for the fused operation:
+# 1. Transposed Convolution (im2col + gemm approach or direct convolution)
+#    Note: Implementing a full optimized transposed conv from scratch is complex.
+#    However, we can optimize the post-processing chain which is often a bottleneck 
+#    if not fused, or replace the entire block if we assume standard conv weights are passed.
+#    
+#    Given the constraint to "replace pytorch operators", and the complexity of writing 
+#    a high-performance Transposed Conv from scratch in inline CUDA without libraries like CUTLASS,
+#    we will focus on fusing the activation and scaling steps which are memory-bound 
+#    if done separately. 
+#
+#    However, the prompt allows "complete freedom". A significant speedup often comes from 
+#    fusing element-wise operations. Let's fuse: Mish + Add + Hardtanh + Scale.
+#    
+#    We will keep nn.ConvTranspose2d for the heavy lifting as writing a correct, fast 
+#    transposed conv kernel inline is error-prone and less likely to beat cuDNN without 
+#    extensive tuning. The element-wise chain is a good candidate for fusion to reduce 
+#    memory bandwidth pressure.
+
+fused_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+// Mish activation: x * tanh(softplus(x)) = x * tanh(ln(1 + exp(x)))
+__device__ inline float mish(float x) {
+    return x * tanh(log1p(expf(x)));
+}
+
+// Hardtanh: clamp to [-min_val, max_val]
+__device__ inline float hardtanh(float x, float min_val, float max_val) {
+    if (x < min_val) return min_val;
+    if (x > max_val) return max_val;
+    return x;
+}
+
+__global__ void fused_ops_kernel(
+    const float* input, 
+    float* output, 
+    int size, 
+    float add_value, 
+    float scale, 
+    float min_val, 
+    float max_val
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float val = input[idx];
+        
+        // 1. Mish Activation
+        val = mish(val);
+        
+        // 2. Add value
+        val += add_value;
+        
+        // 3. Hardtanh Activation
+        val = hardtanh(val, min_val, max_val);
+        
+        // 4. Scale
+        val *= scale;
+        
+        output[idx] = val;
+    }
+}
+
+torch::Tensor fused_ops_cuda(
+    torch::Tensor input, 
+    float add_value, 
+    float scale, 
+    float min_val, 
+    float max_val
+) {
+    auto size = input.numel();
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    fused_ops_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(), 
+        output.data_ptr<float>(), 
+        size, 
+        add_value, 
+        scale, 
+        min_val, 
+        max_val
+    );
+
+    return output;
+}
+"""
+
+fused_ops_cpp_source = (
+    "torch::Tensor fused_ops_cuda(torch::Tensor input, float add_value, float scale, float min_val, float max_val);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_source,
+    functions=["fused_ops_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model that performs a transposed convolution, then fuses 
+    Mish activation, addition, Hardtanh activation, and scaling into a single CUDA kernel.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, add_value, scale):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride, padding, output_padding)
+        self.add_value = add_value
+        self.scale = scale
+        self.min_val = -1.0
+        self.max_val = 1.0
+
+    def forward(self, x):
+        # Perform transposed convolution
+        x = self.conv_transpose(x)
+        
+        # Fuse the remaining element-wise operations into a single kernel call
+        # This reduces memory bandwidth usage by avoiding intermediate tensor allocations
+        x = fused_ops.fused_ops_cuda(
+            x, 
+            self.add_value, 
+            self.scale, 
+            self.min_val, 
+            self.max_val
+        )
+        
+        return x
+
+# Re-defining get_inputs and get_init_inputs to match the required interface for testing/evaluation context
+batch_size = 128
+in_channels  = 64  
+out_channels = 64  
+height = width = 128  
+kernel_size  = 3
+stride       = 2  
+padding      = 1
+output_padding = 1
+add_value = 0.5
+scale = 2
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, output_padding, add_value, scale]

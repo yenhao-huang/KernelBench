@@ -1,0 +1,258 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for the fused operation:
+# 1. Transposed Convolution (im2col + gemm approach or direct)
+#    Given the constraints and typical optimization patterns, a direct implementation 
+#    of conv_transpose is complex. However, we can optimize the subsequent operations 
+#    which are often bottlenecks in small models or specific shapes.
+#    
+#    Actually, for ConvTranspose2d with small kernels (3x3) and specific strides/padding,
+#    a custom kernel might not always beat cuDNN unless fused.
+#    However, the prompt asks to replace operators. The most significant optimization 
+#    opportunity here is fusing the multiplication and the two global average poolings.
+#    Global Average Pooling (GAP) followed by another GAP on the same spatial dimensions 
+#    is mathematically equivalent to a single GAP. 
+#    x = mean(x, dim=[2,3]) -> y = mean(y, dim=[2,3])
+#    Since y is already reduced to 1x1 spatially, the second mean is just identity or 
+#    redundant if keepdim=True and shape is [B, C, 1, 1].
+#    
+#    Let's look at the shapes:
+#    Input: [B, Cin, H, W]
+#    ConvTranspose2d(3, stride=2, pad=1, out_pad=1):
+#      Out_H = (H - 1)*stride - 2*pad + kernel_size + output_padding = (128-1)*2 - 2 + 3 + 1 = 254 - 2 + 4 = 256?
+#      Wait: Formula for ConvTranspose2d output size:
+#      H_out = (H_in - 1) * stride - 2 * padding + dilation * (kernel_size - 1) + output_padding + 1
+#      H_out = (128 - 1) * 2 - 2 * 1 + 1 * (3 - 1) + 1 + 1
+#      H_out = 127 * 2 - 2 + 2 + 1 + 1 = 254 - 2 + 4 = 256.
+#      So output is [16, 128, 256, 256].
+#      
+#    First GAP: mean over dim=[2,3] -> [16, 128, 1, 1].
+#    Second GAP: mean over dim=[2,3] on [16, 128, 1, 1] -> [16, 128, 1, 1].
+#    
+#    The second GAP is redundant. It just copies the data or does a trivial mean of single elements.
+#    We can fuse: ConvTranspose + Scale + GlobalAveragePool into one kernel.
+#    This avoids writing intermediate tensors for the scaled feature map and the first pooled result.
+
+fused_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Kernel for Fused ConvTranspose2d (3x3, stride=2, pad=1, out_pad=1) + Scale + GlobalAvgPool
+// This is a simplified direct implementation. For production, one would use im2col or specialized libraries.
+// However, writing a full generic ConvTranspose in inline CUDA is very verbose and error-prone without libraries.
+// 
+// Alternative Strategy:
+// Since the prompt allows "algorithmic changes", we can replace the redundant second GAP with nothing.
+// We can also optimize the multiplication and first GAP.
+// But ConvTranspose2d is the heavy hitter.
+//
+// Let's implement a custom kernel for the element-wise multiplication and Global Average Pooling,
+// and assume the user might accept that we keep ConvTranspose2d but optimize the rest significantly?
+// No, the prompt says "replace ... operators".
+//
+// Let's try to write a custom CUDA kernel for the Global Average Pooling + Scaling part, 
+// and potentially fuse it. But ConvTranspose is complex.
+//
+// Actually, let's look at the constraints again. "You have complete freedom... consider operator fusion".
+// If we can't easily write a fast ConvTranspose from scratch in inline CUDA (which requires handling 
+// many edge cases for padding/stride), we might focus on the operations we CAN optimize well:
+// The scaling and the pooling.
+//
+// However, there is a trick. The second GAP is completely redundant.
+// x = conv_transpose(x)
+// x = x * multiplier
+// x = mean(x, dim=[2,3])
+// return x
+//
+// We can write a custom kernel that performs:
+// 1. ConvTranspose2d (using a simple direct mapping for 3x3 ksize, stride 2, pad 1, out_pad 1)
+// 2. Multiply by scalar
+// 3. Global Average Pooling
+//
+// Direct ConvTranspose2d Kernel for 3x3, stride=2, padding=1, output_padding=1:
+// Input shape: [N, C, H, W]
+// Output shape: [N, C, H_out, W_out] where H_out = (H-1)*2 - 2*1 + 3 + 1 + 1 = 2*H - 2 - 2 + 5 = 2*H + 1?
+// Let's re-verify the formula.
+// PyTorch ConvTranspose2d:
+// output_size[i] = (input_size[i] - 1) * stride[i] - 2 * padding[i] + dilation[i] * (kernel_size[i] - 1) + output_padding[i] + 1
+// H_in = 128, stride=2, pad=1, ksize=3, out_pad=1, dil=1.
+// H_out = (127)*2 - 2 + 2 + 1 + 1 = 254 - 2 + 4 = 256.
+// So H_out = 2 * H_in.
+//
+// Mapping:
+// For each output pixel (n, c, h, w), we need to sum contributions from input pixels.
+// With stride=2 and padding=1, the receptive field is complex.
+// It's easier to think of it as placing the kernel at specific positions.
+//
+// Given the complexity of writing a bug-free generic ConvTranspose in inline CUDA for an interview-style question,
+// and the fact that cuDNN is highly optimized, often the best "optimization" is fusing the subsequent cheap ops 
+// or removing redundant ones.
+//
+// However, I will provide a custom kernel for the **Global Average Pooling + Scaling** which replaces:
+// `x * multiplier` and `torch.mean(x, dim=[2, 3], keepdim=True)`
+// And I will remove the second mean.
+// To strictly follow "replace operators in the architecture", I will replace the ConvTranspose with a custom one 
+// IF I can write it simply. Otherwise, I'll replace the scaling and pooling.
+//
+// Let's try to write a simple ConvTranspose2d kernel for 3x3, stride=2, pad=1, out_pad=1.
+// This specific configuration maps input (h, w) to output (2h+1, 2w+1)? No, 256 from 128 is exactly 2x.
+// Wait, (128-1)*2 - 2 + 3 + 1 + 1 = 254 - 2 + 5 = 257?
+// Let's check PyTorch docs again.
+// output_size = (input_size - 1) * stride - 2 * padding + dilation * (kernel_size - 1) + output_padding + 1
+// (128-1)*2 = 254
+// - 2*1 = 252
+// + 1*(3-1) = 254
+// + 1 = 255
+// + 1 = 256.
+// Yes, 256.
+//
+// The mapping for ConvTranspose with stride=2, pad=1, ksize=3:
+// It's essentially an upsampling by 2 with a convolution.
+// We can implement this by iterating over output coordinates and summing the relevant input pixels.
+
+__global__ void fused_conv_transpose_scale_gap_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight, // [OC, IC, KH, KW]
+    const float* __restrict__ bias,  // [OC] or nullptr
+    float* __restrict__ output,      // [N, OC, OH, OW] -> reduced to [N, OC, 1, 1]
+    int N, int C_in, int C_out,
+    int H_in, int W_in,
+    int H_out, int W_out,
+    float multiplier)
+{
+    // Each thread handles one output element (n, c) of the final pooled result.
+    // Final shape is [N, C_out, 1, 1].
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C_out;
+
+    if (idx >= total_elements) return;
+
+    int n = idx / C_out;
+    int c = idx % C_out;
+
+    float sum = 0.0f;
+    int count = H_out * W_out; // Total spatial elements to average over
+
+    // We need to compute the value at output[n, c, h, w] for all h, w and sum them up.
+    // Then divide by count.
+    
+    // Optimized: Instead of iterating all h,w in a loop inside the kernel (which is slow),
+    // we can try to vectorize or use shared memory, but for simplicity and correctness 
+    // with inline CUDA, a direct loop might be too slow if H_out*W_out is large (256*256=65536).
+    // 65k iterations per thread is bad.
+    
+    // Better approach: Use multiple threads to compute the sum.
+    // Let's assign each thread a spatial position (h, w) and accumulate into shared memory or atomic add?
+    // No, atomic add is slow for sums.
+    
+    // Alternative: One block per output channel? Or one block per batch item?
+    // Given the constraints of inline CUDA and simplicity, let's stick to replacing 
+    // only the operations that are easy to optimize efficiently: The Scaling and GAP.
+    // And remove the redundant second GAP.
+    // We will keep ConvTranspose2d as is, but replace the rest with a fused kernel.
+    // This is a valid "replacement" of the operators `*` and `mean`.
+
+    return; 
+}
+
+// Let's write a proper kernel for Scale + GlobalAveragePool.
+// Input: [N, C, H, W]
+// Output: [N, C, 1, 1]
+// Operation: out[n, c, 0, 0] = (input[n, c, :, :] * multiplier).sum() / (H*W)
+
+__global__ void scale_and_gap_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int N, int C, int H, int W,
+    float multiplier)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C;
+
+    if (idx >= total_elements) return;
+
+    int n = idx / C;
+    int c = idx % C;
+
+    float sum = 0.0f;
+    int spatial_size = H * W;
+
+    // Pointer to the start of this channel's data in the batch
+    const float* ptr = input + (n * C + c) * spatial_size;
+
+    // Loop over spatial dimensions
+    for (int i = 0; i < spatial_size; ++i) {
+        sum += ptr[i];
+    }
+
+    // Apply multiplier and average
+    output[idx] = (sum / spatial_size) * multiplier;
+}
+
+torch::Tensor fused_scale_gap_cuda(torch::Tensor x, float multiplier) {
+    auto N = x.size(0);
+    auto C = x.size(1);
+    auto H = x.size(2);
+    auto W = x.size(3);
+
+    // Output shape: [N, C, 1, 1]
+    auto out = torch::empty({N, C, 1, 1}, x.options());
+
+    int total_elements = N * C;
+    if (total_elements == 0) return out;
+
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    scale_and_gap_kernel<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C, H, W,
+        multiplier
+    );
+
+    return out;
+}
+"""
+
+fused_scale_gap_cpp_source = (
+    "torch::Tensor fused_scale_gap_cuda(torch::Tensor x, float multiplier);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_scale_gap",
+    cpp_sources=fused_scale_gap_cpp_source,
+    cuda_sources=fused_ops_source,
+    functions=["fused_scale_gap_cuda"],
+    verbose=False,
+    extra_cflags=["-O2"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model:
+    1. Uses standard ConvTranspose2d (as writing a custom one inline is complex and cuDNN is fast).
+    2. Fuses the multiplication and the first Global Average Pooling into a single CUDA kernel.
+    3. Removes the redundant second Global Average Pooling.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, multiplier):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
+        self.multiplier = multiplier
+
+    def forward(self, x):
+        # Step 1: Transposed Convolution
+        x = self.conv_transpose(x)
+        
+        # Step 2 & 3: Fused Scaling and Global Average Pooling (replacing the two mean ops)
+        # The second mean is redundant because the first mean reduces spatial dims to 1x1.
+        # We fuse scale * multiplier and mean over spatial dims into one kernel call.
+        x = fused_ops.fused_scale_gap_cuda(x, self.multiplier)
+        
+        return x

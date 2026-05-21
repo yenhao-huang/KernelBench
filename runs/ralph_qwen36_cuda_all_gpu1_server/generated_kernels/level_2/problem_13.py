@@ -1,0 +1,424 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernels for fused operations
+# We will fuse: ConvTranspose3d -> MeanPool(D) -> Add Bias -> Softmax(C) -> Tanh -> Scale
+# However, since ConvTranspose3d is complex to implement from scratch efficiently in a short inline snippet 
+# without external libraries like CUTLASS or cuDNN wrappers, and the prompt asks for "custom CUDA operators to replace pytorch operators",
+# we can focus on optimizing the post-processing chain which is often memory-bound or has high kernel launch overhead.
+# Alternatively, we can implement a fused kernel for the entire sequence if we assume the ConvTranspose output is available.
+# But to be safe and robust, let's optimize the specific heavy operations: 
+# 1. The Mean Pooling + Bias Add + Softmax + Tanh + Scale chain.
+# Actually, a better approach for significant speedup in this specific architecture (which looks like a lightweight head) 
+# is to fuse the element-wise operations after the convolution.
+
+# Let's implement a fused kernel that takes the output of ConvTranspose3d and performs:
+# 1. Mean over Depth (dim=2)
+# 2. Add Bias
+# 3. Softmax over Channels (dim=1)
+# 4. Tanh
+# 5. Scale
+
+fused_post_conv_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper for fast exp and log if needed, but standard math is usually fine for FP32
+__device__ inline float fast_exp(float x) {
+    return expf(x);
+}
+
+__device__ inline float fast_tanh(float x) {
+    return tanhf(x);
+}
+
+__global__ void fused_post_conv_kernel(
+    const float* input,      // Output of ConvTranspose: (B, C, D, H, W)
+    const float* bias,       // (1, C, 1, 1, 1)
+    float* output,           // (B, C, 1, H, W)
+    int batch_size,
+    int channels,
+    int depth,
+    int height,
+    int width,
+    float scaling_factor
+) {
+    // Each thread handles one element in the final output: (b, c, h, w)
+    // The output shape is (B, C, 1, H, W), so we iterate over B, C, H, W.
+    
+    int total_elements = batch_size * channels * height * width;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= total_elements) return;
+    
+    // Decompose index into coordinates
+    int temp = idx;
+    int w = temp % width;
+    temp /= width;
+    int h = temp % height;
+    temp /= height;
+    int c = temp % channels;
+    int b = temp / channels;
+    
+    // 1. Mean Pooling over Depth (dim=2)
+    // Input is (B, C, D, H, W). Stride for depth is 1, then H, then W.
+    // We need to sum input[b, c, d, h, w] for all d in [0, depth) and divide by depth.
+    
+    float sum = 0.0f;
+    const float* input_ptr = input + b * channels * depth * height * width 
+                             + c * depth * height * width 
+                             + 0 * height * width // h=0 offset base? No, let's calculate properly.
+                             ;
+                             
+    // Correct pointer arithmetic for (B, C, D, H, W)
+    // Element at (b, c, d, h, w) is at:
+    // b * (C*D*H*W) + c * (D*H*W) + d * (H*W) + h * W + w
+    
+    int base_idx = b * (channels * depth * height * width) 
+                 + c * (depth * height * width) 
+                 + h * width 
+                 + w;
+                 
+    for (int d = 0; d < depth; ++d) {
+        sum += input[base_idx + d * height * width];
+    }
+    
+    float mean_val = sum / static_cast<float>(depth);
+    
+    // 2. Add Bias
+    // Bias is (1, C, 1, 1, 1). Element at c is at bias[c].
+    float biased_val = mean_val + bias[c];
+    
+    // 3. Softmax over Channels (dim=1)
+    // To do this efficiently in a single pass per element is hard because softmax requires 
+    // knowing the max and sum of exps across all channels for the same (b, h, w).
+    // Therefore, we cannot fuse the Softmax into a simple 1D grid if we want correctness 
+    // without atomic operations or multiple passes.
+    
+    // Strategy Change: 
+    // Since Softmax is global over C for each (b, h, w), we should launch threads such that 
+    // we can compute the max and sum per group.
+    // However, implementing a full fused softmax in inline CUDA is verbose.
+    
+    // Alternative Optimization:
+    // Replace the standard PyTorch operations with highly optimized custom kernels for each step,
+    // or fuse the non-softmax parts.
+    
+    // Let's implement a specialized kernel for Mean + Bias + Tanh + Scale, and leave Softmax 
+    // to PyTorch if it's the bottleneck, OR implement a block-wise softmax.
+    
+    // Given the constraints of "inline" and "real code", let's optimize the Mean Pooling 
+    // which is memory intensive (reading D elements) and the subsequent element-wise ops.
+    
+    // Actually, let's just replace the whole chain with a custom kernel that does:
+    // Mean -> Bias -> Softmax -> Tanh -> Scale
+    
+    // To do Softmax correctly in CUDA without external libs:
+    // We need to reduce over C.
+    
+    // Let's use a different approach: Launch one block per (b, h, w) pair? 
+    // That might be too many blocks if H*W is large.
+    
+    // Let's stick to replacing the specific operators with optimized versions where possible.
+    // 1. Custom Mean Pooling over Depth
+    // 2. Custom Bias Add
+    // 3. Custom Softmax (using a reduction kernel)
+    // 4. Custom Tanh + Scale
+    
+    // This is getting complex for inline. Let's try to fuse the last 4 steps assuming 
+    // we have the mean-pooled tensor. But Softmax couples channels.
+    
+    // Let's implement a robust Mean Pooling kernel and a fused Bias+Tanh+Scale kernel,
+    // and use PyTorch's optimized Softmax if it's already fast, or implement a simple one.
+    
+    // Actually, the prompt allows replacing MULTIPLE operators.
+    // Let's replace:
+    // 1. Mean Pooling with a custom kernel that is more efficient than generic mean? 
+    //    PyTorch's mean is quite optimized.
+    // 2. Softmax: We can implement a fast softmax.
+    
+    // Let's focus on the most impactful change: Fusing the element-wise operations after ConvTranspose.
+    // But Softmax breaks fusion across channels.
+    
+    // Let's implement a custom kernel for the entire sequence using a two-pass approach 
+    // within the kernel or by launching multiple kernels.
+    
+    // Simpler, high-impact optimization:
+    // The ConvTranspose3d is likely the bottleneck. Implementing it from scratch in inline CUDA 
+    // is error-prone and likely slower than cuDNN.
+    // So we keep ConvTranspose3d.
+    
+    // We optimize the rest: Mean -> Bias -> Softmax -> Tanh -> Scale
+    
+    // Let's write a kernel that computes Mean, then launches another kernel for Softmax+Tanh+Scale?
+    // No, let's try to do it all in one go if possible, or just optimize the memory access.
+    
+    // For this solution, I will provide:
+    // 1. A custom Mean Pooling kernel (optimized for coalesced reads if possible, though D is small).
+    // 2. A fused Bias + Tanh + Scale kernel.
+    // 3. PyTorch's Softmax is generally very optimized. We might leave it or replace with a custom one.
+    
+    // Let's just implement the Mean Pooling and the final element-wise chain separately to ensure correctness 
+    // and speedup over generic calls if they are not fused.
+    
+    // Wait, I can fuse Bias + Tanh + Scale easily.
+    // And I can optimize Mean Pooling.
+    
+    // Let's output a kernel for Mean Pooling over Depth.
+}
+
+__global__ void mean_pool_depth_kernel(
+    const float* input,
+    float* output,
+    int batch_size,
+    int channels,
+    int depth,
+    int height,
+    int width
+) {
+    int total_elements = batch_size * channels * height * width;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= total_elements) return;
+    
+    int temp = idx;
+    int w = temp % width;
+    temp /= width;
+    int h = temp % height;
+    temp /= height;
+    int c = temp % channels;
+    int b = temp / channels;
+    
+    int base_idx = b * (channels * depth * height * width) 
+                 + c * (depth * height * width) 
+                 + h * width 
+                 + w;
+                 
+    float sum = 0.0f;
+    for (int d = 0; d < depth; ++d) {
+        sum += input[base_idx + d * height * width];
+    }
+    
+    output[idx] = sum / static_cast<float>(depth);
+}
+
+__global__ void bias_tanh_scale_kernel(
+    const float* input,      // (B, C, 1, H, W) - Mean pooled
+    const float* bias,       // (1, C, 1, 1, 1)
+    float* output,           // (B, C, 1, H, W)
+    int batch_size,
+    int channels,
+    int height,
+    int width,
+    float scaling_factor
+) {
+    int total_elements = batch_size * channels * height * width;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= total_elements) return;
+    
+    int temp = idx;
+    int w = temp % width;
+    temp /= width;
+    int h = temp % height;
+    temp /= height;
+    int c = temp % channels;
+    int b = temp / channels;
+    
+    float val = input[idx];
+    val += bias[c];
+    val = tanhf(val);
+    val *= scaling_factor;
+    
+    output[idx] = val;
+}
+
+// Softmax over dim 1 (Channels) for tensor of shape (B, C, 1, H, W)
+// This requires reduction over C for each (b, h, w).
+__global__ void softmax_channels_kernel(
+    const float* input,
+    float* output,
+    int batch_size,
+    int channels,
+    int height,
+    int width
+) {
+    // Each thread block handles one (b, h, w) group? 
+    // Or each thread handles one element and we use shared memory for reduction?
+    // Given C=64, it's small. We can have each thread compute its value, then reduce.
+    
+    int total_groups = batch_size * height * width;
+    int group_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (group_idx >= total_groups) return;
+    
+    // Decode group index to b, h, w
+    int temp = group_idx;
+    int w = temp % width;
+    temp /= width;
+    int h = temp % height;
+    int b = temp / height;
+    
+    // Base offset for this (b, h, w) in the tensor (strided by C)
+    // Tensor is (B, C, 1, H, W). 
+    // Element (b, c, 0, h, w) is at: b*(C*H*W) + c*(H*W) + h*W + w
+    
+    int base_offset = b * (channels * height * width) + h * width + w;
+    
+    // Step to next channel for same (b,h,w) is H*W
+    int stride_c = height * width;
+    
+    // Pass 1: Find max
+    float max_val = -INFINITY;
+    for (int c = 0; c < channels; ++c) {
+        float val = input[base_offset + c * stride_c];
+        if (val > max_val) {
+            max_val = val;
+        }
+    }
+    
+    // Pass 2: Sum exp
+    float sum_exp = 0.0f;
+    for (int c = 0; c < channels; ++c) {
+        float val = input[base_offset + c * stride_c];
+        sum_exp += expf(val - max_val);
+    }
+    
+    // Pass 3: Compute softmax and write
+    for (int c = 0; c < channels; ++c) {
+        float val = input[base_offset + c * stride_c];
+        output[base_offset + c * stride_c] = expf(val - max_val) / sum_exp;
+    }
+}
+
+// Host functions to launch kernels
+torch::Tensor mean_pool_depth_cuda(torch::Tensor x, int depth) {
+    auto b = x.size(0);
+    auto c = x.size(1);
+    auto h = x.size(3);
+    auto w = x.size(4);
+    
+    auto out = torch::empty({b, c, 1, h, w}, x.options());
+    
+    int total_elements = b * c * h * w;
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    mean_pool_depth_kernel<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        b, c, depth, h, w
+    );
+    
+    return out;
+}
+
+torch::Tensor bias_tanh_scale_cuda(torch::Tensor x, torch::Tensor bias, float scaling_factor) {
+    auto b = x.size(0);
+    auto c = x.size(1);
+    auto h = x.size(3);
+    auto w = x.size(4);
+    
+    auto out = torch::empty_like(x);
+    
+    int total_elements = b * c * h * w;
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    bias_tanh_scale_kernel<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        b, c, h, w, scaling_factor
+    );
+    
+    return out;
+}
+
+torch::Tensor softmax_channels_cuda(torch::Tensor x) {
+    auto b = x.size(0);
+    auto c = x.size(1);
+    auto h = x.size(3);
+    auto w = x.size(4);
+    
+    auto out = torch::empty_like(x);
+    
+    int total_groups = b * h * w;
+    const int block_size = 256;
+    const int num_blocks = (total_groups + block_size - 1) / block_size;
+    
+    softmax_channels_kernel<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        b, c, h, w
+    );
+    
+    return out;
+}
+"""
+
+fused_post_conv_cpp_source = (
+    "torch::Tensor mean_pool_depth_cuda(torch::Tensor x, int depth);"
+    "torch::Tensor bias_tanh_scale_cuda(torch::Tensor x, torch::Tensor bias, float scaling_factor);"
+    "torch::Tensor softmax_channels_cuda(torch::Tensor x);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_post_conv",
+    cpp_sources=fused_post_conv_cpp_source,
+    cuda_sources=fused_post_conv_source,
+    functions=["mean_pool_depth_cuda", "bias_tanh_scale_cuda", "softmax_channels_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model using custom CUDA operators for post-processing steps.
+    1. Transposed 3D convolution (Kept as is, likely optimized by cuDNN)
+    2. Custom Mean Pooling over depth
+    3. Custom Softmax over channels
+    4. Custom Bias Add + Tanh + Scale
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.bias = nn.Parameter(torch.randn(1, out_channels, 1, 1, 1))
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        # 1. ConvTranspose3d
+        x = self.conv_transpose(x)                            # (B, C, D, H, W)
+        
+        # 2. Custom Mean Pooling over Depth
+        depth = x.size(2)
+        x = fused_ops.mean_pool_depth_cuda(x, depth)          # (B, C, 1, H, W)
+        
+        # 3. Custom Softmax over Channels
+        x = fused_ops.softmax_channels_cuda(x)                # (B, C, 1, H, W)
+        
+        # 4. Custom Bias Add + Tanh + Scale
+        x = fused_ops.bias_tanh_scale_cuda(x, self.bias, self.scaling_factor) # (B, C, 1, H, W)
+        
+        return x
+
+# === Test config ===
+batch_size = 16
+in_channels  = 16  
+out_channels = 64  
+depth = 32; height = width = 128  
+kernel_size  = 3
+stride       = 1  
+padding = 1
+scaling_factor = 2.0
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, depth, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, scaling_factor]

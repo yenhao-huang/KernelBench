@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 72.105,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "0.121631",
+        "0.121647",
+        "0.121621",
+        "0.121626",
+        "0.121621"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "1.115344",
+        "1.142879",
+        "1.104417",
+        "1.070190",
+        "1.115871"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_codex_cuda_all/generated_kernels/level_1/problem_73.py",
+  "level": 1,
+  "model_name": "codex-gpt-5.5",
+  "precision": "fp32",
+  "problem_id": 73,
+  "problem_name": "73_conv_transposed_3D_asymmetric_input_square_kernel__strided_padded__grouped.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_codex_cuda_all/raw_generation/level_1/problem_73.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

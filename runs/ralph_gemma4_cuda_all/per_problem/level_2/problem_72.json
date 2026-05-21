@@ -1,0 +1,14 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 58.765,
+  "error": "No extractable code block or raw Python/CUDA module found.",
+  "generated_kernel_path": "runs/ralph_gemma4_cuda_all/generated_kernels/level_2/problem_72.py",
+  "level": 2,
+  "model_name": "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
+  "precision": "fp32",
+  "problem_id": 72,
+  "problem_name": "72_ConvTranspose3d_BatchNorm_AvgPool_AvgPool.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_gemma4_cuda_all/raw_generation/level_2/problem_72.txt",
+  "status": "extraction_failed"
+}

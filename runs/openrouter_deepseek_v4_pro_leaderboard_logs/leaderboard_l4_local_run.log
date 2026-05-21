@@ -1,0 +1,226 @@
+[START L4 LOCAL] 2026-05-14T01:24:55Z
+Starting Batch Generation with config: EvalConfig({'dataset_src': 'local', 'dataset_name': 'ScalingIntelligence/KernelBench', 'level': 4, 'subset': [None, None], 'problem_ids': [4, 5, 6, 7, 13, 14, 15, 16, 17], 'run_name': 'openrouter_deepseek_v4_pro_leaderboard_l4', 'num_workers': 2, 'api_query_interval': 0.0, 'server_type': 'openrouter', 'model_name': 'openrouter/deepseek/deepseek-v4-pro', 'max_tokens': 8192, 'temperature': 0.0, 'is_reasoning_model': False, 'reasoning_effort': 'low', 'budget_tokens': 0, 'runs_dir': '/workspace/external/KernelBench/runs', 'verbose': False, 'store_type': 'local', 'num_samples': 1, 'log_prompt': False, 'backend': 'cuda', 'precision': 'fp32', 'prompt_option': 'one_shot', 'include_hardware_info': False, 'hardware_gpu_name': 'None', 'custom_prompt_key': 'None', 'check_kernel': True})
+Generating 1 sample(s) each for level 4 problems: [4, 5, 6, 7, 13, 14, 15, 16, 17]
+  0%|          | 0/9 [00:00<?, ?it/s] 11%|█         | 1/9 [01:03<08:27, 63.44s/it] 22%|██▏       | 2/9 [01:58<06:54, 59.27s/it] 33%|███▎      | 3/9 [02:53<05:46, 57.69s/it] 44%|████▍     | 4/9 [04:24<05:30, 66.14s/it] 56%|█████▌    | 5/9 [07:14<05:47, 86.84s/it] 67%|██████▋   | 6/9 [07:33<03:46, 75.62s/it] 78%|███████▊  | 7/9 [11:23<03:15, 97.63s/it] 89%|████████▉ | 8/9 [11:48<01:28, 88.51s/it]100%|██████████| 9/9 [13:46<00:00, 91.85s/it]100%|██████████| 9/9 [13:46<00:00, 91.85s/it]
+Static check warnings for sample 0 for problem 6: 6_facebook-bart-large_bs1_seq1023.py. Warnings: ['Uses torch.nn compute layer (only containers, Parameter, init allowed)']
+Error generating sample 13 0: Static check failed for sample 0 for problem 13: 13_google-reformer-enwik8_bs32_seq256.py. Error: ['Contains try-except block (potential fallback bypass)']. Warnings: ['Uses torch.nn.functional op: F.gelu', 'Uses torch.nn compute layer (only containers, Parameter, init allowed)']
+Static check warnings for sample 0 for problem 14: 14_google-electra-small-discriminator_bs32_seq256.py. Warnings: ['Uses torch.nn compute layer (only containers, Parameter, init allowed)']
+Error in query_server for model openrouter/deepseek/deepseek-v4-pro: LLM returned None content for model openrouter/deepseek/deepseek-v4-pro. finish_reason: length
+Error generating sample 7 0: LLM returned None content for model openrouter/deepseek/deepseek-v4-pro. finish_reason: length
+Error in query_server for model openrouter/deepseek/deepseek-v4-pro: LLM returned None content for model openrouter/deepseek/deepseek-v4-pro. finish_reason: length
+Error generating sample 15 0: LLM returned None content for model openrouter/deepseek/deepseek-v4-pro. finish_reason: length
+Error in query_server for model openrouter/deepseek/deepseek-v4-pro: LLM returned None content for model openrouter/deepseek/deepseek-v4-pro. finish_reason: length
+Error generating sample 16 0: LLM returned None content for model openrouter/deepseek/deepseek-v4-pro. finish_reason: length
+Error in query_server for model openrouter/deepseek/deepseek-v4-pro: LLM returned None content for model openrouter/deepseek/deepseek-v4-pro. finish_reason: length
+Error generating sample 17 0: LLM returned None content for model openrouter/deepseek/deepseek-v4-pro. finish_reason: length
+
+Generated 4 samples for total 9 problems, Please retry for the 5 failed problems.
+Starting Batch Eval with config: EvalConfig({'run_name': 'openrouter_deepseek_v4_pro_leaderboard_l4', 'dataset_src': 'local', 'dataset_name': 'ScalingIntelligence/KernelBench', 'level': 4, 'subset': [None, None], 'problem_ids': [4, 5, 6, 7, 13, 14, 15, 16, 17], 'eval_mode': 'local', 'gpu': 'A10G', 'gpu_arch': ['Ada'], 'runs_dir': '/workspace/external/KernelBench/runs', 'verbose': False, 'num_correct_trials': 5, 'num_perf_trials': 100, 'timeout': 300, 'measure_performance': True, 'timing_method': 'cuda_event', 'build_cache': False, 'num_cpu_workers': 20, 'kernel_eval_build_dir': '/workspace/external/KernelBench/cache', 'num_gpu_devices': 1, 'backend': 'cuda', 'precision': 'fp32', 'num_samples_per_problem': 1, 'pass_at_k_values': [1]})
+Evaluating 1 sample(s) each for level 4 problems: [4, 5, 6, 7, 13, 14, 15, 16, 17]
+Start evaluation on 9 unevaluated samples in range: [4, 5, 6, 7, 13, 14, 15, 16, 17]
+Processing batches:   0%|          | 0/9 [00:00<?, ?it/s][Curr Batch] 1 tasks over 1 GPUs; [Total Work left] 8
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/389 [00:00<?, ?it/s]Loading weights: 100%|██████████| 389/389 [00:00<00:00, 58119.34it/s]
+Loading weights:   0%|          | 0/389 [00:00<?, ?it/s]Loading weights: 100%|██████████| 389/389 [00:00<00:00, 43812.68it/s]
+Processing batches:  11%|█         | 1/9 [00:41<05:30, 41.37s/it]--------------------------------------------------------------------------------------------------------------------------------
+[Eval Result] Problem ID: 4, Sample ID: 0
+compiled=False correctness=False metadata={'other_error': "error: Expected tensor for argument #1 'indices' to have one of the following scalar types: Long, Int; but got torch.cuda.FloatTensor instead (while checking arguments for embedding)", 'other_error_name': 'builtins.RuntimeError', 'hardware': 'NVIDIA GeForce RTX 4090', 'device': 'cuda:0'} runtime=-1.0 runtime_stats={} ref_runtime=-1.0 ref_runtime_stats={}
+Adding Eval Result to file for problem 4 sample 0
+--------------------------------------------------------------------------------------------------------------------------------
+[Curr batch] Evaluation took 41.36 seconds
+[Curr Batch] 1 tasks over 1 GPUs; [Total Work left] 7
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[transformers] If you want to use `BigBirdForCausalLM` as a standalone, add `is_decoder=True.`
+Loading weights:   0%|          | 0/206 [00:00<?, ?it/s]Loading weights: 100%|██████████| 206/206 [00:00<00:00, 69144.26it/s]
+[transformers] [1mBigBirdForCausalLM LOAD REPORT[0m from: google/bigbird-roberta-base
+Key                         | Status     |  | 
+----------------------------+------------+--+-
+cls.seq_relationship.weight | UNEXPECTED |  | 
+cls.seq_relationship.bias   | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+[transformers] If you want to use `BigBirdForCausalLM` as a standalone, add `is_decoder=True.`
+Loading weights:   0%|          | 0/206 [00:00<?, ?it/s]Loading weights: 100%|██████████| 206/206 [00:00<00:00, 38205.91it/s]
+[transformers] [1mBigBirdForCausalLM LOAD REPORT[0m from: google/bigbird-roberta-base
+Key                         | Status     |  | 
+----------------------------+------------+--+-
+cls.seq_relationship.weight | UNEXPECTED |  | 
+cls.seq_relationship.bias   | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+[transformers] Input ids are automatically padded from 4095 to 4096 to be a multiple of `config.block_size`: 64
+Processing batches:  22%|██▏       | 2/9 [01:13<04:10, 35.76s/it]--------------------------------------------------------------------------------------------------------------------------------
+[Eval Result] Problem ID: 5, Sample ID: 0
+compiled=False correctness=False metadata={'other_error': "error: Expected tensor for argument #1 'indices' to have one of the following scalar types: Long, Int; but got torch.cuda.FloatTensor instead (while checking arguments for embedding)", 'other_error_name': 'builtins.RuntimeError', 'hardware': 'NVIDIA GeForce RTX 4090', 'device': 'cuda:0'} runtime=-1.0 runtime_stats={} ref_runtime=-1.0 ref_runtime_stats={}
+Adding Eval Result to file for problem 5 sample 0
+--------------------------------------------------------------------------------------------------------------------------------
+[Curr batch] Evaluation took 31.69 seconds
+[Curr Batch] 1 tasks over 1 GPUs; [Total Work left] 6
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/316 [00:00<?, ?it/s]Loading weights: 100%|██████████| 316/316 [00:00<00:00, 76400.74it/s]
+[transformers] [1mBartForCausalLM LOAD REPORT[0m from: facebook/bart-large
+Key                                                 | Status     |  | 
+----------------------------------------------------+------------+--+-
+encoder.layers.{0...11}.final_layer_norm.bias       | UNEXPECTED |  | 
+encoder.layers.{0...11}.self_attn_layer_norm.weight | UNEXPECTED |  | 
+encoder.embed_tokens.weight                         | UNEXPECTED |  | 
+encoder.layers.{0...11}.fc2.weight                  | UNEXPECTED |  | 
+encoder.embed_positions.weight                      | UNEXPECTED |  | 
+encoder.layers.{0...11}.self_attn.k_proj.bias       | UNEXPECTED |  | 
+encoder.layers.{0...11}.fc2.bias                    | UNEXPECTED |  | 
+encoder.layers.{0...11}.self_attn_layer_norm.bias   | UNEXPECTED |  | 
+encoder.layers.{0...11}.self_attn.out_proj.weight   | UNEXPECTED |  | 
+encoder.layers.{0...11}.self_attn.q_proj.weight     | UNEXPECTED |  | 
+encoder.layers.{0...11}.self_attn.v_proj.weight     | UNEXPECTED |  | 
+encoder.layers.{0...11}.fc1.bias                    | UNEXPECTED |  | 
+encoder.layers.{0...11}.final_layer_norm.weight     | UNEXPECTED |  | 
+encoder.layers.{0...11}.self_attn.v_proj.bias       | UNEXPECTED |  | 
+encoder.layers.{0...11}.fc1.weight                  | UNEXPECTED |  | 
+encoder.layers.{0...11}.self_attn.k_proj.weight     | UNEXPECTED |  | 
+encoder.layers.{0...11}.self_attn.q_proj.bias       | UNEXPECTED |  | 
+encoder.layers.{0...11}.self_attn.out_proj.bias     | UNEXPECTED |  | 
+encoder.layernorm_embedding.bias                    | UNEXPECTED |  | 
+encoder.layernorm_embedding.weight                  | UNEXPECTED |  | 
+shared.weight                                       | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+Loading weights:   0%|          | 0/316 [00:00<?, ?it/s]Loading weights: 100%|██████████| 316/316 [00:00<00:00, 41258.87it/s]
+[transformers] [1mBartForCausalLM LOAD REPORT[0m from: facebook/bart-large
+Key                                                 | Status     |  | 
+----------------------------------------------------+------------+--+-
+encoder.layers.{0...11}.final_layer_norm.bias       | UNEXPECTED |  | 
+encoder.layers.{0...11}.self_attn_layer_norm.weight | UNEXPECTED |  | 
+encoder.embed_tokens.weight                         | UNEXPECTED |  | 
+encoder.layers.{0...11}.fc2.weight                  | UNEXPECTED |  | 
+encoder.embed_positions.weight                      | UNEXPECTED |  | 
+encoder.layers.{0...11}.self_attn.k_proj.bias       | UNEXPECTED |  | 
+encoder.layers.{0...11}.fc2.bias                    | UNEXPECTED |  | 
+encoder.layers.{0...11}.self_attn_layer_norm.bias   | UNEXPECTED |  | 
+encoder.layers.{0...11}.self_attn.out_proj.weight   | UNEXPECTED |  | 
+encoder.layers.{0...11}.self_attn.q_proj.weight     | UNEXPECTED |  | 
+encoder.layers.{0...11}.self_attn.v_proj.weight     | UNEXPECTED |  | 
+encoder.layers.{0...11}.fc1.bias                    | UNEXPECTED |  | 
+encoder.layers.{0...11}.final_layer_norm.weight     | UNEXPECTED |  | 
+encoder.layers.{0...11}.self_attn.v_proj.bias       | UNEXPECTED |  | 
+encoder.layers.{0...11}.fc1.weight                  | UNEXPECTED |  | 
+encoder.layers.{0...11}.self_attn.k_proj.weight     | UNEXPECTED |  | 
+encoder.layers.{0...11}.self_attn.q_proj.bias       | UNEXPECTED |  | 
+encoder.layers.{0...11}.self_attn.out_proj.bias     | UNEXPECTED |  | 
+encoder.layernorm_embedding.bias                    | UNEXPECTED |  | 
+encoder.layernorm_embedding.weight                  | UNEXPECTED |  | 
+shared.weight                                       | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+Processing batches:  33%|███▎      | 3/9 [01:48<03:33, 35.50s/it]--------------------------------------------------------------------------------------------------------------------------------
+[Eval Result] Problem ID: 6, Sample ID: 0
+compiled=False correctness=False metadata={'other_error': "error: Expected tensor for argument #1 'indices' to have one of the following scalar types: Long, Int; but got torch.cuda.FloatTensor instead (while checking arguments for embedding)", 'other_error_name': 'builtins.RuntimeError', 'hardware': 'NVIDIA GeForce RTX 4090', 'device': 'cuda:0'} runtime=-1.0 runtime_stats={} ref_runtime=-1.0 ref_runtime_stats={}
+Adding Eval Result to file for problem 6 sample 0
+--------------------------------------------------------------------------------------------------------------------------------
+[Curr batch] Evaluation took 35.12 seconds
+[Curr Batch] 1 tasks over 1 GPUs; [Total Work left] 5
+Processing batches:  44%|████▍     | 4/9 [01:50<01:51, 22.39s/it][ERROR] Evaluation FAILED for Problem ID: 7, Sample ID: 0: Kernel not found for problem 7 sample 0
+cache_dir to remove: /workspace/external/KernelBench/cache/openrouter_deepseek_v4_pro_leaderboard_l4/7/0
+
+[INFO] Removed cached folder for Problem ID: 7, Sample ID: 0
+--------------------------------------------------------------------------------------------------------------------------------
+[Eval Result] Problem ID: 7, Sample ID: 0
+compiled=False correctness=False metadata={'error': 'Kernel not found for problem 7 sample 0'} runtime=-1.0 runtime_stats={} ref_runtime=-1.0 ref_runtime_stats={}
+Adding Eval Result to file for problem 7 sample 0
+--------------------------------------------------------------------------------------------------------------------------------
+[Curr batch] Evaluation took 2.18 seconds
+[Curr Batch] 1 tasks over 1 GPUs; [Total Work left] 4
+Processing batches:  56%|█████▌    | 5/9 [01:52<01:00, 15.12s/it][ERROR] Evaluation FAILED for Problem ID: 13, Sample ID: 0: Kernel not found for problem 13 sample 0
+cache_dir to remove: /workspace/external/KernelBench/cache/openrouter_deepseek_v4_pro_leaderboard_l4/13/0
+--------------------------------------------------------------------------------------------------------------------------------
+[Eval Result] Problem ID: 13, Sample ID: 0
+compiled=False correctness=False metadata={'error': 'Kernel not found for problem 13 sample 0'} runtime=-1.0 runtime_stats={} ref_runtime=-1.0 ref_runtime_stats={}
+Adding Eval Result to file for problem 13 sample 0
+--------------------------------------------------------------------------------------------------------------------------------
+[Curr batch] Evaluation took 2.21 seconds
+[Curr Batch] 1 tasks over 1 GPUs; [Total Work left] 3
+[transformers] If you want to use `ElectraForCausalLM` as a standalone, add `is_decoder=True.`
+Loading weights:   0%|          | 0/199 [00:00<?, ?it/s]Loading weights: 100%|██████████| 199/199 [00:00<00:00, 70216.75it/s]
+[transformers] [1mElectraForCausalLM LOAD REPORT[0m from: google/electra-small-discriminator
+Key                                               | Status     | 
+--------------------------------------------------+------------+-
+discriminator_predictions.dense.bias              | UNEXPECTED | 
+discriminator_predictions.dense_prediction.bias   | UNEXPECTED | 
+discriminator_predictions.dense.weight            | UNEXPECTED | 
+discriminator_predictions.dense_prediction.weight | UNEXPECTED | 
+generator_predictions.dense.bias                  | MISSING    | 
+generator_lm_head.bias                            | MISSING    | 
+generator_predictions.LayerNorm.bias              | MISSING    | 
+generator_predictions.LayerNorm.weight            | MISSING    | 
+generator_predictions.dense.weight                | MISSING    | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+- MISSING:	those params were newly initialized because missing from the checkpoint. Consider training on your downstream task.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[transformers] If you want to use `ElectraForCausalLM` as a standalone, add `is_decoder=True.`
+Loading weights:   0%|          | 0/199 [00:00<?, ?it/s]Loading weights: 100%|██████████| 199/199 [00:00<00:00, 51096.82it/s]
+[transformers] [1mElectraForCausalLM LOAD REPORT[0m from: google/electra-small-discriminator
+Key                                               | Status     | 
+--------------------------------------------------+------------+-
+discriminator_predictions.dense.bias              | UNEXPECTED | 
+discriminator_predictions.dense_prediction.bias   | UNEXPECTED | 
+discriminator_predictions.dense.weight            | UNEXPECTED | 
+discriminator_predictions.dense_prediction.weight | UNEXPECTED | 
+generator_predictions.dense.bias                  | MISSING    | 
+generator_lm_head.bias                            | MISSING    | 
+generator_predictions.LayerNorm.bias              | MISSING    | 
+generator_predictions.LayerNorm.weight            | MISSING    | 
+generator_predictions.dense.weight                | MISSING    | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+- MISSING:	those params were newly initialized because missing from the checkpoint. Consider training on your downstream task.
+Processing batches:  67%|██████▋   | 6/9 [02:22<01:00, 20.14s/it]--------------------------------------------------------------------------------------------------------------------------------
+[Eval Result] Problem ID: 14, Sample ID: 0
+compiled=False correctness=False metadata={'other_error': "error: Expected tensor for argument #1 'indices' to have one of the following scalar types: Long, Int; but got torch.cuda.FloatTensor instead (while checking arguments for embedding)", 'other_error_name': 'builtins.RuntimeError', 'hardware': 'NVIDIA GeForce RTX 4090', 'device': 'cuda:0'} runtime=-1.0 runtime_stats={} ref_runtime=-1.0 ref_runtime_stats={}
+Adding Eval Result to file for problem 14 sample 0
+--------------------------------------------------------------------------------------------------------------------------------
+[Curr batch] Evaluation took 29.85 seconds
+[Curr Batch] 1 tasks over 1 GPUs; [Total Work left] 2
+Processing batches:  78%|███████▊  | 7/9 [02:24<00:28, 14.27s/it][ERROR] Evaluation FAILED for Problem ID: 15, Sample ID: 0: Kernel not found for problem 15 sample 0
+cache_dir to remove: /workspace/external/KernelBench/cache/openrouter_deepseek_v4_pro_leaderboard_l4/15/0
+
+[INFO] Removed cached folder for Problem ID: 15, Sample ID: 0
+--------------------------------------------------------------------------------------------------------------------------------
+[Eval Result] Problem ID: 15, Sample ID: 0
+compiled=False correctness=False metadata={'error': 'Kernel not found for problem 15 sample 0'} runtime=-1.0 runtime_stats={} ref_runtime=-1.0 ref_runtime_stats={}
+Adding Eval Result to file for problem 15 sample 0
+--------------------------------------------------------------------------------------------------------------------------------
+[Curr batch] Evaluation took 2.11 seconds
+[Curr Batch] 1 tasks over 1 GPUs; [Total Work left] 1
+Processing batches:  89%|████████▉ | 8/9 [02:27<00:10, 10.44s/it][ERROR] Evaluation FAILED for Problem ID: 16, Sample ID: 0: Kernel not found for problem 16 sample 0
+cache_dir to remove: /workspace/external/KernelBench/cache/openrouter_deepseek_v4_pro_leaderboard_l4/16/0
+--------------------------------------------------------------------------------------------------------------------------------
+[Eval Result] Problem ID: 16, Sample ID: 0
+compiled=False correctness=False metadata={'error': 'Kernel not found for problem 16 sample 0'} runtime=-1.0 runtime_stats={} ref_runtime=-1.0 ref_runtime_stats={}
+Adding Eval Result to file for problem 16 sample 0
+--------------------------------------------------------------------------------------------------------------------------------
+[Curr batch] Evaluation took 2.20 seconds
+[Curr Batch] 1 tasks over 1 GPUs; [Total Work left] 0
+Processing batches: 100%|██████████| 9/9 [02:29<00:00,  7.86s/it]Processing batches: 100%|██████████| 9/9 [02:29<00:00, 16.60s/it]
+[ERROR] Evaluation FAILED for Problem ID: 17, Sample ID: 0: Kernel not found for problem 17 sample 0
+cache_dir to remove: /workspace/external/KernelBench/cache/openrouter_deepseek_v4_pro_leaderboard_l4/17/0
+--------------------------------------------------------------------------------------------------------------------------------
+[Eval Result] Problem ID: 17, Sample ID: 0
+compiled=False correctness=False metadata={'error': 'Kernel not found for problem 17 sample 0'} runtime=-1.0 runtime_stats={} ref_runtime=-1.0 ref_runtime_stats={}
+Adding Eval Result to file for problem 17 sample 0
+--------------------------------------------------------------------------------------------------------------------------------
+[Curr batch] Evaluation took 2.18 seconds
+/home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/multiprocessing/resource_tracker.py:224: UserWarning: resource_tracker: There appear to be 3 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '
+/home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/multiprocessing/resource_tracker.py:237: UserWarning: resource_tracker: '/mp-su47frge': [Errno 2] No such file or directory
+  warnings.warn('resource_tracker: %r: %s' % (name, e))
+/home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/multiprocessing/resource_tracker.py:237: UserWarning: resource_tracker: '/mp-zk5cm32m': [Errno 2] No such file or directory
+  warnings.warn('resource_tracker: %r: %s' % (name, e))
+/home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/multiprocessing/resource_tracker.py:237: UserWarning: resource_tracker: '/mp-0mc30rm8': [Errno 2] No such file or directory
+  warnings.warn('resource_tracker: %r: %s' % (name, e))
+[DONE L4 LOCAL] 2026-05-14T01:41:16Z

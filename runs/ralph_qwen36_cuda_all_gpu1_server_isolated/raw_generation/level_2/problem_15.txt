@@ -1,0 +1,662 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for ConvTranspose3d + BatchNorm3d + Mean Subtraction
+# We fuse these operations to minimize memory bandwidth usage.
+# The kernel performs:
+# 1. ConvTranspose3d (im2col/gemm style or direct convolution)
+# 2. Batch Normalization (scale, shift, variance normalization)
+# 3. Subtracting the mean along spatial dimensions (D, H, W)
+
+custom_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper for atomic add if needed, but here we use grid-stride loops and shared memory or direct writes where possible.
+// For ConvTranspose3d, a naive implementation is complex. 
+// However, to ensure correctness and speedup without writing a full GEMM/Conv library from scratch in inline code,
+// we will implement a highly optimized fused kernel for the BatchNorm + Mean Subtraction part, 
+// and use PyTorch's native ConvTranspose3d but fused with the subsequent operations if possible.
+// Actually, the prompt allows replacing ANY operators. 
+// Let's replace the entire forward pass logic with a custom CUDA kernel that does:
+// 1. ConvTranspose3d (using a simplified direct mapping or calling into cuDNN via torch native is cheating? No, we write custom).
+// Writing a full optimized ConvTranspose3d from scratch in inline CUDA is extremely verbose and error-prone for this format.
+// Instead, let's focus on fusing the BatchNorm and Mean Subtraction, which are memory-bound and easy to optimize.
+// But wait, the prompt says "replace pytorch operators". 
+// Let's try to replace the ConvTranspose3d with a custom kernel? 
+// A simple 3D transpose convolution can be implemented by iterating over output pixels and summing contributions from input pixels.
+
+__global__ void conv_transpose_3d_kernel(
+    const float* input,      // [N, C_in, D_in, H_in, W_in]
+    const float* weight,     // [C_out, C_in, K_d, K_h, K_w]
+    const float* bias,       // [C_out]
+    float* output,           // [N, C_out, D_out, H_out, W_out]
+    int N, int C_in, int C_out, 
+    int D_in, int H_in, int W_in,
+    int K_d, int K_h, int K_w,
+    int stride_d, int stride_h, int stride_w,
+    int pad_d, int pad_h, int pad_w,
+    int D_out, int H_out, int W_out) 
+{
+    // Each thread handles one output element: (n, c_out, d, h, w)
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C_out * D_out * H_out * W_out;
+    
+    if (idx >= total_elements) return;
+
+    // Decode index to coordinates
+    int temp = idx;
+    int w = temp % W_out; temp /= W_out;
+    int h = temp % H_out; temp /= H_out;
+    int d = temp % D_out; temp /= D_out;
+    int c_out = temp % C_out; temp /= C_out;
+    int n = temp;
+
+    float sum = 0.0f;
+    
+    // Iterate over input channels and kernel dimensions
+    for (int c_in = 0; c_in < C_in; ++c_in) {
+        for (int k_d = 0; k_d < K_d; ++k_d) {
+            int d_in = d * stride_d - pad_d + k_d;
+            if (d_in < 0 || d_in >= D_in) continue;
+            
+            for (int k_h = 0; k_h < K_h; ++k_h) {
+                int h_in = h * stride_h - pad_h + k_h;
+                if (h_in < 0 || h_in >= H_in) continue;
+                
+                for (int k_w = 0; k_w < K_w; ++k_w) {
+                    int w_in = w * stride_w - pad_w + k_w;
+                    if (w_in < 0 || w_in >= W_in) continue;
+
+                    // Weight index: [c_out, c_in, k_d, k_h, k_w]
+                    int weight_idx = ((c_out * C_in + c_in) * K_d + k_d) * K_h * K_w + k_h * K_w + k_w;
+                    
+                    // Input index: [n, c_in, d_in, h_in, w_in]
+                    int input_idx = ((n * C_in + c_in) * D_in + d_in) * H_in * W_in + h_in * W_in + w_in;
+
+                    sum += weight[weight_idx] * input[input_idx];
+                }
+            }
+        }
+    }
+
+    if (bias != nullptr) {
+        sum += bias[c_out];
+    }
+
+    // Output index: [n, c_out, d, h, w]
+    int output_idx = ((n * C_out + c_out) * D_out + d) * H_out * W_out + h * W_out + w;
+    output[output_idx] = sum;
+}
+
+__global__ void batch_norm_mean_sub_kernel(
+    const float* input,      // [N, C, D, H, W]
+    float* output,           // [N, C, D, H, W]
+    const float* running_mean, // [C]
+    const float* running_var,  // [C]
+    const float* weight,       // [C] (gamma)
+    const float* bias,         // [C] (beta)
+    int N, int C, int D, int H, int W,
+    float eps) 
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C * D * H * W;
+
+    if (idx >= total_elements) return;
+
+    // Decode index
+    int temp = idx;
+    int w = temp % W; temp /= W;
+    int h = temp % H; temp /= H;
+    int d = temp % D; temp /= D;
+    int c = temp % C; temp /= C;
+    int n = temp;
+
+    // Calculate spatial mean for this specific (n, c) slice
+    float spatial_mean = 0.0f;
+    int spatial_size = D * H * W;
+    
+    // We need to compute the mean of the input tensor along spatial dims for each (n, c).
+    // However, the original code does: x - torch.mean(x, dim=(2,3,4), keepdim=True)
+    // This means it subtracts the mean of the CURRENT x (which is already BN processed? No, in the original code:
+    // 1. Conv -> x
+    // 2. BN -> x
+    // 3. x - mean(x)
+    // So we need to compute the mean of the BN output.
+    
+    // To do this efficiently in one pass without two global memory reads for mean calculation,
+    // we can use shared memory or atomic adds if we split it up. But for simplicity and correctness in inline CUDA:
+    // We will assume the input to this kernel is the result of ConvTranspose3d.
+    // Wait, the original code applies BN first. 
+    // Let's fuse ConvTranspose3d -> BatchNorm -> MeanSubtraction.
+    
+    // Step 1: Compute Conv Output (already done in previous kernel? No, we are writing ONE fused kernel or multiple?)
+    // The prompt allows replacing operators. Let's replace the whole forward with a single custom function 
+    // that does ConvTranspose3d, then BatchNorm stats calculation/apply, then Mean Subtraction.
+    
+    // Actually, calculating mean of BN output requires reading the BN output.
+    // If we fuse everything, we can compute the mean during the convolution or in a separate pass.
+    // Given the complexity, let's split into two kernels:
+    // 1. ConvTranspose3d + BatchNorm (using running stats) -> Intermediate Buffer
+    // 2. Mean Subtraction
+    
+    // But to minimize memory traffic, let's just do the Mean Subtraction on top of the Conv output if we skip BN? 
+    // No, BN is required.
+    
+    // Let's implement a kernel that takes Conv Output, applies BatchNorm using running stats, and stores it.
+    // Then another kernel for mean subtraction. Or fuse them.
+    
+    // Fused: Conv -> BN -> MeanSub
+    // This requires storing the intermediate result or computing mean on the fly.
+    // Computing mean on the fly is hard because you need to read all spatial elements first.
+    
+    // Alternative: Use two kernels.
+    // Kernel 1: ConvTranspose3d + BatchNorm (using running mean/var)
+    // Kernel 2: Subtract Mean
+    
+    // Let's stick to the structure of the example: one custom function call in Python.
+    // We can define a single CUDA file with multiple functions and call them sequentially from C++.
+    
+    return; // Placeholder for logic below
+}
+
+// Kernel 1: ConvTranspose3d + BatchNorm (using running statistics)
+__global__ void conv_bn_kernel(
+    const float* input,      // [N, C_in, D_in, H_in, W_in]
+    const float* weight,     // [C_out, C_in, K_d, K_h, K_w]
+    const float* bias,       // [C_out]
+    const float* running_mean, // [C_out]
+    const float* running_var,  // [C_out]
+    const float* gamma,        // [C_out] (weight of BN)
+    const float* beta,         // [C_out] (bias of BN)
+    float* output,           // [N, C_out, D_out, H_out, W_out]
+    int N, int C_in, int C_out, 
+    int D_in, int H_in, int W_in,
+    int K_d, int K_h, int K_w,
+    int stride_d, int stride_h, int stride_w,
+    int pad_d, int pad_h, int pad_w,
+    int D_out, int H_out, int W_out,
+    float eps) 
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C_out * D_out * H_out * W_out;
+    
+    if (idx >= total_elements) return;
+
+    int temp = idx;
+    int w = temp % W_out; temp /= W_out;
+    int h = temp % H_out; temp /= H_out;
+    int d = temp % D_out; temp /= D_out;
+    int c_out = temp % C_out; temp /= C_out;
+    int n = temp;
+
+    float conv_sum = 0.0f;
+    
+    for (int c_in = 0; c_in < C_in; ++c_in) {
+        for (int k_d = 0; k_d < K_d; ++k_d) {
+            int d_in = d * stride_d - pad_d + k_d;
+            if (d_in < 0 || d_in >= D_in) continue;
+            
+            for (int k_h = 0; k_h < K_h; ++k_h) {
+                int h_in = h * stride_h - pad_h + k_h;
+                if (h_in < 0 || h_in >= H_in) continue;
+                
+                for (int k_w = 0; k_w < K_w; ++k_w) {
+                    int w_in = w * stride_w - pad_w + k_w;
+                    if (w_in < 0 || w_in >= W_in) continue;
+
+                    int weight_idx = ((c_out * C_in + c_in) * K_d + k_d) * K_h * K_w + k_h * K_w + k_w;
+                    int input_idx = ((n * C_in + c_in) * D_in + d_in) * H_in * W_in + h_in * W_in + w_in;
+
+                    conv_sum += weight[weight_idx] * input[input_idx];
+                }
+            }
+        }
+    }
+
+    if (bias != nullptr) {
+        conv_sum += bias[c_out];
+    }
+
+    // Apply Batch Normalization using running statistics
+    float mean = running_mean[c_out];
+    float var = running_var[c_out];
+    
+    float inv_std = rsqrtf(var + eps);
+    float normalized = (conv_sum - mean) * inv_std;
+    
+    if (gamma != nullptr) {
+        normalized *= gamma[c_out];
+    }
+    if (beta != nullptr) {
+        normalized += beta[c_out];
+    }
+
+    int output_idx = ((n * C_out + c_out) * D_out + d) * H_out * W_out + h * W_out + w;
+    output[output_idx] = normalized;
+}
+
+// Kernel 2: Subtract Mean along spatial dimensions (D, H, W) for each (N, C)
+__global__ void mean_sub_kernel(
+    const float* input,      // [N, C, D, H, W]
+    float* output,           // [N, C, D, H, W]
+    int N, int C, int D, int H, int W) 
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C * D * H * W;
+
+    if (idx >= total_elements) return;
+
+    // We need to compute the mean for each (n, c) slice.
+    // Since we can't easily share data between threads in a single launch for reduction without shared memory complexity,
+    // and grid-stride loops are simple, let's use a two-pass approach or atomic adds?
+    // Actually, for this specific problem, we can compute the mean in the kernel if we iterate twice, 
+    // but that's inefficient.
+    
+    // Better: Use a separate reduction kernel or assume small spatial dimensions and do it naively?
+    // D=16, H=32, W=32 -> 16*32*32 = 16384 elements per channel.
+    // Doing two passes over this in one thread is slow.
+    
+    // Let's use a simple reduction within the kernel using shared memory if possible, 
+    // but for inline code simplicity and correctness, let's launch a reduction kernel first?
+    // No, we want to replace the operator.
+    
+    // Alternative: Compute mean in the same kernel by iterating over spatial dims twice?
+    // Thread 0 computes mean for (n=0, c=0), then writes it out? No, other threads need it.
+    
+    // Let's use a simple approach: 
+    // 1. Launch a reduction kernel to compute means into a temporary buffer [N, C].
+    // 2. Launch this kernel to subtract.
+    // But we want to minimize memory traffic.
+    
+    // Given the constraints of "inline" and "real code", let's implement a simple mean subtraction 
+    // that assumes the mean is precomputed or compute it efficiently.
+    // Actually, we can compute the mean in this kernel if we use atomicAdd for partial sums? No.
+    
+    // Let's just do two kernels defined in the same source file.
+}
+
+// We will expose a C++ function that calls these CUDA kernels sequentially.
+
+torch::Tensor conv_bn_mean_sub_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    int stride_d, int stride_h, int stride_w,
+    int pad_d, int pad_h, int pad_w) 
+{
+    auto N = input.size(0);
+    auto C_in = input.size(1);
+    auto D_in = input.size(2);
+    auto H_in = input.size(3);
+    auto W_in = input.size(4);
+
+    auto K_d = weight.size(2);
+    auto K_h = weight.size(3);
+    auto K_w = weight.size(4);
+    auto C_out = weight.size(0);
+
+    // Calculate output spatial dimensions for ConvTranspose3d
+    // Formula: D_out = (D_in - 1) * stride_d - 2 * pad_d + K_d
+    auto D_out = (D_in - 1) * stride_d - 2 * pad_d + K_d;
+    auto H_out = (H_in - 1) * stride_h - 2 * pad_h + K_h;
+    auto W_out = (W_in - 1) * stride_w - 2 * pad_w + K_w;
+
+    // Allocate intermediate output for Conv+BN
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(input.device());
+    auto conv_bn_output = torch::empty({N, C_out, D_out, H_out, W_out}, options);
+
+    const int block_size = 256;
+    int total_elements_conv = N * C_out * D_out * H_out * W_out;
+    int num_blocks_conv = (total_elements_conv + block_size - 1) / block_size;
+
+    conv_bn_kernel<<<num_blocks_conv, block_size>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        running_mean.data_ptr<float>(),
+        running_var.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        conv_bn_output.data_ptr<float>(),
+        N, C_in, C_out, D_in, H_in, W_in,
+        K_d, K_h, K_w,
+        stride_d, stride_h, stride_w,
+        pad_d, pad_h, pad_w,
+        D_out, H_out, W_out,
+        1e-5 // eps for BN
+    );
+
+    // Now compute mean along spatial dims (2,3,4) for each (N, C)
+    // We need a temporary buffer for means: [N, C_out]
+    auto means = torch::empty({N, C_out}, options);
+    
+    // Launch reduction kernel to compute means
+    // Each block handles one (n, c) pair? Or use atomic adds.
+    // Let's launch one thread per (n, c) element to compute the mean by iterating spatial dims.
+    int total_means = N * C_out;
+    int num_blocks_mean = (total_means + block_size - 1) / block_size;
+
+    auto d_input = conv_bn_output.data_ptr<float>();
+    auto d_means = means.data_ptr<float>();
+    
+    // Kernel to compute mean for each (n, c)
+    auto compute_mean_kernel = [] __device__ (const float* data, int N, int C, int D, int H, int W, int n, int c) {
+        float sum = 0.0f;
+        int spatial_size = D * H * W;
+        // Strides for (n, c, d, h, w)
+        int stride_n = C * D * H * W;
+        int stride_c = D * H * W;
+        
+        const float* slice = data + n * stride_n + c * stride_c;
+        
+        for (int i = 0; i < spatial_size; ++i) {
+            sum += slice[i];
+        }
+        return sum / spatial_size;
+    };
+
+    // We need to define this kernel in the source. Let's add it below.
+    
+    // For now, let's assume we have a kernel `compute_mean_kernel` defined.
+    // Since I can't easily define lambdas in inline CUDA source for kernels, 
+    // I will define a proper kernel below.
+
+    return conv_bn_output; // Placeholder
+}
+
+// We need to define the mean computation kernel and the final subtraction kernel in the source string.
+"""
+
+# Let's rewrite the source string properly with all kernels defined.
+
+full_cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void conv_bn_kernel(
+    const float* input,      // [N, C_in, D_in, H_in, W_in]
+    const float* weight,     // [C_out, C_in, K_d, K_h, K_w]
+    const float* bias,       // [C_out]
+    const float* running_mean, // [C_out]
+    const float* running_var,  // [C_out]
+    const float* gamma,        // [C_out]
+    const float* beta,         // [C_out]
+    float* output,           // [N, C_out, D_out, H_out, W_out]
+    int N, int C_in, int C_out, 
+    int D_in, int H_in, int W_in,
+    int K_d, int K_h, int K_w,
+    int stride_d, int stride_h, int stride_w,
+    int pad_d, int pad_h, int pad_w,
+    int D_out, int H_out, int W_out,
+    float eps) 
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C_out * D_out * H_out * W_out;
+    
+    if (idx >= total_elements) return;
+
+    int temp = idx;
+    int w = temp % W_out; temp /= W_out;
+    int h = temp % H_out; temp /= H_out;
+    int d = temp % D_out; temp /= D_out;
+    int c_out = temp % C_out; temp /= C_out;
+    int n = temp;
+
+    float conv_sum = 0.0f;
+    
+    for (int c_in = 0; c_in < C_in; ++c_in) {
+        for (int k_d = 0; k_d < K_d; ++k_d) {
+            int d_in = d * stride_d - pad_d + k_d;
+            if (d_in < 0 || d_in >= D_in) continue;
+            
+            for (int k_h = 0; k_h < K_h; ++k_h) {
+                int h_in = h * stride_h - pad_h + k_h;
+                if (h_in < 0 || h_in >= H_in) continue;
+                
+                for (int k_w = 0; k_w < K_w; ++k_w) {
+                    int w_in = w * stride_w - pad_w + k_w;
+                    if (w_in < 0 || w_in >= W_in) continue;
+
+                    int weight_idx = ((c_out * C_in + c_in) * K_d + k_d) * K_h * K_w + k_h * K_w + k_w;
+                    int input_idx = ((n * C_in + c_in) * D_in + d_in) * H_in * W_in + h_in * W_in + w_in;
+
+                    conv_sum += weight[weight_idx] * input[input_idx];
+                }
+            }
+        }
+    }
+
+    if (bias != nullptr) {
+        conv_sum += bias[c_out];
+    }
+
+    float mean = running_mean[c_out];
+    float var = running_var[c_out];
+    
+    float inv_std = rsqrtf(var + eps);
+    float normalized = (conv_sum - mean) * inv_std;
+    
+    if (gamma != nullptr) {
+        normalized *= gamma[c_out];
+    }
+    if (beta != nullptr) {
+        normalized += beta[c_out];
+    }
+
+    int output_idx = ((n * C_out + c_out) * D_out + d) * H_out * W_out + h * W_out + w;
+    output[output_idx] = normalized;
+}
+
+__global__ void compute_mean_kernel(
+    const float* input,      // [N, C, D, H, W]
+    float* means,            // [N, C]
+    int N, int C, int D, int H, int W) 
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_means = N * C;
+
+    if (idx >= total_means) return;
+
+    int c = idx % C;
+    int n = idx / C;
+
+    float sum = 0.0f;
+    int spatial_size = D * H * W;
+    
+    // Strides: [N, C, D, H, W]
+    int stride_n = C * D * H * W;
+    int stride_c = D * H * W;
+    
+    const float* slice = input + n * stride_n + c * stride_c;
+    
+    for (int i = 0; i < spatial_size; ++i) {
+        sum += slice[i];
+    }
+    
+    means[idx] = sum / spatial_size;
+}
+
+__global__ void mean_sub_kernel(
+    const float* input,      // [N, C, D, H, W]
+    const float* means,      // [N, C]
+    float* output,           // [N, C, D, H, W]
+    int N, int C, int D, int H, int W) 
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C * D * H * W;
+
+    if (idx >= total_elements) return;
+
+    int temp = idx;
+    int w = temp % W; temp /= W;
+    int h = temp % H; temp /= H;
+    int d = temp % D; temp /= D;
+    int c = temp % C; temp /= C;
+    int n = temp;
+
+    float mean_val = means[n * C + c];
+    
+    // Input index: [n, c, d, h, w]
+    int stride_n = C * D * H * W;
+    int stride_c = D * H * W;
+    int input_idx = n * stride_n + c * stride_c + d * H * W + h * W + w;
+    
+    output[idx] = input[input_idx] - mean_val;
+}
+
+torch::Tensor conv_bn_mean_sub_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    int stride_d, int stride_h, int stride_w,
+    int pad_d, int pad_h, int pad_w) 
+{
+    auto N = input.size(0);
+    auto C_in = input.size(1);
+    auto D_in = input.size(2);
+    auto H_in = input.size(3);
+    auto W_in = input.size(4);
+
+    auto K_d = weight.size(2);
+    auto K_h = weight.size(3);
+    auto K_w = weight.size(4);
+    auto C_out = weight.size(0);
+
+    auto D_out = (D_in - 1) * stride_d - 2 * pad_d + K_d;
+    auto H_out = (H_in - 1) * stride_h - 2 * pad_h + K_h;
+    auto W_out = (W_in - 1) * stride_w - 2 * pad_w + K_w;
+
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(input.device());
+    auto conv_bn_output = torch::empty({N, C_out, D_out, H_out, W_out}, options);
+
+    const int block_size = 256;
+    int total_elements_conv = N * C_out * D_out * H_out * W_out;
+    int num_blocks_conv = (total_elements_conv + block_size - 1) / block_size;
+
+    conv_bn_kernel<<<num_blocks_conv, block_size>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        running_mean.data_ptr<float>(),
+        running_var.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        conv_bn_output.data_ptr<float>(),
+        N, C_in, C_out, D_in, H_in, W_in,
+        K_d, K_h, K_w,
+        stride_d, stride_h, stride_w,
+        pad_d, pad_h, pad_w,
+        D_out, H_out, W_out,
+        1e-5
+    );
+
+    int total_means = N * C_out;
+    int num_blocks_mean = (total_means + block_size - 1) / block_size;
+    auto means = torch::empty({N, C_out}, options);
+
+    compute_mean_kernel<<<num_blocks_mean, block_size>>>(
+        conv_bn_output.data_ptr<float>(),
+        means.data_ptr<float>(),
+        N, C_out, D_out, H_out, W_out
+    );
+
+    int total_elements_final = N * C_out * D_out * H_out * W_out;
+    int num_blocks_final = (total_elements_final + block_size - 1) / block_size;
+    auto output = torch::empty({N, C_out, D_out, H_out, W_out}, options);
+
+    mean_sub_kernel<<<num_blocks_final, block_size>>>(
+        conv_bn_output.data_ptr<float>(),
+        means.data_ptr<float>(),
+        output.data_ptr<float>(),
+        N, C_out, D_out, H_out, W_out
+    );
+
+    return output;
+}
+"""
+
+custom_ops_cpp_source = (
+    "torch::Tensor conv_bn_mean_sub_cuda("
+    "torch::Tensor input,"
+    "torch::Tensor weight,"
+    "torch::Tensor bias,"
+    "torch::Tensor running_mean,"
+    "torch::Tensor running_var,"
+    "torch::Tensor gamma,"
+    "torch::Tensor beta,"
+    "int stride_d, int stride_h, int stride_w,"
+    "int pad_d, int pad_h, int pad_w"
+    ");"
+)
+
+# Compile the inline CUDA code
+custom_ops = load_inline(
+    name="custom_ops",
+    cpp_sources=custom_ops_cpp_source,
+    cuda_sources=full_cuda_source,
+    functions=["conv_bn_mean_sub_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias=True):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias)
+        self.batch_norm = nn.BatchNorm3d(out_channels)
+        
+        # Initialize weights for the custom operator to match PyTorch's ConvTranspose3d and BatchNorm3d
+        # We need to extract the parameters from the initialized layers
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        
+    def forward(self, x):
+        # Get parameters from PyTorch layers
+        weight = self.conv_transpose.weight
+        bias = self.conv_transpose.bias
+        running_mean = self.batch_norm.running_mean
+        running_var = self.batch_norm.running_var
+        gamma = self.batch_norm.weight
+        beta = self.batch_norm.bias
+        
+        stride_d, stride_h, stride_w = self.stride if isinstance(self.stride, tuple) else (self.stride, self.stride, self.stride)
+        pad_d, pad_h, pad_w = self.padding if isinstance(self.padding, tuple) else (self.padding, self.padding, self.padding)
+        
+        # Call custom fused CUDA operator
+        out = custom_ops.conv_bn_mean_sub_cuda(
+            x,
+            weight,
+            bias,
+            running_mean,
+            running_var,
+            gamma,
+            beta,
+            stride_d, stride_h, stride_w,
+            pad_d, pad_h, pad_w
+        )
+        
+        return out
+
+def get_inputs():
+    return [torch.rand(16, 16, 16, 32, 32)]
+
+def get_init_inputs():
+    return [16, 32, 3, 2, 1]
+```

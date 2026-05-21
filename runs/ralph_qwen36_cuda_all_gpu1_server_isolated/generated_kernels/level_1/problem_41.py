@@ -1,0 +1,193 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for Max Pooling 1D
+max_pool_1d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Kernel to compute max pooling with indices
+__global__ void max_pool_1d_kernel(
+    const float* __restrict__ input,
+    int* __restrict__ indices,
+    float* __restrict__ output,
+    int batch_size,
+    int num_features,
+    int sequence_length,
+    int kernel_size,
+    int stride,
+    int padding,
+    int dilation) 
+{
+    // Calculate global thread index
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Total number of output elements: batch * features * out_seq_len
+    int out_seq_len = (sequence_length + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+    int total_out_elements = batch_size * num_features * out_seq_len;
+
+    if (idx >= total_out_elements) return;
+
+    // Decompose index into batch, feature, and output sequence position
+    int out_pos = idx % out_seq_len;
+    int feature_idx = (idx / out_seq_len) % num_features;
+    int batch_idx = idx / (out_seq_len * num_features);
+
+    // Calculate the start index in the input sequence for this output position
+    // Input index corresponding to output position 'out_pos' with given stride and padding
+    int input_start = out_pos * stride - padding;
+
+    float max_val = -INFINITY;
+    int max_idx = -1;
+
+    // Iterate over the kernel window
+    for (int k = 0; k < kernel_size; ++k) {
+        int input_idx = input_start + k * dilation;
+        
+        // Check bounds
+        if (input_idx >= 0 && input_idx < sequence_length) {
+            float val = input[batch_idx * num_features * sequence_length + feature_idx * sequence_length + input_idx];
+            if (val > max_val) {
+                max_val = val;
+                max_idx = input_idx;
+            }
+        }
+    }
+
+    // Write output
+    output[idx] = max_val;
+    
+    // Write index if requested (indices tensor is passed as valid pointer)
+    if (indices != nullptr) {
+        indices[idx] = max_idx;
+    }
+}
+
+torch::Tensor max_pool_1d_cuda(torch::Tensor input, int kernel_size, int stride, int padding, int dilation, bool return_indices) {
+    // Input shape: [batch_size, num_features, sequence_length]
+    TORCH_CHECK(input.dim() == 3, "Input tensor must be 3D");
+    
+    auto batch_size = input.size(0);
+    auto num_features = input.size(1);
+    auto sequence_length = input.size(2);
+
+    // Calculate output sequence length
+    int out_seq_len = (sequence_length + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+    
+    TORCH_CHECK(out_seq_len > 0, "Output sequence length must be positive");
+
+    auto output = torch::empty({batch_size, num_features, out_seq_len}, input.options());
+    
+    torch::Tensor indices_tensor;
+    int* indices_ptr = nullptr;
+    
+    if (return_indices) {
+        indices_tensor = torch::empty({batch_size, num_features, out_seq_len}, torch::kInt32);
+        indices_ptr = indices_tensor.data_ptr<int>();
+    }
+
+    const float* input_ptr = input.data_ptr<float>();
+    float* output_ptr = output.data_ptr<float>();
+
+    int total_out_elements = batch_size * num_features * out_seq_len;
+    
+    if (total_out_elements == 0) {
+        return output;
+    }
+
+    const int block_size = 256;
+    const int num_blocks = (total_out_elements + block_size - 1) / block_size;
+
+    max_pool_1d_kernel<<<num_blocks, block_size>>>(
+        input_ptr,
+        indices_ptr,
+        output_ptr,
+        batch_size,
+        num_features,
+        sequence_length,
+        kernel_size,
+        stride,
+        padding,
+        dilation
+    );
+
+    // Check for launch errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA error in max_pool_1d: ") + cudaGetErrorString(err));
+    }
+
+    if (return_indices) {
+        return indices_tensor;
+    } else {
+        return output;
+    }
+}
+"""
+
+max_pool_1d_cpp_source = (
+    "torch::Tensor max_pool_1d_cuda(torch::Tensor input, int kernel_size, int stride, int padding, int dilation, bool return_indices);"
+)
+
+# Compile the inline CUDA code for Max Pooling 1D
+max_pool_1d_module = load_inline(
+    name="max_pool_1d_cuda",
+    cpp_sources=max_pool_1d_cpp_source,
+    cuda_sources=max_pool_1d_source,
+    functions=["max_pool_1d_cuda"],
+    verbose=False,
+    extra_cflags=["-O2"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Max Pooling 1D using custom CUDA operators.
+    """
+    def __init__(self, kernel_size: int, stride: int = None, padding: int = 0, dilation: int = 1, return_indices: bool = False):
+        """
+        Initializes the Max Pooling 1D layer with custom CUDA implementation.
+
+        Args:
+            kernel_size (int): Size of the window to take a max over.
+            stride (int, optional): Stride of the window. Defaults to None (same as kernel_size).
+            padding (int, optional): Implicit zero padding to be added on both sides. Defaults to 0.
+            dilation (int, optional): Spacing between kernel elements. Defaults to 1.
+            return_indices (bool, optional): Whether to return the indices of the maximum values. Defaults to False.
+        """
+        super(ModelNew, self).__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+        self.padding = padding
+        self.dilation = dilation
+        self.return_indices = return_indices
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Max Pooling 1D to the input tensor using custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, num_features, sequence_length).
+
+        Returns:
+            torch.Tensor: Output tensor with Max Pooling 1D applied, shape (batch_size, num_features, output_sequence_length).
+                          If return_indices is True, returns the indices tensor.
+        """
+        # Ensure input is on CUDA and contiguous
+        if not x.is_cuda:
+            x = x.cuda()
+        
+        # Use custom CUDA operator
+        result = max_pool_1d_module.max_pool_1d_cuda(
+            x, 
+            self.kernel_size, 
+            self.stride, 
+            self.padding, 
+            self.dilation, 
+            self.return_indices
+        )
+        
+        return result

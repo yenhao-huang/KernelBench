@@ -1,0 +1,244 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+from transformers import AutoModelForCausalLM, AutoConfig
+
+# Define custom CUDA kernels for optimized operations
+# We will replace the standard Matmul and LayerNorm with fused/custom implementations
+# to demonstrate optimization. Note: For GPT-Neo 2.7B, the bottleneck is often the 
+# attention mechanism's matmuls. We will implement a fused Linear + GeLU (if applicable) 
+# or just optimized Matmul. However, since we are replacing PyTorch ops in a pre-trained model,
+# we must be careful about compatibility. 
+# A common optimization for LLMs is using FlashAttention or custom fused kernels.
+# Here, we will implement a custom Fused Linear + Activation (GeLU) kernel which is often used in GPT models,
+# and potentially optimize the final projection.
+
+# However, replacing internal layers of AutoModelForCausalLM directly with inline CUDA 
+# requires modifying the model's forward pass or monkey-patching. 
+# The prompt asks to "replace pytorch operators... in the given architecture".
+# Since we cannot easily rewrite the entire transformer internals with inline CUDA in a single file 
+# without significant complexity, we will focus on optimizing the most critical path: 
+# The Linear layers (Matmul) and potentially the final Logits projection.
+
+# Let's define a custom Fused Linear + GeLU kernel for the MLP blocks if possible, 
+# but since we are using AutoModelForCausalLM, the structure is fixed.
+# A more practical approach for "custom CUDA operators" in this context is to implement 
+# a highly optimized Matmul or a fused operation that replaces standard torch.nn.functional.linear 
+# where it matters most.
+
+# Given the constraints and the need for real, compiling code, we will implement:
+# 1. A custom Fused Linear + GeLU kernel (common in GPT-Neo MLPs)
+# 2. We will wrap this in a PyTorch module and attempt to replace the relevant layers.
+
+# Note: Replacing layers in a pre-trained model requires loading weights into new layers.
+# This is complex. An alternative interpretation is to write custom CUDA ops that 
+# mimic standard ops but are faster, and use them in a *new* model definition if we were building from scratch.
+# But the prompt says "replace... in the given architecture".
+# Let's assume we can modify the ModelNew class to use these optimized kernels by replacing specific sub-modules.
+
+# Custom CUDA Source for Fused Linear + GeLU
+fused_linear_gelu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Kernel for Fused Linear + GeLU
+// out = gelu(x @ W^T + b)
+__global__ void fused_linear_gelu_kernel(
+    const float* __restrict__ x, 
+    const float* __restrict__ w, 
+    const float* __restrict__ b, 
+    float* __restrict__ out, 
+    int batch_size, 
+    int seq_len, 
+    int in_features, 
+    int out_features) {
+    
+    // Each thread handles one output element
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * seq_len * out_features;
+    
+    if (idx < total_elements) {
+        int bs_idx = idx / (seq_len * out_features);
+        int sl_idx = (idx % (seq_len * out_features)) / out_features;
+        int feat_idx = idx % out_features;
+        
+        float sum = 0.0f;
+        const float* x_row = x + bs_idx * seq_len * in_features + sl_idx * in_features;
+        const float* w_col = w + feat_idx * in_features; // W is typically [out_features, in_features]
+        
+        for (int i = 0; i < in_features; ++i) {
+            sum += x_row[i] * w_col[i];
+        }
+        
+        if (b != nullptr) {
+            sum += b[feat_idx];
+        }
+        
+        // GeLU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        float x_val = sum;
+        float cube = x_val * x_val * x_val;
+        float tanh_arg = sqrtf(2.0f / M_PI) * (x_val + 0.044715f * cube);
+        float tanh_val = tanhf(tanh_arg);
+        out[idx] = 0.5f * x_val * (1.0f + tanh_val);
+    }
+}
+
+torch::Tensor fused_linear_gelu_cuda(
+    torch::Tensor x, 
+    torch::Tensor w, 
+    torch::Tensor b) {
+    
+    auto batch_size = x.size(0);
+    auto seq_len = x.size(1);
+    auto in_features = x.size(2);
+    auto out_features = w.size(0);
+    
+    auto out = torch::empty({batch_size, seq_len, out_features}, x.options());
+    
+    const int block_size = 256;
+    int total_elements = batch_size * seq_len * out_features;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    fused_linear_gelu_kernel<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(), 
+        w.data_ptr<float>(), 
+        b != nullptr ? b.data_ptr<float>() : nullptr, 
+        out.data_ptr<float>(), 
+        batch_size, seq_len, in_features, out_features);
+        
+    return out;
+}
+"""
+
+fused_linear_gelu_cpp_source = (
+    "torch::Tensor fused_linear_gelu_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor b);"
+)
+
+# Load the custom extension
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_linear_gelu_cpp_source,
+    cuda_sources=fused_linear_gelu_source,
+    functions=["fused_linear_gelu_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+class FusedLinearGeLU(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / (fan_in ** 0.5) if fan_in > 0 else 0
+        if self.bias is not None:
+            uniform_ = torch.nn.init.uniform_
+            uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        # x shape: [batch, seq_len, in_features]
+        # w shape: [out_features, in_features]
+        return fused_ops.fused_linear_gelu_cuda(x, self.weight, self.bias)
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, model_name, config):
+        super().__init__()
+        self.model_name = model_name
+        self.config = config
+        
+        # Load the original model to get weights
+        base_model = AutoModelForCausalLM.from_pretrained(model_name, config=config)
+        
+        # We will create a new model structure that mimics GPT-Neo but uses our custom fused layers
+        # Note: This is a simplified replacement. In reality, replacing every layer in a 2.7B model 
+        # with inline CUDA kernels is extremely verbose and complex due to the many sub-layers (Attention, MLP, etc.).
+        # Here we demonstrate the concept by replacing the MLP's linear+gelu parts which are compute-heavy.
+        
+        self.transformer = base_model.transformer
+        self.lm_head = base_model.lm_head
+        
+        # Replace specific Linear layers in the MLP blocks with our custom FusedLinearGeLU
+        # GPT-Neo MLP structure: DenseHid -> GeLU -> DenseOut
+        # We will replace the first linear + gelu activation with our fused kernel.
+        
+        for layer_idx, decoder_layer in enumerate(self.transformer.h):
+            # The MLP in GPT-Neo is typically: 
+            # self.mlp = nn.Sequential(
+            #     nn.Linear(config.n_embd, config.n_inner),
+            #     nn.GELU(),
+            #     nn.Linear(config.n_inner, config.n_embd)
+            # )
+            # We replace the first Linear and the GELU with our fused kernel.
+            
+            mlp = decoder_layer.mlp
+            if hasattr(mlp, 'c_fc'): # GPT-Neo uses c_fc, c_proj naming
+                in_features = config.n_embd
+                out_features = config.n_inner
+                
+                # Create new fused layer
+                fused_layer = FusedLinearGeLU(in_features, out_features, bias=True)
+                
+                # Copy weights from original model
+                with torch.no_grad():
+                    fused_layer.weight.copy_(mlp.c_fc.weight)
+                    fused_layer.bias.copy_(mlp.c_fc.bias)
+                
+                # Replace the c_fc and gelu logic. 
+                # Since we can't easily change the forward pass of the pre-built module without rewriting it,
+                # we will monkey-patch the forward method of the MLP or replace the submodule.
+                # However, nn.Sequential doesn't support easy replacement of internal steps.
+                
+                # Alternative: Replace the entire mlp block with a custom one that uses our kernel.
+                class CustomMLP(nn.Module):
+                    def __init__(self, fused_linear, c_proj_weight, c_proj_bias):
+                        super().__init__()
+                        self.fused_linear = fused_linear
+                        self.c_proj = nn.Linear(config.n_inner, config.n_embd)
+                        with torch.no_grad():
+                            self.c_proj.weight.copy_(c_proj_weight)
+                            self.c_proj.bias.copy_(c_proj_bias)
+                    
+                    def forward(self, x):
+                        # x: [batch, seq_len, n_embd]
+                        # FusedLinearGeLU outputs [batch, seq_len, n_inner]
+                        h = self.fused_linear(x)
+                        h = self.c_proj(h)
+                        return h
+                
+                new_mlp = CustomMLP(
+                    fused_layer, 
+                    mlp.c_proj.weight, 
+                    mlp.c_proj.bias if hasattr(mlp.c_proj, 'bias') else None
+                )
+                
+                decoder_layer.mlp = new_mlp
+
+    def forward(self, x):
+        return self.model(x).logits if hasattr(self, 'model') else self.transformer(x).last_hidden_state @ self.lm_head.weight + self.lm_head.bias
+
+# Re-initialize with the custom model structure
+def get_inputs():
+    inputs = torch.randint(0, config.vocab_size, (batch_size, sequence_length))
+    return [inputs]
+
+def get_init_inputs():
+    return [model_name, config]
+
+# Instantiate the new model
+try:
+    model_new = ModelNew(model_name, config)
+except Exception as e:
+    # Fallback if complex replacement fails due to version mismatches
+    print(f"Error initializing ModelNew: {e}")
+    model_new = None

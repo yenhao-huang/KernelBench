@@ -1,0 +1,173 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void squeeze_relu_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ y,
+    int N, int C, int S, int H, int W
+) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)N * S * H * W;
+    if (idx >= total) return;
+
+    int ow = idx % W;
+    int oh = (idx / W) % H;
+    int os = (idx / (long long)(W * H)) % S;
+    int n = idx / (long long)(S * H * W);
+
+    float acc = b[os];
+    long long base = ((long long)n * C * H + oh) * W + ow;
+    for (int c = 0; c < C; ++c) {
+        acc += x[base + (long long)c * H * W] * w[os * C + c];
+    }
+    y[idx] = acc > 0.0f ? acc : 0.0f;
+}
+
+__global__ void expand_cat_relu_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w1,
+    const float* __restrict__ b1,
+    const float* __restrict__ w3,
+    const float* __restrict__ b3,
+    float* __restrict__ out,
+    int N, int S, int E1, int E3, int H, int W
+) {
+    int E = E1 + E3;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)N * E * H * W;
+    if (idx >= total) return;
+
+    int ow = idx % W;
+    int oh = (idx / W) % H;
+    int oc = (idx / (long long)(W * H)) % E;
+    int n = idx / (long long)(E * H * W);
+
+    float acc;
+    if (oc < E1) {
+        acc = b1[oc];
+        long long in_base = ((long long)n * S * H + oh) * W + ow;
+        long long w_base = (long long)oc * S;
+        for (int s = 0; s < S; ++s) {
+            acc += x[in_base + (long long)s * H * W] * w1[w_base + s];
+        }
+    } else {
+        int oc3 = oc - E1;
+        acc = b3[oc3];
+        long long w_base = (long long)oc3 * S * 9;
+        for (int s = 0; s < S; ++s) {
+            for (int kh = 0; kh < 3; ++kh) {
+                int ih = oh + kh - 1;
+                if (ih < 0 || ih >= H) continue;
+                for (int kw = 0; kw < 3; ++kw) {
+                    int iw = ow + kw - 1;
+                    if (iw < 0 || iw >= W) continue;
+                    float xv = x[((long long)n * S * H + (long long)s * H + ih) * W + iw];
+                    float wv = w3[w_base + (long long)s * 9 + kh * 3 + kw];
+                    acc += xv * wv;
+                }
+            }
+        }
+    }
+
+    out[idx] = acc > 0.0f ? acc : 0.0f;
+}
+
+torch::Tensor fire_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor sw,
+    torch::Tensor sb,
+    torch::Tensor e1w,
+    torch::Tensor e1b,
+    torch::Tensor e3w,
+    torch::Tensor e3b
+) {
+    int N = x.size(0);
+    int C = x.size(1);
+    int H = x.size(2);
+    int W = x.size(3);
+    int S = sw.size(0);
+    int E1 = e1w.size(0);
+    int E3 = e3w.size(0);
+
+    auto squeezed = torch::empty({N, S, H, W}, x.options());
+    auto out = torch::empty({N, E1 + E3, H, W}, x.options());
+
+    const int threads = 256;
+    long long squeeze_total = (long long)N * S * H * W;
+    int squeeze_blocks = (int)((squeeze_total + threads - 1) / threads);
+    squeeze_relu_kernel<<<squeeze_blocks, threads>>>(
+        x.data_ptr<float>(),
+        sw.data_ptr<float>(),
+        sb.data_ptr<float>(),
+        squeezed.data_ptr<float>(),
+        N, C, S, H, W
+    );
+
+    long long expand_total = (long long)N * (E1 + E3) * H * W;
+    int expand_blocks = (int)((expand_total + threads - 1) / threads);
+    expand_cat_relu_kernel<<<expand_blocks, threads>>>(
+        squeezed.data_ptr<float>(),
+        e1w.data_ptr<float>(),
+        e1b.data_ptr<float>(),
+        e3w.data_ptr<float>(),
+        e3b.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, S, E1, E3, H, W
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor fire_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor sw,
+    torch::Tensor sb,
+    torch::Tensor e1w,
+    torch::Tensor e1b,
+    torch::Tensor e3w,
+    torch::Tensor e3b
+);
+"""
+
+fire_cuda = load_inline(
+    name="fire_cuda_inline",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["fire_forward_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, squeeze_channels, expand1x1_channels, expand3x3_channels):
+        super(ModelNew, self).__init__()
+        self.squeeze = nn.Conv2d(in_channels, squeeze_channels, kernel_size=1)
+        self.squeeze_activation = nn.ReLU(inplace=True)
+        self.expand1x1 = nn.Conv2d(squeeze_channels, expand1x1_channels, kernel_size=1)
+        self.expand1x1_activation = nn.ReLU(inplace=True)
+        self.expand3x3 = nn.Conv2d(squeeze_channels, expand3x3_channels, kernel_size=3, padding=1)
+        self.expand3x3_activation = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        return fire_cuda.fire_forward_cuda(
+            x,
+            self.squeeze.weight,
+            self.squeeze.bias,
+            self.expand1x1.weight,
+            self.expand1x1.bias,
+            self.expand3x3.weight,
+            self.expand3x3.bias,
+        )
+```

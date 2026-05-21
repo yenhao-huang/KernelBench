@@ -1,0 +1,709 @@
+import torch
+
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for element-wise addition and concatenation
+# In DenseNet, the concatenation is a single operation that happens at every layer.
+# In the original model, torch.cat(features, 1) is called repeatedly,
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the. custom CUDA kernel for fused-BatchNorm-ReLU-Conv2D-Dropout-Concatenation
+- In DenseBlock, DenseBlock.forward pass is the_most critical part.
+- In DenseBlock.forward, the input to the layer is 'x' which is accumulates.
+        - Layer s.t. [0, 1, ..., k-1]
+        - Layer k: input is concat(x_0, x_1, ..., x_{k-1})
+                        where x_0 is the layer 0 input,
+ little bit of a even more expensive-wise
+ even more expensive than than torch.cat is torch.cat(features, features_new)
+                    
+                    # Layer 1: input is concat(x_0, x.1)
+                    # pseudocode-wise:
+                    # optimization:
+ pre-allocate-all-the-features-allocation-
+<|channel>thought
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# The most expensive part of DenseNet is the repeated concatenation in DenseBlock.
+# Instead of creating many small tensors and calling torch.cat, which involves 
+# multiple memory allocations and copies, we can pre-allocate the final output 
+# buffer for the entire DenseBlock and write each layer's output directly into it.
+
+dense_block_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Kernel to copy a single feature map into a specific slice of the pre-allocated buffer
+// This is used to "concatenate" by writing directly to the destination.
+__global__ void copy_feature_kernel(const float* src, float* dst, int batch_size, int channels, int height, int width, int dst_offset_channels) {
+    int b = blockIdx.z;
+    int c = blockIdx.y;
+    int hw = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    int total_hw = height * width;
+    if (hw < total_hw) {
+        int src_idx = ((b * channels + c) * total_hw) + hw;
+        int dst_idx = ((b * (channels + dst_offset_channels) + (c + dst_offset_channels)) * total_hw) + hw; 
+        // Wait, the logic above is for appending. 
+        // Let's simplify: we want to write 'src' into 'dst' at a specific channel offset.
+    }
+}
+
+// A more robust approach: A kernel that copies a 3D tensor (C, H, W) into a 4D tensor (B, C_total, H, W) at a specific channel offset.
+__global__ void copy_to_buffer_kernel(const float* __restrict__ src, float* __restrict__ dst, 
+                                     int batch_size, int src_channels, int dst_offset_channels, 
+                                     int height, int width) {
+    int b = blockIdx.z;
+    int c = blockIdx.y; // src channel
+    int hw = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    int total_hw = height * width;
+    if (hw < total_hw) {
+        // src index: (b * src_channels + c) * total_hw + hw
+        // dst index: (b * total_dst_channels + (offset + c)) * total_hw + hw
+        // However, we don't know total_dst_channels here. 
+        // Let's pass it.
+    }
+}
+"""
+
+# Actually, the most effective way to optimize DenseNet in PyTorch without writing 
+# a massive fused kernel is to optimize the concatenation. 
+# In the DenseBlock, we know the final number of channels.
+# We can pre-allocate the output tensor and use slice assignment.
+
+class DenseBlockNew(nn.Module):
+    def __init__(self, num_layers: int, num_input_features: int, growth_rate: int):
+        super(DenseBlockNew, self).__init__()
+        self.growth_rate = growth_rate
+        self.num_layers = num_layers
+        self.num_input_features = num_input_features
+        self.total_output_features = num_input_features + num_layers * growth_rate
+        
+        layers = []
+        for i in range(num_layers):
+            layers.append(self._make_layer(num_input_features + i * growth_rate, growth_rate))
+        self.layers = nn.ModuleList(layers)
+
+    def _make_layer(self, in_features: int, growth_rate: int):
+        return nn.Sequential(
+            nn.BatchNorm2d(in_features),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_features, growth_rate, kernel_size=3, padding=1, bias=False),
+            nn.Dropout(0.0)
+        )
+
+    def forward(self, x):
+        batch_size, _, height, width = x.shape
+        # Pre-allocate the full output buffer
+        out = torch.empty((batch_size, self.total_output_features, height, width), 
+                          dtype=x.dtype, device=x.device)
+        
+        # Copy initial input into the first part of the buffer
+        out[:, :self.num_input_features, :, :] = x
+        
+        # Current pointer for the next layer's output
+        current_offset = self.num_input_features
+        
+        for i, layer in enumerate(self.layers):
+            # The input to the layer is the concatenation of all previous features.
+            # In the original, this was torch.cat(features, 1).
+            # Here, we slice the pre-allocated buffer.
+            # Note: The layer expects a contiguous tensor. 
+            # Slicing 'out' might not be contiguous if we aren't careful, 
+            # but 'out' is newly allocated and contiguous.
+            # However, 'out[:, :current_offset]' is a view.
+            
+            # To avoid massive memory overhead of creating new tensors, 
+            # we pass the view of the buffer.
+            layer_input = out[:, :current_offset, :, :]
+            
+            # The layer produces 'growth_rate' channels
+            new_feature = layer(layer_input)
+            
+            # Copy the new feature into the buffer at the correct offset
+            out[:, current_offset:current_offset + self.growth_rate, :, :] = new_feature
+            current_offset += self.growth_rate
+            
+        return out
+
+# Since the prompt asks for custom CUDA operators, let's implement a fused 
+# BatchNorm + ReLU + Conv kernel if possible, but for standard architectures, 
+# the bottleneck is often the memory management of concatenation.
+# Let's provide a version that uses a custom CUDA kernel for the "Concat-and-Copy" 
+# logic which is the core of DenseNet's inefficiency.
+
+dense_block_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void dense_concat_kernel(
+    const float* __restrict__ input_tensor, // The current accumulated tensor (B, C_acc, H, W)
+    const float* __restrict__ new_feature,  // The new layer output (B, C_new, H, W)
+    float* __restrict__ output_tensor,      // The pre-allocated buffer (B, C_total, H, W)
+    int batch_size,
+    int C_acc,
+    int C_new,
+    int C_total,
+    int H,
+    int W) 
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * C_total * H * W;
+    
+    if (idx < total_elements) {
+        // This is a simplified kernel. In practice, we want to copy 
+        // the new_feature into the specific channel slice of output_tensor.
+        // However, for simplicity and correctness in a single kernel:
+        // We'll use a more granular approach.
+    }
+}
+"""
+
+# Given the complexity of writing a fully fused Conv+BN+ReLU+Concat kernel 
+# (which would require implementing Conv2d in CUDA), the most practical 
+# and high-impact optimization is to replace the repeated `torch.cat` 
+# with a pre-allocated buffer strategy. 
+
+# Let's refine the ModelNew to use the pre-allocation strategy which 
+# significantly reduces memory fragmentation and allocation overhead.
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class DenseBlockNew(nn.Module):
+    def __init__(self, num_layers: int, num_input_features: int, growth_rate: int):
+        super(DenseBlockNew, self).__init__()
+        self.num_layers = num_layers
+        self.num_input_features = num_input_features
+        self.growth_rate = growth_rate
+        self.total_output_features = num_input_features + num_layers * growth_rate
+        
+        layers = []
+        for i in range(num_layers):
+            layers.append(self._make_layer(num_input_features + i * growth_rate, growth_rate))
+        self.layers = nn.ModuleList(layers)
+
+    def _make_layer(self, in_features: int, growth_rate: int):
+        return nn.Sequential(
+            nn.BatchNorm2d(in_features),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_features, growth_rate, kernel_size=3, padding=1, bias=False),
+            nn.Dropout(0.0)
+        )
+
+    def forward(self, x):
+        # x shape: (B, C_in, H, W)
+        B, C_in, H, W = x.shape
+        
+        # Pre-allocate the entire block's output
+        # This avoids the O(N^2) memory copies of repeated torch.cat
+        out = torch.empty((B, self.total_output_features, H, W), dtype=x.dtype, device=x.device)
+        
+        # Copy initial input
+        out[:, :C_in, :, :] = x
+        
+        current_channels = C_in
+        for layer in self.layers:
+            # The input to the layer is the slice of the buffer containing all features so far
+            # We use a view to avoid copying
+            layer_input = out[:, :current_channels, :, :]
+            
+            # Compute new features
+            new_feat = layer(layer_input)
+            
+            # Place new features into the buffer
+            out[:, current_channels:current_channels + self.growth_rate, :, :] = new_feat
+            current_channels += self.growth_rate
+            
+        return out
+
+class TransitionLayerNew(nn.Module):
+    def __init__(self, num_input_features: int, num_output_features: int):
+        super(TransitionLayerNew, self).__init__()
+        self.transition = nn.Sequential(
+            nn.BatchNorm2d(num_input_features),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(num_input_features, num_output_features, kernel_size=1, bias=False),
+            nn.AvgPool2d(kernel_size=2, stride=2)
+        )
+
+    def forward(self, x):
+        return self.transition(x)
+
+class ModelNew(nn.Module):
+    def __init__(self, growth_rate: int = 32, num_classes: int = 1000):
+        super(ModelNew, self).__init__()
+
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        )
+
+        num_features = 64
+        block_layers = [6, 12, 48, 32]
+
+        self.dense_blocks = nn.ModuleList()
+        self.transition_layers = nn.ModuleList()
+
+        for i, num_layers in enumerate(block_layers):
+            block = DenseBlockNew(num_layers=num_layers, num_input_features=num_features, growth_rate=growth_rate)
+            self.dense_blocks.append(block)
+            num_features = num_features + num_layers * growth_rate
+
+            if i != len(block_layers) - 1:
+                transition = TransitionLayerNew(num_input_features=num_features, num_output_features=num_features // 2)
+                self.transition_layers.append(transition)
+                num_features = num_features // 2
+
+        self.final_bn = nn.BatchNorm2d(num_features)
+        self.classifier = nn.Linear(num_features, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+
+        for i, block in enumerate(self.dense_blocks):
+            x = block(x)
+            if i != len(self.dense_blocks) - 1:
+                x = self.transition_layers[i](x)
+
+        x = self.final_bn(x)
+        x = F.relu(x, inplace=True)
+        x = F.adaptive_avg_pool2d(x, (1, 1)).view(x.size(0), -1)
+        x = self.classifier(x)
+        return x
+
+```
+
+Wait, the prompt specifically asks for custom CUDA operators. While the pre-allocation strategy is a massive algorithmic improvement, I should include a custom CUDA kernel to satisfy the requirement. I will implement a fused kernel for the `BatchNorm + ReLU` part which is common in the transition layers and the end of the model.
+
+Actually, a better target for a custom CUDA kernel in DenseNet is the `AvgPool2d` or a fused `Conv+BN+ReLU`. But since I cannot easily implement a high-performance `Conv2d` in a single code block, I will implement a fused `BatchNorm + ReLU` kernel.
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Fused BatchNorm (inference mode) + ReLU kernel
+# In inference, BatchNorm is just: y = gamma * (x - mean) / sqrt(var + eps) + beta
+# We can fuse this with ReLU.
+fused_bn_relu_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_bn_relu_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ running_mean,
+    const float* __restrict__ running_var,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* __restrict__ output,
+    int batch_size,
+    int num_channels,
+    int spatial_size,
+    float eps) 
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * num_channels * spatial_size;
+
+    if (idx < total_elements) {
+        // Calculate channel index
+        // idx = b * (C * S) + c * S + s
+        int spatial_idx = idx % spatial_size;
+        int channel_idx = (idx / spatial_size) % num_channels;
+        
+        float x = input[idx];
+        float mean = running_mean[channel_idx];
+        float var = running_var[channel_idx];
+        float gamma = weight[channel_idx];
+        float beta = bias[channel_idx];
+        
+        // BatchNorm formula
+        float inv_std = 1.0f / sqrtf(var + eps);
+        float val = gamma * (x - mean) * inv_std + beta;
+        
+        // ReLU
+        output[idx] = val > 0.0f ? val : 0.0f;
+    }
+}
+
+torch::Tensor fused_bn_relu_cuda(
+    torch::Tensor input,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    float eps) 
+{
+    auto batch_size = input.size(0);
+    auto num_channels = input.size(1);
+    auto spatial_size = input.size(2) * input.size(3);
+    auto output = torch::empty_like(input);
+
+    int total_elements = batch_size * num_channels * spatial_size;
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    fused_bn_relu_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        running_mean.data_ptr<float>(),
+        running_var.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        num_channels,
+        spatial_size,
+        eps
+    );
+
+    return output;
+}
+"""
+
+fused_bn_relu_cpp_source = "torch::Tensor fused_bn_relu_cuda(torch::Tensor input, torch::Tensor running_mean, torch::Tensor running_var, torch::Tensor weight, torch::Tensor bias, float eps);"
+
+fused_bn_relu = load_inline(
+    name="fused_bn_relu",
+    cpp_sources=fused_bn_relu_cpp_source,
+    cuda_sources=fused_bn_relu_cuda_source,
+    functions=["fused_bn_relu_cuda"],
+    verbose=False
+)
+
+class FusedBNReLU(nn.Module):
+    def __init__(self, num_features, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+        self.bn = nn.BatchNorm2d(num_features)
+
+    def forward(self, x):
+        # Use the custom fused kernel during inference
+        if not self.training:
+            return fused_bn_relu.fused_bn_relu_cuda(
+                x, self.bn.running_mean, self.bn.running_var, 
+                self.bn.weight, self.bn.bias, self.eps
+            )
+        else:
+            # Fallback to standard for training
+            return F.relu(self.bn(x), inplace=True)
+
+    def train(self, mode=True):
+        super().train(mode)
+        return self
+
+# Now we integrate this into the model.
+# We'll also use the DenseBlock optimization (pre-allocation).
+
+class DenseBlockNew(nn.Module):
+    def __init__(self, num_layers: int, num_input_features: int, growth_rate: int):
+        super(DenseBlockNew, self).__init__()
+        self.num_layers = num_layers
+        self.num_input_features = num_input_features
+        self.growth_rate = growth_rate
+        self.total_output_features = num_input_features + num_layers * growth_rate
+        
+        layers = []
+        for i in range(num_layers):
+            layers.append(self._make_layer(num_input_features + i * growth_rate, growth_rate))
+        self.layers = nn.ModuleList(layers)
+
+    def _make_layer(self, in_features: int, growth_rate: int):
+        return nn.Sequential(
+            nn.BatchNorm2d(in_features),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_features, growth_rate, kernel_size=3, padding=1, bias=False),
+            nn.Dropout(0.0)
+        )
+
+    def forward(self, x):
+        B, C_in, H, W = x.shape
+        out = torch.empty((B, self.total_output_features, H, W), dtype=x.dtype, device=x.device)
+        out[:, :C_in, :, :] = x
+        
+        current_channels = C_in
+        for layer in self.layers:
+            layer_input = out[:, :current_channels, :, :]
+            new_feat = layer(layer_input)
+            out[:, current_channels:current_channels + self.growth_rate, :, :] = new_feat
+            current_channels += self.growth_rate
+        return out
+
+class TransitionLayerNew(nn.Module):
+    def __init__(self, num_input_features: int, num_output_features: int):
+        super(TransitionLayerNew, self).__init__()
+        # Using FusedBNReLU for the transition layer
+        self.bn = FusedBNReLU(num_input_features)
+        self.conv = nn.Conv2d(num_input_features, num_output_features, kernel_size=1, bias=False)
+        self.pool = nn.AvgPool2d(kernel_size=2, stride=2)
+
+    def forward(self, x):
+        # The original order was BN -> ReLU -> Conv -> Pool
+        # Our FusedBNReLU does BN + ReLU.
+        x = self.bn(x)
+        x = self.conv(x)
+        x = self.pool(x)
+        return x
+
+class ModelNew(nn.Module):
+    def __init__(self, growth_rate: int = 32, num_classes: int = 1000):
+        super(ModelNew, self).__init__()
+
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        )
+
+        num_features = 64
+        block_layers = [6, 12, 48, 32]
+
+        self.dense_blocks = nn.ModuleList()
+        self.transition_layers = nn.ModuleList()
+
+        for i, num_layers in enumerate(block_layers):
+            block = DenseBlockNew(num_layers=num_layers, num_input_features=num_features, growth_rate=growth_rate)
+            self.dense_blocks.append(block)
+            num_features = num_features + num_layers * growth_rate
+
+            if i != len(block_layers) - 1:
+                transition = TransitionLayerNew(num_input_features=num_features, num_output_features=num_features // 2)
+                self.transition_layers.append(transition)
+                num_features = num_features // 2
+
+        self.final_bn = FusedBNReLU(num_features)
+        self.classifier = nn.Linear(num_features, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+
+        for i, block in enumerate(self.dense_blocks):
+            x = block(x)
+            if i != len(self.dense_blocks) - 1:
+                x = self.transition_layers[i](x)
+
+        x = self.final_bn(x)
+        # Note: FusedBNReLU already applied ReLU.
+        x = F.adaptive_avg_pool2d(x, (1, 1)).view(x.size(0), -1)
+        x = self.classifier(x)
+        return x
+```
+
+Final check: The `FusedBNReLU` is only used in `eval()` mode. This is a common pattern for optimizing inference. The `DenseBlockNew` uses the pre-allocation strategy which is the most significant speedup for DenseNet.
+
+One small detail: In `TransitionLayerNew`, the original code was `BN -> ReLU -> Conv -> Pool`. My `FusedBNReLU` does `BN -> ReLU`. So `self.bn(x)` followed by `self.conv(x)` is correct.
+
+In `ModelNew.forward`, the original code was `final_bn -> ReLU -> AdaptiveAvgPool`. My `FusedBNReLU` does `BN -> ReLU`. So `x = self.final_bn(x)` followed by `adaptive_avg_pool2d` is correct.
+
+The `DenseBlockNew` uses `out[:, :current_channels, :, :]` as input. This is a view. PyTorch's `Conv2d` handles non-contiguous views by internally making them contiguous if necessary, but since `out` was allocated with `torch.empty` and we are filling it sequentially, the slices will be contiguous in the channel dimension for the spatial dimensions.
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Fused BatchNorm (inference mode) + ReLU kernel
+fused_bn_relu_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_bn_relu_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ running_mean,
+    const float* __restrict__ running_var,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* __restrict__ output,
+    int batch_size,
+    int num_channels,
+    int spatial_size,
+    float eps) 
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * num_channels * spatial_size;
+
+    if (idx < total_elements) {
+        int spatial_idx = idx % spatial_size;
+        int channel_idx = (idx / spatial_size) % num_channels;
+        
+        float x = input[idx];
+        float mean = running_mean[channel_idx];
+        float var = running_var[channel_idx];
+        float gamma = weight[channel_idx];
+        float beta = bias[channel_idx];
+        
+        float inv_std = 1.0f / sqrtf(var + eps);
+        float val = gamma * (x - mean) * inv_std + beta;
+        
+        output[idx] = val > 0.0f ? val : 0.0f;
+    }
+}
+
+torch::Tensor fused_bn_relu_cuda(
+    torch::Tensor input,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    float eps) 
+{
+    auto batch_size = input.size(0);
+    auto num_channels = input.size(1);
+    auto spatial_size = input.size(2) * input.size(3);
+    auto output = torch::empty_like(input);
+
+    int total_elements = batch_size * num_channels * spatial_size;
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    fused_bn_relu_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        running_mean.data_ptr<float>(),
+        running_var.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        num_channels,
+        spatial_size,
+        eps
+    );
+
+    return output;
+}
+"""
+
+fused_bn_relu_cpp_source = "torch::Tensor fused_bn_relu_cuda(torch::Tensor input, torch::Tensor running_mean, torch::Tensor running_var, torch::Tensor weight, torch::Tensor bias, float eps);"
+
+fused_bn_relu = load_inline(
+    name="fused_bn_relu",
+    cpp_sources=fused_bn_relu_cpp_source,
+    cuda_sources=fused_bn_relu_cuda_source,
+    functions=["fused_bn_relu_cuda"],
+    verbose=False
+)
+
+class FusedBNReLU(nn.Module):
+    def __init__(self, num_features, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+        self.bn = nn.BatchNorm2d(num_features)
+
+    def forward(self, x):
+        if not self.training:
+            return fused_bn_relu.fused_bn_relu_cuda(
+                x, self.bn.running_mean, self.bn.running_var, 
+                self.bn.weight, self.bn.bias, self.eps
+            )
+        else:
+            return F.relu(self.bn(x), inplace=True)
+
+    def train(self, mode=True):
+        super().train(mode)
+        return self
+
+class DenseBlockNew(nn.Module):
+    def __init__(self, num_layers: int, num_input_features: int, growth_rate: int):
+        super(DenseBlockNew, self).__init__()
+        self.num_layers = num_layers
+        self.num_input_features = num_input_features
+        self.growth_rate = growth_rate
+        self.total_output_features = num_input_features + num_layers * growth_rate
+        
+        layers = []
+        for i in range(num_layers):
+            layers.append(self._make_layer(num_input_features + i * growth_rate, growth_rate))
+        self.layers = nn.ModuleList(layers)
+
+    def _make_layer(self, in_features: int, growth_rate: int):
+        return nn.Sequential(
+            nn.BatchNorm2d(in_features),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_features, growth_rate, kernel_size=3, padding=1, bias=False),
+            nn.Dropout(0.0)
+        )
+
+    def forward(self, x):
+        B, C_in, H, W = x.shape
+        out = torch.empty((B, self.total_output_features, H, W), dtype=x.dtype, device=x.device)
+        out[:, :C_in, :, :] = x
+        
+        current_channels = C_in
+        for layer in self.layers:
+            layer_input = out[:, :current_channels, :, :]
+            new_feat = layer(layer_input)
+            out[:, current_channels:current_channels + self.growth_rate, :, :] = new_feat
+            current_channels += self.growth_rate
+        return out
+
+class TransitionLayerNew(nn.Module):
+    def __init__(self, num_input_features: int, num_output_features: int):
+        super(TransitionLayerNew, self).__init__()
+        self.bn = FusedBNReLU(num_input_features)
+        self.conv = nn.Conv2d(num_input_features, num_output_features, kernel_size=1, bias=False)
+        self.pool = nn.AvgPool2d(kernel_size=2, stride=2)
+
+    def forward(self, x):
+        x = self.bn(x)
+        x = self.conv(x)
+        x = self.pool(x)
+        return x
+
+class ModelNew(nn.Module):
+    def __init__(self, growth_rate: int = 32, num_classes: int = 1000):
+        super(ModelNew, self).__init__()
+
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        )
+
+        num_features = 64
+        block_layers = [6, 12, 48, 32]
+
+        self.dense_blocks = nn.ModuleList()
+        self.transition_layers = nn.ModuleList()
+
+        for i, num_layers in enumerate(block_layers):
+            block = DenseBlockNew(num_layers=num_layers, num_input_features=num_features, growth_rate=growth_rate)
+            self.dense_blocks.append(block)
+            num_features = num_features + num_layers * growth_rate
+
+            if i != len(block_layers) - 1:
+                transition = TransitionLayerNew(num_input_features=num_features, num_output_features=num_features // 2)
+                self.transition_layers.append(transition)
+                num_features = num_features // 2
+
+        self.final_bn = FusedBNReLU(num_features)
+        self.classifier = nn.Linear(num_features, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+
+        for i, block in enumerate(self.dense_blocks):
+            x = block(x)
+            if i != len(self.dense_blocks) - 1:
+                x = self.transition_layers[i](x)
+
+        x = self.final_bn(x)
+        x = F.adaptive_avg_pool2d(x, (1, 1)).view(x.size(0), -1)
+        x = self.classifier(x)
+        return x
+```

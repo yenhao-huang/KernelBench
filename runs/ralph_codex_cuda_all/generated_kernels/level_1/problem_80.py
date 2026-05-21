@@ -1,0 +1,163 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+conv2d_cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+
+__global__ void conv2d_dilated_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ y,
+    int N, int C, int H, int W,
+    int O, int KH, int KW,
+    int OH, int OW,
+    int stride_h, int stride_w,
+    int pad_h, int pad_w,
+    int dil_h, int dil_w,
+    int has_bias
+) {
+    int ow = blockIdx.x * blockDim.x + threadIdx.x;
+    int oh = blockIdx.y * blockDim.y + threadIdx.y;
+    int no = blockIdx.z;
+    int n = no / O;
+    int oc = no - n * O;
+
+    if (ow >= OW || oh >= OH) return;
+
+    float acc = has_bias ? b[oc] : 0.0f;
+
+    #pragma unroll
+    for (int ic = 0; ic < 32; ++ic) {
+        const float* x_base = x + ((n * C + ic) * H) * W;
+        const float* w_base = w + ((oc * C + ic) * KH) * KW;
+
+        for (int kh = 0; kh < KH; ++kh) {
+            int ih = oh * stride_h + kh * dil_h - pad_h;
+            if ((unsigned)ih >= (unsigned)H) continue;
+
+            for (int kw = 0; kw < KW; ++kw) {
+                int iw = ow * stride_w + kw * dil_w - pad_w;
+                if ((unsigned)iw < (unsigned)W) {
+                    acc = fmaf(x_base[ih * W + iw], w_base[kh * KW + kw], acc);
+                }
+            }
+        }
+    }
+
+    y[((n * O + oc) * OH + oh) * OW + ow] = acc;
+}
+
+torch::Tensor conv2d_dilated_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int stride_h,
+    int stride_w,
+    int pad_h,
+    int pad_w,
+    int dil_h,
+    int dil_w,
+    bool has_bias
+) {
+    int N = x.size(0);
+    int C = x.size(1);
+    int H = x.size(2);
+    int W = x.size(3);
+    int O = weight.size(0);
+    int KH = weight.size(2);
+    int KW = weight.size(3);
+
+    int OH = (H + 2 * pad_h - dil_h * (KH - 1) - 1) / stride_h + 1;
+    int OW = (W + 2 * pad_w - dil_w * (KW - 1) - 1) / stride_w + 1;
+
+    auto y = torch::empty({N, O, OH, OW}, x.options());
+
+    dim3 block(16, 16);
+    dim3 grid((OW + block.x - 1) / block.x, (OH + block.y - 1) / block.y, N * O);
+
+    conv2d_dilated_kernel<<<grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        has_bias ? bias.data_ptr<float>() : nullptr,
+        y.data_ptr<float>(),
+        N, C, H, W, O, KH, KW, OH, OW,
+        stride_h, stride_w, pad_h, pad_w, dil_h, dil_w,
+        has_bias ? 1 : 0
+    );
+
+    return y;
+}
+"""
+
+conv2d_cpp_source = r"""
+torch::Tensor conv2d_dilated_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int stride_h,
+    int stride_w,
+    int pad_h,
+    int pad_w,
+    int dil_h,
+    int dil_w,
+    bool has_bias
+);
+"""
+
+conv2d_ext = load_inline(
+    name="kb_conv2d_dilated_fp32",
+    cpp_sources=conv2d_cpp_source,
+    cuda_sources=conv2d_cuda_source,
+    functions=["conv2d_dilated_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: tuple,
+        stride: int = 1,
+        padding: tuple = (0, 0),
+        dilation: tuple = (1, 1),
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_channels, in_channels, kernel_size[0], kernel_size[1]))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_channels))
+        else:
+            self.register_parameter("bias", None)
+
+        nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
+        if self.bias is not None:
+            fan_in = in_channels * kernel_size[0] * kernel_size[1]
+            bound = fan_in ** -0.5
+            nn.init.uniform_(self.bias, -bound, bound)
+
+        self.stride = (stride, stride) if isinstance(stride, int) else stride
+        self.padding = padding
+        self.dilation = dilation
+        self.conv2d_ext = conv2d_ext
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bias = self.bias if self.bias is not None else torch.empty(0, device=x.device, dtype=x.dtype)
+        return self.conv2d_ext.conv2d_dilated_cuda(
+            x.contiguous(),
+            self.weight.contiguous(),
+            bias,
+            self.stride[0],
+            self.stride[1],
+            self.padding[0],
+            self.padding[1],
+            self.dilation[0],
+            self.dilation[1],
+            self.bias is not None,
+        )

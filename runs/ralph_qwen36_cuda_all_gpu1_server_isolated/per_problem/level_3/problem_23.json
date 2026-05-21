@@ -1,0 +1,20 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 60.629,
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_3/problem_23.py",
+  "level": 3,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 23,
+  "problem_name": "23_EfficientNetB1.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_3/problem_23.txt",
+  "static_errors": [
+    "Contains 'pass' statement (inheritance bypass)"
+  ],
+  "static_warnings": [
+    "Uses torch.nn.functional op: F.linear",
+    "Uses torch.nn compute layer (only containers, Parameter, init allowed)"
+  ],
+  "status": "static_failed"
+}

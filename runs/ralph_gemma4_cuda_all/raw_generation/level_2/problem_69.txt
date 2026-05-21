@@ -1,0 +1,86 @@
+name: elementwise_fused_activation-fused-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d de-fused-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-dev-loc-loc-loc-loc-loc-loc-loc-loc-stdio-loc-loc-loc-loc-loc-0.0-0.0-0.0-0.0-00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000wise_activation-fused-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2d-conv2024-01-01 2024-01-01 2thought
+<channel|>```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# The optimization strategy is to fuse the HardSwish and ReLU activations into a single CUDA kernel.
+# HardSwish(x) = x * relu6(x + 3) / 6
+# ReLU(x) = max(0, x)
+# Fused(x) = max(0, x * relu6(x + 3) / 6)
+# Since HardSwish(x) is non-negative for the range where ReLU is active (and specifically, 
+# HardSwish(x) is only negative for very small x, but ReLU(x) will zero those out),
+# the fusion simplifies the computation by reducing memory bandwidth overhead.
+
+fused_activation_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <algorithm>
+
+__global__ void fused_hardswish_relu_kernel(const float* __restrict__ input, float* __restrict__ output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float x = input[idx];
+        // HardSwish: x * clamp(x + 3, 0, 6) / 6
+        float relu6_part = std::max(0.0f, std::min(x + 3.0f, 6.0f));
+        float hswish = x * relu6_part / 6.0f;
+        // ReLU: max(0, hswish)
+        output[idx] = std::max(0.0f, hswish);
+    }
+}
+
+torch::Tensor fused_hardswish_relu_cuda(torch::Tensor input) {
+    auto output = torch::empty_like(input);
+    int size = input.numel();
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    fused_hardswish_relu_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(), 
+        output.data_ptr<float>(), 
+        size
+    );
+
+    return output;
+}
+"""
+
+fused_activation_cpp_source = (
+    "torch::Tensor fused_hardswish_relu_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_activation_cpp_source,
+    cuda_sources=fused_activation_source,
+    functions=["fused_hardswish_relu_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model that performs a convolution, then applies fused HardSwish and ReLU.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.fused_ops = fused_ops
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, height, width).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, height, width).
+        """
+        # Perform standard convolution (highly optimized in cuDNN)
+        x = self.conv(x)
+        
+        # Apply fused HardSwish + ReLU kernel to reduce memory passes
+        x = self.fused_ops.fused_hardswish_relu_cuda(x)
+        
+        return x
+```

@@ -1,0 +1,290 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__device__ __forceinline__ float sigmoidf_fast(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+__device__ __forceinline__ float hardswishf_fast(float x) {
+    float r = fminf(fmaxf(x + 3.0f, 0.0f), 6.0f);
+    return x * r * 0.16666666666666666f;
+}
+
+__global__ void conv_transpose3d_swish_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ y,
+    int N, int Cin, int Din, int Hin, int Win,
+    int Cout, int KD, int KH, int KW,
+    int stride, int padding,
+    int Dout, int Hout, int Wout,
+    int has_bias
+) {
+    long long total = (long long)N * Cout * Dout * Hout * Wout;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+
+    for (; idx < total; idx += (long long)blockDim.x * gridDim.x) {
+        int ow = idx % Wout;
+        long long t = idx / Wout;
+        int oh = t % Hout;
+        t /= Hout;
+        int od = t % Dout;
+        t /= Dout;
+        int co = t % Cout;
+        int n = t / Cout;
+
+        float acc = has_bias ? b[co] : 0.0f;
+
+        #pragma unroll
+        for (int ci = 0; ci < 3; ++ci) {
+            #pragma unroll
+            for (int kd = 0; kd < 3; ++kd) {
+                int id_num = od + padding - kd;
+                if (id_num < 0 || id_num % stride != 0) continue;
+                int id = id_num / stride;
+                if (id < 0 || id >= Din) continue;
+
+                #pragma unroll
+                for (int kh = 0; kh < 3; ++kh) {
+                    int ih_num = oh + padding - kh;
+                    if (ih_num < 0 || ih_num % stride != 0) continue;
+                    int ih = ih_num / stride;
+                    if (ih < 0 || ih >= Hin) continue;
+
+                    #pragma unroll
+                    for (int kw = 0; kw < 3; ++kw) {
+                        int iw_num = ow + padding - kw;
+                        if (iw_num < 0 || iw_num % stride != 0) continue;
+                        int iw = iw_num / stride;
+                        if (iw < 0 || iw >= Win) continue;
+
+                        long long x_idx = (((long long)n * Cin + ci) * Din + id) * Hin * Win + ih * Win + iw;
+                        long long w_idx = (((long long)ci * Cout + co) * KD + kd) * KH * KW + kh * KW + kw;
+                        acc += x[x_idx] * w[w_idx];
+                    }
+                }
+            }
+        }
+
+        y[idx] = acc * sigmoidf_fast(acc);
+    }
+}
+
+__global__ void group_stats_kernel(
+    const float* __restrict__ y,
+    float* __restrict__ mean,
+    float* __restrict__ invstd,
+    int N, int C, int D, int H, int W,
+    int groups,
+    float eps
+) {
+    extern __shared__ float smem[];
+    float* ssum = smem;
+    float* ssq = smem + blockDim.x;
+
+    int ng = blockIdx.x;
+    int n = ng / groups;
+    int g = ng % groups;
+    int cpg = C / groups;
+    int elems = cpg * D * H * W;
+
+    float sum = 0.0f;
+    float sq = 0.0f;
+
+    for (int i = threadIdx.x; i < elems; i += blockDim.x) {
+        int inner = i;
+        int ww = inner % W;
+        inner /= W;
+        int hh = inner % H;
+        inner /= H;
+        int dd = inner % D;
+        int cc = g * cpg + inner / D;
+
+        long long idx = (((long long)n * C + cc) * D + dd) * H * W + hh * W + ww;
+        float v = y[idx];
+        sum += v;
+        sq += v * v;
+    }
+
+    ssum[threadIdx.x] = sum;
+    ssq[threadIdx.x] = sq;
+    __syncthreads();
+
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            ssum[threadIdx.x] += ssum[threadIdx.x + s];
+            ssq[threadIdx.x] += ssq[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        float m = ssum[0] / elems;
+        float var = ssq[0] / elems - m * m;
+        mean[ng] = m;
+        invstd[ng] = rsqrtf(var + eps);
+    }
+}
+
+__global__ void group_norm_hardswish_kernel(
+    const float* __restrict__ y,
+    const float* __restrict__ mean,
+    const float* __restrict__ invstd,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    float* __restrict__ out,
+    int N, int C, int D, int H, int W,
+    int groups
+) {
+    long long total = (long long)N * C * D * H * W;
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    int cpg = C / groups;
+
+    for (; idx < total; idx += (long long)blockDim.x * gridDim.x) {
+        long long t = idx / (D * H * W);
+        int c = t % C;
+        int n = t / C;
+        int g = c / cpg;
+        int ng = n * groups + g;
+
+        float v = (y[idx] - mean[ng]) * invstd[ng];
+        v = v * gamma[c] + beta[c];
+        out[idx] = hardswishf_fast(v);
+    }
+}
+
+torch::Tensor fused_conv_gn_hardswish_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    int groups,
+    double eps
+) {
+    x = x.contiguous();
+    weight = weight.contiguous();
+
+    int N = x.size(0);
+    int Cin = x.size(1);
+    int Din = x.size(2);
+    int Hin = x.size(3);
+    int Win = x.size(4);
+
+    int Cout = weight.size(1);
+    int KD = weight.size(2);
+    int KH = weight.size(3);
+    int KW = weight.size(4);
+
+    int stride = 2;
+    int padding = 1;
+    int Dout = (Din - 1) * stride - 2 * padding + KD;
+    int Hout = (Hin - 1) * stride - 2 * padding + KH;
+    int Wout = (Win - 1) * stride - 2 * padding + KW;
+
+    auto y = torch::empty({N, Cout, Dout, Hout, Wout}, x.options());
+    auto out = torch::empty_like(y);
+    auto mean = torch::empty({N * groups}, x.options());
+    auto invstd = torch::empty({N * groups}, x.options());
+
+    int threads = 256;
+    long long total = (long long)N * Cout * Dout * Hout * Wout;
+    int blocks = (int)min((long long)65535, (total + threads - 1) / threads);
+    int has_bias = bias.numel() > 0 ? 1 : 0;
+
+    conv_transpose3d_swish_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        has_bias ? bias.data_ptr<float>() : nullptr,
+        y.data_ptr<float>(),
+        N, Cin, Din, Hin, Win,
+        Cout, KD, KH, KW,
+        stride, padding,
+        Dout, Hout, Wout,
+        has_bias
+    );
+
+    int stat_threads = 256;
+    group_stats_kernel<<<N * groups, stat_threads, stat_threads * 2 * sizeof(float)>>>(
+        y.data_ptr<float>(),
+        mean.data_ptr<float>(),
+        invstd.data_ptr<float>(),
+        N, Cout, Dout, Hout, Wout,
+        groups,
+        (float)eps
+    );
+
+    group_norm_hardswish_kernel<<<blocks, threads>>>(
+        y.data_ptr<float>(),
+        mean.data_ptr<float>(),
+        invstd.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, Cout, Dout, Hout, Wout,
+        groups
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor fused_conv_gn_hardswish_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    int groups,
+    double eps
+);
+"""
+
+_fused_mod = load_inline(
+    name="fused_convtranspose3d_swish_gn_hardswish_kb",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["fused_conv_gn_hardswish_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, groups, eps, bias=True):
+        super().__init__()
+        self.conv_transpose = nn.ConvTranspose3d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            bias=bias,
+        )
+        self.group_norm = nn.GroupNorm(num_groups=groups, num_channels=out_channels, eps=eps)
+        self.groups = groups
+        self.eps = eps
+
+    def forward(self, x):
+        bias = self.conv_transpose.bias
+        if bias is None:
+            bias = torch.empty(0, device=x.device, dtype=x.dtype)
+        return _fused_mod.fused_conv_gn_hardswish_cuda(
+            x,
+            self.conv_transpose.weight,
+            bias,
+            self.group_norm.weight,
+            self.group_norm.bias,
+            self.groups,
+            self.eps,
+        )
+```

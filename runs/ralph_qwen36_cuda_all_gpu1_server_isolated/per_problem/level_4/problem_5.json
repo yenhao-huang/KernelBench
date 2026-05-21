@@ -1,0 +1,23 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 49.083,
+  "error": "Isolated KernelBench evaluator failed.",
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_4/problem_5.py",
+  "isolated_eval": {
+    "error": "name 'uniform_' is not defined",
+    "error_type": "builtins.NameError",
+    "ok": false,
+    "subprocess_output_tail": "Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.\n[transformers] If you want to use `BigBirdForCausalLM` as a standalone, add `is_decoder=True.`\n\nLoading weights:   0%|          | 0/206 [00:00<?, ?it/s]\nLoading weights: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 206/206 [00:00<00:00, 71667.77it/s]\n[transformers] \u001b[1mBigBirdForCausalLM LOAD REPORT\u001b[0m from: google/bigbird-roberta-base\nKey                         | Status     |  | \n----------------------------+------------+--+-\ncls.seq_relationship.bias   | UNEXPECTED |  | \ncls.seq_relationship.weight | UNEXPECTED |  | \n\nNotes:\n- UNEXPECTED:\tcan be ignored when loading from different task/architecture; not ok if you expect identical arch.\n[transformers] If you want to use `BigBirdForCausalLM` as a standalone, add `is_decoder=True.`\n\nLoading weights:   0%|          | 0/206 [00:00<?, ?it/s]\nLoading weights: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 206/206 [00:00<00:00, 38443.90it/s]\n[transformers] \u001b[1mBigBirdForCausalLM LOAD REPORT\u001b[0m from: google/bigbird-roberta-base\nKey                         | Status     |  | \n----------------------------+------------+--+-\ncls.seq_relationship.bias   | UNEXPECTED |  | \ncls.seq_relationship.weight | UNEXPECTED |  | \n\nNotes:\n- UNEXPECTED:\tcan be ignored when loading from different task/architecture; not ok if you expect identical arch.\n",
+    "subprocess_returncode": 0,
+    "traceback": "Traceback (most recent call last):\n  File \"<string>\", line 18, in <module>\n  File \"/workspace/external/KernelBench/src/kernelbench/eval.py\", line 562, in eval_kernel_against_ref\n    custom_model = ModelNew(*init_inputs)\n  File \"<string>\", line 152, in __init__\n  File \"<string>\", line 174, in _replace_linear_layers\n  File \"<string>\", line 174, in _replace_linear_layers\n  File \"<string>\", line 174, in _replace_linear_layers\n  [Previous line repeated 3 more times]\n  File \"<string>\", line 161, in _replace_linear_layers\n  File \"<string>\", line 113, in __init__\n  File \"<string>\", line 120, in reset_parameters\nNameError: name 'uniform_' is not defined\n"
+  },
+  "level": 4,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 5,
+  "problem_name": "5_google-bigbird-roberta-base_bs1_seq4095.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_4/problem_5.txt",
+  "static_warnings": [],
+  "status": "evaluation_error"
+}

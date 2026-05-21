@@ -1,0 +1,28 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 69.319,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "correctness_issue": "Output shape mismatch: Expected torch.Size([32, 64, 513, 513]), got torch.Size([32, 64, 512, 512])",
+      "correctness_issue_name": "correctness_issue",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090"
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_codex_cuda_all/generated_kernels/level_2/problem_5.py",
+  "level": 2,
+  "model_name": "codex-gpt-5.5",
+  "precision": "fp32",
+  "problem_id": 5,
+  "problem_name": "5_ConvTranspose2d_Subtract_Tanh.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_codex_cuda_all/raw_generation/level_2/problem_5.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

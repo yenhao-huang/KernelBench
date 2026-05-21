@@ -1,0 +1,250 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for mean reduction along a specific dimension
+mean_reduce_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Kernel to compute sum and count for mean calculation
+__global__ void mean_reduce_kernel(const float* input, float* output, int64_t dim_size, int64_t other_size) {
+    // Each thread block handles one element of the output tensor
+    // The output tensor has shape: [..., dim_size=1, ...] -> effectively size 'other_size' elements if we reduce dim
+    
+    // We need to map global thread index to output index and input indices
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= other_size) return;
+
+    float sum = 0.0f;
+    
+    // Iterate over the dimension being reduced
+    for (int64_t i = 0; i < dim_size; ++i) {
+        // Calculate input index based on output index and reduction dimension offset
+        // Assuming contiguous memory layout, we need to calculate strides or offsets.
+        // However, since torch.mean(x, dim=d) reduces along dim d, the elements are strided by 1 in the last dimension usually if not transposed, 
+        // but generally, for a tensor of shape (N, D1, D2), reducing dim=1 means we sum over D1.
+        // The stride for dim 1 is D2. The stride for dim 0 is D1*D2.
+        
+        // Let's assume the input is contiguous and we are reducing along a specific dimension.
+        // To make this generic, we can pass strides or calculate them. 
+        // For simplicity in this inline example, let's assume standard contiguous tensor where dim is the last one or handle general case via passed strides.
+        
+        // Actually, calculating indices for arbitrary dim in CUDA without passing strides is complex.
+        // Let's simplify: We will assume the user passes a tensor where the reduction dimension is the LAST dimension for this specific kernel implementation 
+        // OR we pass the stride of the reduced dimension and the total size of non-reduced dimensions.
+        
+        // Better approach for generic dim: Pass strides. But to keep it simple and robust for the given shape (128, 4096, 4095) reducing dim=1 or similar:
+        // Let's assume we reduce along the LAST dimension for this specific kernel version to ensure correctness without complex index math, 
+        // OR we implement a general indexer.
+        
+        // Given the prompt allows "complete freedom", let's implement a robust general mean reduction that handles any contiguous tensor by passing strides.
+    }
+    
+    // Since implementing a fully generic multi-dimensional stride indexer in a single kernel is verbose, 
+    // and the example input is (128, 4096, 4095), let's assume we reduce along dim=1 (the middle one) or make it flexible.
+    // Let's write a kernel that assumes the reduction dimension is known and strides are passed.
+}
+
+// Optimized Kernel: Mean Reduction over a specific dimension with passed strides
+__global__ void mean_reduce_generic_kernel(const float* input, float* output, int64_t dim_size, const int64_t* strides, int64_t other_size) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= other_size) return;
+
+    float sum = 0.0f;
+    
+    // The 'other_size' represents the number of elements in the output tensor.
+    // Each output element corresponds to a unique combination of indices for all dimensions EXCEPT the reduced one.
+    // We need to iterate through the reduced dimension (size = dim_size) and sum up the values.
+    
+    // To access the input, we start at the base address for this output index and step by the stride of the reduced dimension.
+    // However, 'strides' array needs to be indexed correctly. 
+    // Let's assume strides[dim] is the stride for the dimension being reduced.
+    
+    const float* ptr = input;
+    
+    // We need to find the starting pointer for this output index.
+    // This requires converting the linear output index 'idx' into multi-dimensional indices for non-reduced dims, 
+    // then computing the offset in the original tensor.
+    // This is complex. 
+    
+    // Alternative: Use a simpler approach if we know the shape. But the model takes arbitrary x.
+    
+    // Let's use a different strategy: 
+    // We will assume the input tensor is contiguous and we are reducing along the LAST dimension for this specific optimized kernel 
+    // to demonstrate high performance, OR we handle the general case by passing the stride of the reduced dim and the total count of non-reduced elements.
+    
+    // For the purpose of this exercise, let's implement a kernel that reduces along the LAST dimension (dim=-1 or dim=ndim-1) 
+    // as it is the most common and efficient pattern for contiguous memory access.
+    // If the user wants to reduce a different dim, they should permute/transpose first. 
+    // However, the prompt says "replace torch.mean(x, dim=self.dim)".
+    
+    // Let's implement a kernel that works for ANY dimension by passing the stride of the reduced dimension and the total size of the non-reduced part.
+    // We also need to know the starting offset for each output element.
+    
+    // To avoid complex index mapping in CUDA, we can use a 2D grid where one block handles one output element? No, too slow.
+    
+    // Let's stick to the most efficient case: Reducing along the last dimension. 
+    // If dim != -1, PyTorch will handle the permutation or we can add logic here. 
+    // But for a "custom operator", it's better to be general.
+    
+    // General Mean Reduction Kernel:
+    // Input shape: (N, D1, D2, ..., Dk)
+    // Reduce dim d.
+    // Output shape: (N, D1, ..., D_{d-1}, D_{d+1}, ..., Dk)
+    // Strides: S_0, S_1, ..., S_k
+    
+    // For a given output index 'idx' (linearized over non-reduced dims), we need to sum input[idx * stride_of_non_reduced + i * stride_d] for i in 0..dim_size-1?
+    // No, the mapping is not that simple.
+    
+    // Let's use a simpler, highly optimized kernel for the specific case of reducing the LAST dimension, which covers many use cases and is very fast.
+    // For other dimensions, we can rely on PyTorch's efficient implementation or add a transpose step in Python if needed. 
+    // But to strictly replace `torch.mean(x, dim=self.dim)`, let's try to be general.
+    
+    // Actually, let's look at the input shape: (128, 4096, 4095).
+    // If dim=1, we reduce 4096. Stride of dim 1 is 4095.
+    // If dim=2, we reduce 4095. Stride of dim 2 is 1.
+    
+    // Let's implement a kernel that takes the stride of the reduced dimension and the total number of elements in the output tensor.
+    // It assumes that for each output element, the corresponding input elements are spaced by `stride_reduced`.
+    // This is true ONLY if the reduced dimension is the last one (stride=1) or if we handle the offset calculation.
+    
+    // Correct General Approach:
+    // We pass the strides of all dimensions.
+    // We iterate over output elements. For each output element, we calculate its multi-index for non-reduced dims, 
+    // then sum over the reduced dim.
+    
+    // To keep code size manageable and efficient, let's assume the reduction is along the LAST dimension for this kernel.
+    // If self.dim != x.dim() - 1, we can permute in Python before calling the CUDA op.
+}
+
+__global__ void mean_reduce_last_dim_kernel(const float* input, float* output, int64_t dim_size, int64_t other_size) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= other_size) return;
+
+    float sum = 0.0f;
+    
+    // The input is contiguous. The last dimension has size 'dim_size' and stride 1.
+    // The 'other_size' is the product of all dimensions except the last one.
+    // Each output element corresponds to a block of 'dim_size' elements in the input.
+    // The starting address for output index 'idx' is input + idx * dim_size.
+    
+    const float* ptr = input + idx * dim_size;
+    
+    #pragma unroll
+    for (int64_t i = 0; i < dim_size; ++i) {
+        sum += ptr[i];
+    }
+    
+    output[idx] = sum / static_cast<float>(dim_size);
+}
+
+torch::Tensor mean_reduce_cuda(torch::Tensor x, int64_t dim) {
+    if (!x.is_cuda()) {
+        throw std::runtime_error("Input tensor must be on CUDA");
+    }
+    
+    auto ndim = x.dim();
+    if (ndim == 0) return x;
+    
+    // Normalize negative dimension
+    if (dim < 0) dim += ndim;
+    
+    auto shape = x.sizes();
+    int64_t dim_size = shape[dim];
+    
+    // Calculate other_size: product of all dimensions except 'dim'
+    int64_t other_size = 1;
+    for (int i = 0; i < ndim; ++i) {
+        if (i != dim) {
+            other_size *= shape[i];
+        }
+    }
+    
+    // If the dimension to reduce is not the last one, we permute the tensor so that the reduction dimension becomes the last one.
+    // This allows us to use the efficient contiguous kernel above.
+    torch::Tensor x_permuted = x;
+    if (dim != ndim - 1) {
+        std::vector<int64_t> perm(ndim);
+        for (int i = 0; i < ndim; ++i) {
+            if (i == dim) {
+                perm[ndim - 1] = i;
+            } else if (i > dim) {
+                perm[i - 1] = i;
+            } else {
+                perm[i] = i;
+            }
+        }
+        x_permuted = x.permute(perm);
+    }
+    
+    // Create output tensor with the reduced dimension removed
+    std::vector<int64_t> out_shape;
+    for (int i = 0; i < ndim; ++i) {
+        if (i != dim) {
+            out_shape.push_back(shape[i]);
+        }
+    }
+    
+    torch::Tensor output = torch::empty(out_shape, x.options());
+    
+    const int block_size = 256;
+    const int num_blocks = (other_size + block_size - 1) / block_size;
+    
+    mean_reduce_last_dim_kernel<<<num_blocks, block_size>>>(
+        x_permuted.data_ptr<float>(), 
+        output.data_ptr<float>(), 
+        dim_size, 
+        other_size
+    );
+    
+    return output;
+}
+"""
+
+mean_reduce_cpp_source = (
+    "torch::Tensor mean_reduce_cuda(torch::Tensor x, int64_t dim);"
+)
+
+# Compile the inline CUDA code for mean reduction
+mean_reduce = load_inline(
+    name="mean_reduce",
+    cpp_sources=mean_reduce_cpp_source,
+    cuda_sources=mean_reduce_source,
+    functions=["mean_reduce_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs mean reduction over a specific dimension using custom CUDA operators.
+    """
+    def __init__(self, dim: int):
+        """
+        Initializes the model with the dimension to reduce over.
+
+        Args:
+            dim (int): The dimension to reduce over.
+        """
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.mean_reduce_op = mean_reduce
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Reduces the input tensor along the specified dimension by taking the mean using a custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of arbitrary shape.
+
+        Returns:
+            torch.Tensor: Output tensor with reduced dimension. The shape of the output is the same as the input except for the reduced dimension which is removed.
+        """
+        return self.mean_reduce_op.mean_reduce_cuda(x, self.dim)

@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 42.47,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "2.086946",
+        "2.086917",
+        "2.085633",
+        "2.086461",
+        "2.085905"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "25.361578",
+        "24.899418",
+        "26.433170",
+        "24.218056",
+        "26.673792"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_2/problem_86.py",
+  "level": 2,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 86,
+  "problem_name": "86_Matmul_Divide_GELU.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_2/problem_86.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

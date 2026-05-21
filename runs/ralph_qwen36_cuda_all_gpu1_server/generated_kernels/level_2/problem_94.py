@@ -1,0 +1,353 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernels for GEMM, BiasAdd, Hardtanh, Mish, and GroupNorm fusion.
+# We will fuse these into a single kernel for maximum performance.
+# The input is (batch_size, in_features), output is (batch_size, out_features).
+# We assume standard row-major layout.
+
+custom_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper for atomic add if needed, but here we do element-wise writes mostly.
+// Hardtanh: clamp(x, -1.0f, 1.0f)
+__device__ __forceinline__ float hardtanh(float x) {
+    return fminf(fmaxf(x, -1.0f), 1.0f);
+}
+
+// Mish: x * tanh(softplus(x)) = x * tanh(ln(1 + exp(x)))
+__device__ __forceinline__ float mish(float x) {
+    // softplus(x) = ln(1 + exp(x))
+    // For numerical stability, we can use log1p(exp(x)) or similar.
+    // However, standard implementation:
+    float softplus = log1pf(expf(x)); 
+    return x * tanhf(softplus);
+}
+
+// GroupNorm Kernel
+// Input: x (N, C), Weight: gamma (C), Bias: beta (C)
+// Output: out (N, C)
+// Groups: G
+// Channels per group: C / G
+__global__ void fused_gemm_bias_hardtanh_mish_groupnorm_kernel(
+    const float* __restrict__ x,      // [batch_size, in_features]
+    const float* __restrict__ weight, // [out_features, in_features]
+    const float* __restrict__ bias,   // [out_features]
+    const float* __restrict__ gamma,  // [out_features]
+    const float* __restrict__ beta,   // [out_features]
+    float* __restrict__ out,          // [batch_size, out_features]
+    int batch_size,
+    int in_features,
+    int out_features,
+    int num_groups
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * out_features;
+
+    if (idx >= total_elements) return;
+
+    int b = idx / out_features;
+    int c = idx % out_features;
+
+    // 1. GEMM: x[b] @ weight[c] + bias[c]
+    float sum = 0.0f;
+    const float* x_row = &x[b * in_features];
+    const float* w_col = &weight[c * in_features]; // weight is [out, in], so row c
+    
+    // Unrolling or simple loop for GEMM part
+    // For performance, we might want to use shared memory or vectorized loads, 
+    // but for a single kernel demonstration, a straightforward loop is safer for correctness.
+    // To optimize, we can assume in_features is large and unroll manually if needed, 
+    // but let's stick to a clean loop first.
+    
+    #pragma unroll
+    for (int i = 0; i < in_features; ++i) {
+        sum += x_row[i] * w_col[i];
+    }
+    
+    sum += bias[c];
+
+    // 2. Hardtanh
+    float h_tanh_val = hardtanh(sum);
+
+    // 3. Mish
+    float mish_val = mish(h_tanh_val);
+
+    // 4. GroupNorm
+    // Calculate group index and channel index within group
+    int channels_per_group = out_features / num_groups;
+    int group_idx = c / channels_per_group;
+    int local_channel_idx = c % channels_per_group;
+
+    // We need to compute mean and variance over the group for this specific batch item.
+    // Since we are processing one element at a time, we cannot easily compute global stats 
+    // without multiple passes or atomic operations. 
+    // However, GroupNorm requires statistics computed over the entire group (N, C/G).
+    // To do this in a single pass per pixel is impossible without pre-computed stats.
+    
+    // Correction: The prompt asks to replace operators. Standard GroupNorm computes mean/var 
+    // over the spatial/group dimensions. In PyTorch, for input (N, C), GroupNorm with G groups 
+    // computes mean/var over each group of size C/G for each sample in N.
+    // So for a single output element (b, c), we need the mean and variance of all elements 
+    // (b, k) where k is in the same group as c.
+    
+    // To implement this efficiently in one kernel without pre-computation, we would typically 
+    // need two passes: one to compute stats, one to normalize. Or use atomic adds for stats.
+    // Given the constraint of "inline" and simplicity, let's assume we can do a two-pass approach 
+    // or use atomics. But atomics for float sum/variance are tricky.
+    
+    // Alternative: Since this is a custom operator replacement task, we can implement GroupNorm 
+    // by launching a kernel that computes stats first, then another that normalizes? 
+    // The prompt allows replacing multiple operators. Let's keep the fusion of GEMM+Bias+Hardtanh+Mish 
+    // and do GroupNorm separately or fused if possible.
+    
+    // Actually, let's look at the structure. 
+    // x = gemm(x) -> bias -> hardtanh -> mish -> groupnorm.
+    // The output of mish is still (N, C). GroupNorm operates on this.
+    
+    // Let's split it:
+    // Kernel 1: Fused GEMM + BiasAdd + Hardtanh + Mish. Output intermediate tensor.
+    // Kernel 2: GroupNorm on the intermediate tensor.
+    
+    // But wait, the prompt says "replace ... operators". It doesn't strictly force a single kernel 
+    // for everything, but fusion is encouraged. Let's try to do GEMM+Bias+Hardtanh+Mish in one kernel, 
+    // and then call PyTorch's GroupNorm or a custom GroupNorm kernel.
+    // To be safe and "optimized", let's write a custom GroupNorm kernel as well.
+    
+    // However, implementing a correct GroupNorm with atomics for mean/var in a single pass is complex.
+    // Let's stick to: 
+    // 1. Custom Kernel for GEMM + Bias + Hardtanh + Mish.
+    // 2. Use PyTorch's built-in GroupNorm or a simple custom one if needed. 
+    // But the prompt says "replace ... with custom CUDA operators". So I should probably replace GroupNorm too.
+    
+    // Let's implement a two-pass GroupNorm in a single kernel launch using shared memory? 
+    // Or just use atomics for mean and sum of squares.
+    
+    // For simplicity and correctness in this context, let's assume the following strategy:
+    // We will create a fused kernel for GEMM+Bias+Hardtanh+Mish.
+    // Then we will create a separate custom GroupNorm kernel.
+    
+    // But wait, I can only return one ModelNew class. I can load multiple kernels.
+    
+    // Let's refine the plan:
+    // 1. Load a fused GEMM+Bias+Hardtanh+Mish kernel.
+    // 2. Load a GroupNorm kernel.
+    
+    // Let's rewrite the kernel structure to support this.
+}
+
+// Actually, let's just implement the fused part and use PyTorch's GroupNorm if it's too complex?
+// No, "replace ... with custom CUDA operators". I must replace GroupNorm.
+
+// Let's define a simpler GroupNorm kernel that assumes we have precomputed mean/var? 
+// No, that changes the API.
+
+// Okay, let's do this:
+// 1. Fused GEMM+Bias+Hardtanh+Mish Kernel.
+// 2. Custom GroupNorm Kernel using atomics for statistics.
+
+__global__ void groupnorm_kernel(
+    const float* __restrict__ x,      // [N, C]
+    const float* __restrict__ gamma,  // [C]
+    const float* __restrict__ beta,   // [C]
+    float* __restrict__ out,          // [N, C]
+    int N,
+    int C,
+    int G
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C;
+    
+    if (idx >= total) return;
+
+    int n = idx / C;
+    int c = idx % C;
+
+    int channels_per_group = C / G;
+    int group_idx = c / channels_per_group;
+    int local_c = c % channels_per_group;
+
+    // Compute mean and variance for this group, this batch item
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    int count = channels_per_group;
+
+    for (int i = 0; i < count; ++i) {
+        float val = x[n * C + group_idx * channels_per_group + i];
+        sum += val;
+        sum_sq += val * val;
+    }
+
+    float mean = sum / count;
+    float var = (sum_sq / count) - (mean * mean);
+    
+    // Add epsilon for numerical stability
+    float eps = 1e-5f;
+    float inv_std = rsqrtf(var + eps);
+
+    // Normalize current element
+    float val = x[idx];
+    float normalized = (val - mean) * inv_std;
+    
+    out[idx] = gamma[c] * normalized + beta[c];
+}
+
+// Fused GEMM + Bias + Hardtanh + Mish Kernel
+__global__ void fused_gemm_bias_hardtanh_mish_kernel(
+    const float* __restrict__ x,      // [batch_size, in_features]
+    const float* __restrict__ weight, // [out_features, in_features]
+    const float* __restrict__ bias,   // [out_features]
+    float* __restrict__ out,          // [batch_size, out_features]
+    int batch_size,
+    int in_features,
+    int out_features
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * out_features;
+
+    if (idx >= total_elements) return;
+
+    int b = idx / out_features;
+    int c = idx % out_features;
+
+    float sum = 0.0f;
+    const float* x_row = &x[b * in_features];
+    const float* w_col = &weight[c * in_features];
+
+    // Simple loop for GEMM
+    for (int i = 0; i < in_features; ++i) {
+        sum += x_row[i] * w_col[i];
+    }
+    
+    sum += bias[c];
+
+    // Hardtanh
+    float h_tanh_val = hardtanh(sum);
+
+    // Mish
+    float mish_val = mish(h_tanh_val);
+
+    out[idx] = mish_val;
+}
+
+// Python bindings
+torch::Tensor fused_gemm_bias_hardtanh_mish_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias
+) {
+    auto batch_size = x.size(0);
+    auto in_features = x.size(1);
+    auto out_features = weight.size(0);
+
+    auto out = torch::empty({batch_size, out_features}, x.options());
+
+    const int block_size = 256;
+    int total_elements = batch_size * out_features;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    fused_gemm_bias_hardtanh_mish_kernel<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        in_features,
+        out_features
+    );
+
+    return out;
+}
+
+torch::Tensor groupnorm_cuda(
+    torch::Tensor x,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    int num_groups
+) {
+    auto N = x.size(0);
+    auto C = x.size(1);
+    
+    auto out = torch::empty_like(x);
+
+    const int block_size = 256;
+    int total_elements = N * C;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    groupnorm_kernel<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N,
+        C,
+        num_groups
+    );
+
+    return out;
+}
+"""
+
+custom_ops_cpp_source = (
+    "torch::Tensor fused_gemm_bias_hardtanh_mish_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias);"
+    "torch::Tensor groupnorm_cuda(torch::Tensor x, torch::Tensor gamma, torch::Tensor beta, int num_groups);"
+);
+
+// Load the custom operators
+custom_ops = load_inline(
+    name="custom_ops",
+    cpp_sources=custom_ops_cpp_source,
+    cuda_sources=custom_ops_source,
+    functions=["fused_gemm_bias_hardtanh_mish_cuda", "groupnorm_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using custom CUDA operators for GEMM+Bias+Hardtanh+Mish and GroupNorm.
+    """
+    def __init__(self, in_features, out_features, bias_shape, num_groups):
+        super(ModelNew, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_groups = num_groups
+        
+        # Initialize parameters
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.gamma = nn.Parameter(torch.ones(out_features))
+        self.beta = nn.Parameter(torch.zeros(out_features))
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        # 1. Fused GEMM + BiasAdd + Hardtanh + Mish
+        x = custom_ops.fused_gemm_bias_hardtanh_mish_cuda(x, self.weight, self.bias)
+        
+        # 2. GroupNorm
+        x = custom_ops.groupnorm_cuda(x, self.gamma, self.beta, self.num_groups)
+        
+        return x
+
+
+def get_inputs():
+    batch_size = 1024
+    in_features = 8192
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    in_features = 8192
+    out_features = 8192
+    bias_shape = (out_features,)
+    num_groups = 256
+    return [in_features, out_features, bias_shape, num_groups]

@@ -1,0 +1,17 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 58.714,
+  "generated_kernel_path": "runs/ralph_gemma4_cuda_all/generated_kernels/level_1/problem_97.py",
+  "level": 1,
+  "model_name": "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
+  "precision": "fp32",
+  "problem_id": 97,
+  "problem_name": "97_ScaledDotProductAttention.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_gemma4_cuda_all/raw_generation/level_1/problem_97.txt",
+  "static_errors": [
+    "Missing __global__ kernel definition"
+  ],
+  "static_warnings": [],
+  "status": "static_failed"
+}

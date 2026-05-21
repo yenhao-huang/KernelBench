@@ -1,0 +1,234 @@
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernels for BatchNorm2d + ReLU + Conv2D fusion
+# This kernel performs: BN -> ReLU -> Conv2D in a single pass to reduce memory traffic.
+# It assumes input is (N, C, H, W) and output is (N, G, K, H, W) where G is groups=1 for standard conv, 
+# but here we handle general case or specific structure. 
+# Given the model: Conv2d(in_features, growth_rate, kernel_size=3, padding=1, bias=False)
+# We will fuse BN (running_mean, running_var, weight, bias), ReLU, and Conv2D.
+
+fusion_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper to get index
+#define GET_INDEX(batch, channel, height, width, C, H, W) \
+    ((batch) * (C) * (H) * (W) + (channel) * (H) * (W) + (height) * (W) + (width))
+
+// Kernel for BatchNorm2d + ReLU + Conv2D Fusion
+// Input: x (N, C_in, H, W), weight (C_out, C_in, K, K), running_mean, running_var, bn_weight, bn_bias
+// Output: out (N, C_out, H, W)
+__global__ void fused_bn_relu_conv_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    const float* __restrict__ running_mean,
+    const float* __restrict__ running_var,
+    const float* __restrict__ bn_weight,
+    const float* __restrict__ bn_bias,
+    float* __restrict__ out,
+    int N, int C_in, int C_out, int H, int W, int K) 
+{
+    // Each thread handles one output element (N, C_out, H, W)
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C_out * H * W;
+    
+    if (idx >= total_elements) return;
+
+    int n = idx / (C_out * H * W);
+    int rem = idx % (C_out * H * W);
+    int c_out = rem / (H * W);
+    rem = rem % (H * W);
+    int h = rem / W;
+    int w = rem % W;
+
+    float sum = 0.0f;
+
+    // Convolution loop over input channels and kernel size
+    for (int c_in = 0; c_in < C_in; ++c_in) {
+        for (int ky = 0; ky < K; ++ky) {
+            for (int kx = 0; kx < K; ++kx) {
+                int ih = h + ky - 1; // padding=1, kernel=3 -> indices -1, 0, 1
+                int iw = w + kx - 1;
+
+                if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
+                    // Get input value
+                    int in_idx = GET_INDEX(n, c_in, ih, iw, C_in, H, W);
+                    float val = x[in_idx];
+
+                    // BatchNorm: (x - mean) / sqrt(var + eps) * gamma + beta
+                    int bn_idx = c_in;
+                    float r_mean = running_mean[bn_idx];
+                    float r_var = running_var[bn_idx];
+                    float gamma = bn_weight[bn_idx];
+                    float beta = bn_bias[bn_idx];
+                    
+                    // Standard eps for BN is 1e-5
+                    val = (val - r_mean) * rsqrtf(r_var + 1e-5f);
+                    val = val * gamma + beta;
+
+                    // ReLU
+                    if (val < 0.0f) val = 0.0f;
+
+                    // Conv weight access: weight[c_out][c_in][ky][kx]
+                    int w_idx = ((c_out * C_in + c_in) * K + ky) * K + kx;
+                    sum += val * weight[w_idx];
+                }
+            }
+        }
+    }
+
+    out[idx] = sum;
+}
+
+torch::Tensor fused_bn_relu_conv_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    torch::Tensor bn_weight,
+    torch::Tensor bn_bias) 
+{
+    auto N = x.size(0);
+    auto C_in = x.size(1);
+    auto H = x.size(2);
+    auto W = x.size(3);
+    
+    auto C_out = weight.size(0);
+    auto K = weight.size(2); // Assuming square kernel
+
+    auto out = torch::zeros({N, C_out, H, W}, x.options());
+
+    const int block_size = 256;
+    int total_elements = N * C_out * H * W;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    fused_bn_relu_conv_kernel<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        running_mean.data_ptr<float>(),
+        running_var.data_ptr<float>(),
+        bn_weight.data_ptr<float>(),
+        bn_bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C_in, C_out, H, W, K
+    );
+
+    return out;
+}
+"""
+
+fusion_cpp_source = (
+    "torch::Tensor fused_bn_relu_conv_cuda("
+    "torch::Tensor x,"
+    "torch::Tensor weight,"
+    "torch::Tensor running_mean,"
+    "torch::Tensor running_var,"
+    "torch::Tensor bn_weight,"
+    "torch::Tensor bn_bias"
+    ");"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_bn_relu_conv",
+    cpp_sources=fusion_cpp_source,
+    cuda_sources=fusion_source,
+    functions=["fused_bn_relu_conv_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_layers: int, num_input_features: int, growth_rate: int):
+        """
+        :param num_layers: The number of layers in the dense block
+        :param num_input_features: The number of input feature maps
+        :param growth_rate: The growth rate for the dense block (new features added per layer)
+        """
+        super(ModelNew, self).__init__()
+        self.num_layers = num_layers
+        self.num_input_features = num_input_features
+        self.growth_rate = growth_rate
+        
+        # We will store the parameters of each layer to pass to the custom kernel
+        # Since the custom kernel expects specific tensors, we need to manage them.
+        # In a real scenario, you might wrap this in a custom autograd function or module.
+        # Here, we store the Conv weights and BN stats as buffers/parameters.
+        
+        self.layers_params = nn.ModuleList()
+        
+        for i in range(num_layers):
+            in_features = num_input_features + i * growth_rate
+            # Create dummy parameters to hold the state, but we won't use standard nn.Conv2d/nn.BatchNorm2d forward pass
+            # Instead, we will store the raw tensors needed for the fused kernel.
+            
+            # Conv2d: out_channels=growth_rate, in_channels=in_features, kernel_size=3
+            conv_weight = nn.Parameter(torch.randn(growth_rate, in_features, 3, 3))
+            
+            # BatchNorm2d: num_features=in_features
+            bn_weight_param = nn.Parameter(torch.ones(in_features))
+            bn_bias_param = nn.Parameter(torch.zeros(in_features))
+            running_mean = torch.zeros(in_features)
+            running_var = torch.ones(in_features)
+            eps = 1e-5
+            
+            # We store these as buffers or parameters. 
+            # Note: In a production setting, you'd likely use a custom autograd Function to handle gradients correctly.
+            # For this optimization task focusing on inference speed (implied by "speedups" and replacing operators),
+            # we assume evaluation mode where BN uses running stats.
+            
+            self.register_buffer(f'running_mean_{i}', running_mean)
+            self.register_buffer(f'running_var_{i}', running_var)
+            
+            layer_params = {
+                'conv_weight': conv_weight,
+                'bn_weight': bn_weight_param,
+                'bn_bias': bn_bias_param,
+                'in_features': in_features,
+                'growth_rate': growth_rate
+            }
+            self.layers_params.append(layer_params)
+
+    def forward(self, x):
+        """
+        :param x: Input tensor of shape (batch_size, num_input_features, height, width)
+        :return: Concatenated output tensor with shape (batch_size, num_output_features, height, width)
+        """
+        features = [x]
+        
+        for i in range(self.num_layers):
+            params = self.layers_params[i]
+            
+            # Get current input x
+            curr_x = x
+            
+            # Perform fused BN -> ReLU -> Conv2D using custom CUDA kernel
+            new_feature = fused_ops.fused_bn_relu_conv_cuda(
+                curr_x,
+                params['conv_weight'],
+                params[f'running_mean_{i}'],
+                params[f'running_var_{i}'],
+                params['bn_weight'],
+                params['bn_bias']
+            )
+            
+            features.append(new_feature)
+            # Concatenate along channel axis (dim=1)
+            x = torch.cat(features, 1)
+            
+        return x
+
+# Re-defining get_inputs and get_init_inputs to match the required interface if needed by external harness
+def get_inputs():
+    return [torch.rand(batch_size, num_input_features, height, width)]
+
+def get_init_inputs():
+    return [num_layers, num_input_features, growth_rate]
+```

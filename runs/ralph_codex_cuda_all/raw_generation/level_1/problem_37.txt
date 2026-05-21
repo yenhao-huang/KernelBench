@@ -1,0 +1,132 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cpp_sources = """
+torch::Tensor fro_norm_normalize_cuda(torch::Tensor x);
+"""
+
+cuda_sources = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fro_partial_sum_kernel(const float* __restrict__ x, float* __restrict__ partial, long long n) {
+    extern __shared__ float smem[];
+    int tid = threadIdx.x;
+    int bid = blockIdx.x;
+    long long stride = (long long)blockDim.x * gridDim.x;
+    long long idx = (long long)bid * blockDim.x + tid;
+
+    float sum = 0.0f;
+    for (long long i = idx; i < n; i += stride) {
+        float v = x[i];
+        sum += v * v;
+    }
+
+    smem[tid] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            smem[tid] += smem[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        partial[bid] = smem[0];
+    }
+}
+
+__global__ void fro_final_sum_kernel(const float* __restrict__ partial, float* __restrict__ inv_norm, int m) {
+    extern __shared__ float smem[];
+    int tid = threadIdx.x;
+
+    float sum = 0.0f;
+    for (int i = tid; i < m; i += blockDim.x) {
+        sum += partial[i];
+    }
+
+    smem[tid] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            smem[tid] += smem[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        inv_norm[0] = rsqrtf(smem[0]);
+    }
+}
+
+__global__ void fro_normalize_kernel(const float* __restrict__ x, const float* __restrict__ inv_norm, float* __restrict__ out, long long n) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long stride = (long long)blockDim.x * gridDim.x;
+    float scale = inv_norm[0];
+
+    for (long long i = idx; i < n; i += stride) {
+        out[i] = x[i] * scale;
+    }
+}
+
+torch::Tensor fro_norm_normalize_cuda(torch::Tensor x) {
+    const long long n = x.numel();
+    auto out = torch::empty_like(x);
+
+    const int threads = 256;
+    int reduce_blocks = (int)((n + threads - 1) / threads);
+    if (reduce_blocks > 4096) reduce_blocks = 4096;
+    if (reduce_blocks < 1) reduce_blocks = 1;
+
+    auto partial = torch::empty({reduce_blocks}, x.options());
+    auto inv_norm = torch::empty({1}, x.options());
+
+    fro_partial_sum_kernel<<<reduce_blocks, threads, threads * sizeof(float)>>>(
+        x.data_ptr<float>(),
+        partial.data_ptr<float>(),
+        n
+    );
+
+    fro_final_sum_kernel<<<1, threads, threads * sizeof(float)>>>(
+        partial.data_ptr<float>(),
+        inv_norm.data_ptr<float>(),
+        reduce_blocks
+    );
+
+    int norm_blocks = (int)((n + threads - 1) / threads);
+    if (norm_blocks > 65535) norm_blocks = 65535;
+    if (norm_blocks < 1) norm_blocks = 1;
+
+    fro_normalize_kernel<<<norm_blocks, threads>>>(
+        x.data_ptr<float>(),
+        inv_norm.data_ptr<float>(),
+        out.data_ptr<float>(),
+        n
+    );
+
+    return out;
+}
+"""
+
+fro_norm_normalize = load_inline(
+    name="fro_norm_normalize_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["fro_norm_normalize_cuda"],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.fro_norm_normalize = fro_norm_normalize
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fro_norm_normalize.fro_norm_normalize_cuda(x)
+```

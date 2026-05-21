@@ -1,0 +1,99 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void zero_out_kernel(float* out, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) out[idx] = 0.0f;
+}
+
+__global__ void linear_sigmoid_sum_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ out,
+    int batch,
+    int input_size,
+    int hidden_size
+) {
+    int bh = blockIdx.x;
+    int row = bh / hidden_size;
+    int h = bh - row * hidden_size;
+    int tid = threadIdx.x;
+
+    float acc = 0.0f;
+    const float* xrow = x + row * input_size;
+    const float* wrow = w + h * input_size;
+
+    for (int k = tid; k < input_size; k += blockDim.x) {
+        acc += xrow[k] * wrow[k];
+    }
+
+    __shared__ float smem[256];
+    smem[tid] = acc;
+    __syncthreads();
+
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) smem[tid] += smem[tid + stride];
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float z = smem[0] + b[h];
+        float s = 1.0f / (1.0f + expf(-z));
+        atomicAdd(out + row, s);
+    }
+}
+
+torch::Tensor linear_sigmoid_sum_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor b) {
+    int batch = x.size(0);
+    int input_size = x.size(1);
+    int hidden_size = w.size(0);
+
+    auto out = torch::empty({batch, 1}, x.options());
+
+    zero_out_kernel<<<(batch + 255) / 256, 256>>>(out.data_ptr<float>(), batch);
+
+    int blocks = batch * hidden_size;
+    linear_sigmoid_sum_kernel<<<blocks, 256>>>(
+        x.data_ptr<float>(),
+        w.data_ptr<float>(),
+        b.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch,
+        input_size,
+        hidden_size
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor linear_sigmoid_sum_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor b);
+"""
+
+linear_sigmoid_sum_ext = load_inline(
+    name="linear_sigmoid_sum_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["linear_sigmoid_sum_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+    extra_cflags=["-O3"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(input_size, hidden_size)
+        self.ext = linear_sigmoid_sum_ext
+
+    def forward(self, x):
+        return self.ext.linear_sigmoid_sum_cuda(x, self.linear.weight, self.linear.bias)

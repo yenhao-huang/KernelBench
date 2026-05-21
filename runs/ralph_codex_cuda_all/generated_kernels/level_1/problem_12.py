@@ -1,0 +1,95 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+diag_mul_cpp_source = """
+torch::Tensor diag_mul_cuda(torch::Tensor A, torch::Tensor B);
+"""
+
+diag_mul_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void diag_mul_kernel(const float* __restrict__ A,
+                                const float* __restrict__ B,
+                                float* __restrict__ C,
+                                int total,
+                                int M) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        int row = idx / M;
+        C[idx] = A[row] * B[idx];
+    }
+}
+
+__global__ void diag_mul_vec4_kernel(const float* __restrict__ A,
+                                     const float4* __restrict__ B4,
+                                     float4* __restrict__ C4,
+                                     int total4,
+                                     int M4) {
+    int idx4 = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx4 < total4) {
+        int row = idx4 / M4;
+        float a = A[row];
+        float4 b = B4[idx4];
+        float4 c;
+        c.x = a * b.x;
+        c.y = a * b.y;
+        c.z = a * b.z;
+        c.w = a * b.w;
+        C4[idx4] = c;
+    }
+}
+
+torch::Tensor diag_mul_cuda(torch::Tensor A, torch::Tensor B) {
+    auto C = torch::empty_like(B);
+    int N = B.size(0);
+    int M = B.size(1);
+    int total = N * M;
+
+    const int threads = 256;
+
+    if ((M % 4) == 0 &&
+        (reinterpret_cast<uintptr_t>(B.data_ptr<float>()) % 16) == 0 &&
+        (reinterpret_cast<uintptr_t>(C.data_ptr<float>()) % 16) == 0) {
+        int M4 = M / 4;
+        int total4 = total / 4;
+        int blocks = (total4 + threads - 1) / threads;
+        diag_mul_vec4_kernel<<<blocks, threads>>>(
+            A.data_ptr<float>(),
+            reinterpret_cast<const float4*>(B.data_ptr<float>()),
+            reinterpret_cast<float4*>(C.data_ptr<float>()),
+            total4,
+            M4
+        );
+    } else {
+        int blocks = (total + threads - 1) / threads;
+        diag_mul_kernel<<<blocks, threads>>>(
+            A.data_ptr<float>(),
+            B.data_ptr<float>(),
+            C.data_ptr<float>(),
+            total,
+            M
+        );
+    }
+
+    return C;
+}
+"""
+
+diag_mul_ext = load_inline(
+    name="diag_mul_ext",
+    cpp_sources=diag_mul_cpp_source,
+    cuda_sources=diag_mul_cuda_source,
+    functions=["diag_mul_cuda"],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.diag_mul_ext = diag_mul_ext
+
+    def forward(self, A, B):
+        return self.diag_mul_ext.diag_mul_cuda(A, B)

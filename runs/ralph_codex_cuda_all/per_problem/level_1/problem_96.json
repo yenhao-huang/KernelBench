@@ -1,0 +1,28 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 73.566,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "runtime_error": "CUDA out of memory. Tried to allocate 4.00 GiB. GPU 0 has a total capacity of 23.52 GiB of which 1.31 GiB is free. Including non-PyTorch memory, this process has 16.97 GiB memory in use. Of the allocated memory 16.51 GiB is allocated by PyTorch, and 13.75 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)",
+      "runtime_error_name": "torch.OutOfMemoryError"
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_codex_cuda_all/generated_kernels/level_1/problem_96.py",
+  "level": 1,
+  "model_name": "codex-gpt-5.5",
+  "precision": "fp32",
+  "problem_id": 96,
+  "problem_name": "96_HuberLoss.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_codex_cuda_all/raw_generation/level_1/problem_96.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

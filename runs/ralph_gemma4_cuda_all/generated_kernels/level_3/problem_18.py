@@ -1,0 +1,155 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# The optimization strategy focuses on the FireModule.
+# In the original FireModule, there is a sequence of:
+# Conv2d -> ReLU -> Conv2d -> ReLU -> Cat
+# We can fuse the ReLU into the Conv2d operation if we were writing a custom Conv kernel,
+# but since we are using standard libraries for heavy lifting (cuDNN), 
+# a highly effective fusion for this specific architecture is to fuse the 
+# concatenation and the final ReLU activation of the two branches.
+# However, a more significant bottleneck in SqueezeNet-like architectures is the 
+# memory bandwidth used by multiple small kernels.
+# We will implement a fused "Cat + ReLU" kernel to reduce memory passes.
+
+fused_cat_relu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_cat_relu_kernel(
+    const float* __restrict__ branch1,
+    const float* __restrict__ branch2,
+    float* __restrict__ out,
+    int batch_size,
+    int channels1,
+    int channels2,
+    int height,
+    int width) 
+{
+    // Total output channels
+    int total_channels = channels1 + channels2;
+    int spatial_size = height * width;
+    
+    // Each thread handles one (channel, pixel) element in the output
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * total_channels * spatial_size;
+
+    if (idx < total_elements) {
+        // Decompose idx into (b, c, h_w)
+        int hw_idx = idx % spatial_size;
+        int rem = idx / spatial_size;
+        int c_idx = rem % total_channels;
+        int b_idx = rem / total_channels;
+
+        int offset_hw = b_idx * total_channels * spatial_size + c_idx * spatial_size + hw_idx;
+        
+        float val = 0.0f;
+        if (c_idx < channels1) {
+            // Element belongs to branch 1
+            int b1_idx = b_idx * channels1 * spatial_size + c_idx * spatial_size + hw_idx;
+            val = branch1[b1_idx];
+        } else {
+            // Element belongs to branch 2
+            int c2_idx = c_idx - channels1;
+            int b2_idx = b_idx * channels2 * spatial_size + c2_idx * spatial_size + hw_idx;
+            val = branch2[b2_idx];
+        }
+
+        // Apply ReLU
+        out[idx] = val > 0.0f ? val : 0.0f;
+    }
+}
+
+torch::Tensor fused_cat_relu_cuda(torch::Tensor b1, torch::Tensor b2) {
+    auto batch_size = b1.size(0);
+    auto channels1 = b1.size(1);
+    auto height = b1.size(2);
+    auto width = b1.size(3);
+    auto channels2 = b2.size(1);
+    
+    auto out = torch::empty({batch_size, channels1 + channels2, height, width}, b1.options());
+
+    int total_elements = b1.numel() + b2.numel();
+    int block_size = 256;
+    int num_blocks = (batch_size * (channels1 + channels2) * height * width + block_size - 1) / block_size;
+
+    fused_cat_relu_kernel<<<num_blocks, block_size>>>(
+        b1.data_ptr<float>(), 
+        b2.data_ptr<float>(), 
+        out.data_ptr<float>(), 
+        batch_size, channels1, channels2, height, width
+    );
+
+    return out;
+}
+"""
+
+fused_cat_relu_cpp_source = (
+    "torch::Tensor fused_cat_relu_cuda(torch::Tensor b1, torch::Tensor b2);"
+)
+
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_cat_relu_cpp_source,
+    cuda_sources=fused_cat_relu_source,
+    functions=["fused_cat_relu_cuda"],
+    verbose=False,
+)
+
+class FireModuleNew(nn.Module):
+    def __init__(self, in_channels, squeeze_channels, expand1x1_channels, expand3x3_channels):
+        super(FireModuleNew, self).__init__()
+        self.squeeze = nn.Conv2d(in_channels, squeeze_channels, kernel_size=1)
+        self.squeeze_activation = nn.ReLU(inplace=True)
+        
+        self.expand1x1 = nn.Conv2d(squeeze_channels, expand1x1_channels, kernel_size=1)
+        # We remove the explicit ReLU here because it's fused into the cat kernel
+        
+        self.expand3x3 = nn.Conv2d(squeeze_channels, expand3x3_channels, kernel_size=3, padding=1)
+        # We remove the explicit ReLU here because it's fused into the cat kernel
+        
+        self.fused_ops = fused_ops
+
+    def forward(self, x):
+        x = self.squeeze_activation(self.squeeze(x))
+        # The original code had: cat([relu(conv1), relu(conv3)])
+        # Our kernel does: relu(cat([conv1, conv3]))
+        # Mathematically, relu(cat([a, b])) == cat([relu(a), relu(b)])
+        # This allows us to skip the intermediate ReLU kernels and the separate cat kernel.
+        b1 = self.expand1x1(x)
+        b2 = self.expand3x3(x)
+        return self.fused_ops.fused_cat_relu_cuda(b1, b2)
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000):
+        super(ModelNew, self).__init__()
+        
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 96, kernel_size=7, stride=2),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, ceil_mode=True),
+            FireModuleNew(96, 16, 64, 64),
+            FireModuleNew(128, 16, 64, 64),
+            FireModuleNew(128, 32, 128, 128),
+            nn.MaxPool2d(kernel_size=3, stride=2, ceil_mode=True),
+            FireModuleNew(256, 32, 128, 128),
+            FireModuleNew(256, 48, 192, 192),
+            FireModuleNew(384, 48, 192, 192),
+            FireModuleNew(384, 64, 256, 256),
+            nn.MaxPool2d(kernel_size=3, stride=2, ceil_mode=True),
+            FireModuleNew(512, 64, 256, 256),
+        )
+        
+        self.classifier = nn.Sequential(
+            nn.Dropout(p=0.0),
+            nn.Conv2d(512, num_classes, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1))
+        )
+    
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        return torch.flatten(x, 1)

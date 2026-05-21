@@ -1,0 +1,172 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernels
+custom_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper for atomic add if needed, though we mostly do element-wise or reduction per batch/channel
+
+// 1. ConvTranspose3d Kernel (Simplified for demonstration of custom op structure)
+// Note: Implementing a full generic ConvTranspose3d in inline CUDA is extremely verbose.
+// For the purpose of this optimization challenge where we replace specific ops, 
+// we will focus on the non-standard ops that are hard to fuse or optimize via standard cuDNN 
+// when combined with subsequent element-wise ops, OR we can implement a fused version.
+// However, ConvTranspose3d is highly optimized in cuDNN. The prompt asks for speedups by replacing operators.
+// Let's focus on the LogSumExp + HardSwish + Subtraction + Clamp fusion, which is a classic candidate for kernel fusion 
+// to reduce memory bandwidth pressure (reading/writing intermediate tensors).
+
+// We will implement a fused kernel: LogSumExp -> HardSwish -> Subtract Bias -> Clamp
+// Input: x [B, C, D, H, W]
+// Output: out [B, 1, D, H, W] (since LSE reduces dim 1 to 1)
+// Bias: bias [1, 1, 1, 1]
+
+__device__ __forceinline__ float hard_swish(float x) {
+    return x * fminf(fmaxf(x + 3.0f, 0.0f), 6.0f) / 6.0f;
+}
+
+__global__ void fused_lse_hardswish_sub_clamp_kernel(
+    const float* __restrict__ input, 
+    const float* __restrict__ bias, 
+    float* __restrict__ output, 
+    int batch_size, 
+    int channels, 
+    int spatial_size // D * H * W
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * spatial_size;
+
+    if (idx >= total_elements) return;
+
+    int b = idx / spatial_size;
+    int s_idx = idx % spatial_size;
+
+    // Calculate LogSumExp over channels for this specific (b, s_idx)
+    float max_val = -INFINITY;
+    
+    // First pass: find max
+    for (int c = 0; c < channels; ++c) {
+        int elem_idx = b * channels * spatial_size + c * spatial_size + s_idx;
+        if (input[elem_idx] > max_val) {
+            max_val = input[elem_idx];
+        }
+    }
+
+    // Second pass: compute sum(exp(x - max))
+    float sum_exp = 0.0f;
+    for (int c = 0; c < channels; ++c) {
+        int elem_idx = b * channels * spatial_size + c * spatial_size + s_idx;
+        sum_exp += expf(input[elem_idx] - max_val);
+    }
+
+    float lse = logf(sum_exp) + max_val;
+
+    // Apply HardSwish: x * sigmoid(x+3) is approximated by x * (x+3)/6 for x in [-3, 3]
+    // The prompt uses: x * torch.sigmoid(x + 3) / 6. 
+    // Note: Standard HardSwish is x * ReLU6(x+3) / 6. 
+    // The prompt code: x * torch.sigmoid(x + 3) / 6. This is slightly different from standard H-Swish but we follow the prompt.
+    // Actually, looking closely at the prompt: `x * torch.sigmoid(x + 3) / 6`.
+    // Standard HardSwish is usually `x * hard_sigmoid(x+3)` where hard_sigmoid is ReLU6(x+3)/6.
+    // The prompt uses `torch.sigmoid`, which is the smooth sigmoid function. 
+    // We will implement exactly what is written: x * sigmoid(x + 3) / 6.
+    
+    float shifted = lse + 3.0f;
+    float sig = 1.0f / (1.0f + expf(-shifted));
+    float hs_val = lse * sig / 6.0f;
+
+    // Subtract bias
+    float sub_val = hs_val - bias[0];
+
+    // Clamp [-1, 1]
+    if (sub_val < -1.0f) sub_val = -1.0f;
+    else if (sub_val > 1.0f) sub_val = 1.0f;
+
+    output[idx] = sub_val;
+}
+
+// Wrapper for the fused kernel
+torch::Tensor fused_lse_hardswish_sub_clamp_cuda(torch::Tensor x, torch::Tensor bias) {
+    // x shape: [B, C, D, H, W]
+    // bias shape: [1, 1, 1, 1]
+    
+    auto batch_size = x.size(0);
+    auto channels = x.size(1);
+    auto depth = x.size(2);
+    auto height = x.size(3);
+    auto width = x.size(4);
+    int spatial_size = depth * height * width;
+    
+    // Output shape: [B, 1, D, H, W] -> flattened size B * D * H * W
+    auto out_shape = torch::IntArrayRef({batch_size, 1, depth, height, width});
+    auto output = torch::zeros(out_shape, x.options());
+
+    const int block_size = 256;
+    int total_elements = batch_size * spatial_size;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    fused_lse_hardswish_sub_clamp_kernel<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(), 
+        bias.data_ptr<float>(), 
+        output.data_ptr<float>(), 
+        batch_size, 
+        channels, 
+        spatial_size
+    );
+
+    return output;
+}
+"""
+
+custom_cpp_source = (
+    "torch::Tensor fused_lse_hardswish_sub_clamp_cuda(torch::Tensor x, torch::Tensor bias);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=custom_cpp_source,
+    cuda_sources=custom_cuda_source,
+    functions=["fused_lse_hardswish_sub_clamp_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model using custom fused CUDA operator for LogSumExp, HardSwish-like activation, 
+    bias subtraction, and clamping.
+    Note: ConvTranspose3d is left to PyTorch/cuDNN as it is highly optimized and complex to reimplement efficiently in inline CUDA without cuDNN context.
+    The major memory bandwidth saving comes from fusing the subsequent element-wise operations which would otherwise 
+    require reading/writing the full tensor multiple times.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.bias = nn.Parameter(torch.randn(1, 1, 1, 1)) 
+
+    def forward(self, x):
+        # Step 1: ConvTranspose3d (Standard optimized op)
+        x = self.conv_transpose(x)
+        
+        # Step 2: Fused LogSumExp + HardSwish-like + Sub Bias + Clamp
+        # The custom kernel handles the reduction over dim=1 and all subsequent element-wise ops
+        x = fused_ops.fused_lse_hardswish_sub_clamp_cuda(x, self.bias)
+        
+        return x
+
+# Re-defining get_inputs and get_init_inputs to match the required interface for testing/usage context if needed, 
+# though the prompt asks only for the ModelNew code block. 
+# However, to ensure the "codeblocks" output is self-contained and valid as a drop-in replacement structure:
+
+def get_inputs():
+    return [torch.rand(128, 3, 16, 32, 32)]
+
+def get_init_inputs():
+    return [3, 16, 3, 2, 1, (1, 1, 1, 1)]
+```

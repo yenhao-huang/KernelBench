@@ -1,0 +1,123 @@
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused matmul + subtraction + multiplication + ReLU
+# This kernel will fuse the first part of subtract and multiply with the ReLU
+# Note: Since matmul is a single large operation, we will use the 
+# #include <cublas/cublas_v2.h>
+# #import <at::Tensor-based cublas-based mat_mul
+- We will use thelib/cublas/cublas_v
+- Wecu will use a
+- We will use a custom kernel for the    
+- x = x - sub
+- x = x * mul
+- x * = relu(x)
+<#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_ops_kernel(const float* input, const float* weight, const float* bias, float* output, int M, int N, int K, float sub, float mul, float batch_size_val)
+{
+    // This is a complex kernel. 
+    // To make it _efficient, we                
+    // kernel logic:
+    // Do a standard matmul-like approach or 
+    // Do a
+
+
+    // For simplicity and the un-fused-everything-into-one-kernel 
+    // is often slow for compute-efficient 
+    #include <torch/extension.
+#include <torch matmul-based
+<#include <torch/extension.h>
+#    include <cuda_runtime. elementwise-wise-wise-wise-wise-wise-wise-weight-weight-wise-idx-weight-wise-idx-idx-idx-relu-sub-sub-wise-wise-index-wise-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx
+```
+
+Ithought'
+<channel|>```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused element-wise operations: (x - sub) * mul, then ReLU
+# We fuse the subtraction, multiplication, and ReLU into a single kernel to reduce memory bandwidth usage.
+# The linear layer's matmul is kept as a standard torch.matmul (which uses highly optimized cuBLAS)
+# and then we apply the fused kernel to the result.
+fused_ops_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_elementwise_kernel(
+    const float* __restrict__ input,
+    float sub,
+    float mul,
+    float* __restrict__ output,
+    int size) {
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float val = input[idx];
+        // Apply: (val - subtract_value) * multiply_value
+        float transformed = (val - sub) * mul;
+        // Apply: ReLU(transformed)
+        output[idx] = transformed > 0.0f ? transformed : 0.0f;
+    }
+}
+
+torch::Tensor fused_elementwise_cuda(torch::Tensor input, float sub, float mul) {
+    auto size = input.numel();
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    fused_elementwise_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        sub,
+        mul,
+        output.data_ptr<float>(),
+        size
+    );
+
+    return output;
+}
+"""
+
+fused_ops_cpp_source = """
+torch::Tensor fused_elementwise_cuda(torch::Tensor input, float sub, float mul);
+"""
+
+# Compile the inline CUDA code
+fused_ops_module = load_inline(
+    name="fused_ops_module",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_cuda_source,
+    functions=["fused_elementwise_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model that performs a matrix multiplication, subtraction, multiplication, and ReLU activation.
+    The element-wise operations (subtraction, multiplication, and ReLU) are fused into a single CUDA kernel.
+    """
+    def __init__(self, in_features, out_features, subtract_value, multiply_value):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.subtract_value = subtract_value
+        self.multiply_value = multiply_value
+        self.fused_ops = fused_ops_module
+
+    def forward(self, x):
+        # 1. Perform the linear transformation (Matmul + Bias)
+        # We use the standard PyTorch linear layer which is highly optimized via cuBLAS/cuDNN.
+        x = self.linear(x)
+        
+        # 2. Perform fused element-wise operations: (x - sub) * mul and ReLU
+        # This reduces the number of kernel launches and memory passes (read/write) from 3 to 1.
+        x = self.fused_ops.fused_elementwise_cuda(x, self.subtract_value, self.multiply_value)
+        
+        return x
+```

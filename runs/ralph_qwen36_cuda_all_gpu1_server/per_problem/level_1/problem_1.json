@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 37.814,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "2724.435547",
+        "2710.894531",
+        "2725.425049",
+        "2710.745605",
+        "2713.210693"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "646503.687500",
+        "647267.125000",
+        "648322.937500",
+        "648882.500000",
+        "647734.562500"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server/generated_kernels/level_1/problem_1.py",
+  "level": 1,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 1,
+  "problem_name": "1_Square_matrix_multiplication_.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server/raw_generation/level_1/problem_1.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

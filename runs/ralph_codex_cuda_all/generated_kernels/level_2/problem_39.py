@@ -1,0 +1,118 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cpp_sources = """
+torch::Tensor linear_scale_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, torch::Tensor scale);
+"""
+
+cuda_sources = """
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+
+#define TILE_M 16
+#define TILE_N 16
+#define TILE_K 32
+
+__global__ void linear_scale_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    const float* __restrict__ s,
+    float* __restrict__ y,
+    int M,
+    int K,
+    int N
+) {
+    __shared__ float xs[TILE_M][TILE_K + 1];
+    __shared__ float ws[TILE_N][TILE_K + 1];
+
+    int row = blockIdx.y * TILE_M + threadIdx.y;
+    int col = blockIdx.x * TILE_N + threadIdx.x;
+
+    float acc = 0.0f;
+
+    for (int k0 = 0; k0 < K; k0 += TILE_K) {
+        int kx = k0 + threadIdx.x;
+        int ky = k0 + threadIdx.y;
+
+        if (row < M && kx < K) {
+            xs[threadIdx.y][threadIdx.x] = x[row * K + kx];
+        } else {
+            xs[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        if (threadIdx.y < TILE_N && ky < K && (blockIdx.x * TILE_N + threadIdx.y) < N) {
+            ws[threadIdx.y][threadIdx.x] = w[(blockIdx.x * TILE_N + threadIdx.y) * K + kx];
+        } else if (threadIdx.y < TILE_N) {
+            ws[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int kk = 0; kk < TILE_K; ++kk) {
+            acc += xs[threadIdx.y][kk] * ws[threadIdx.x][kk];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        y[row * N + col] = (acc + b[col]) * s[col];
+    }
+}
+
+torch::Tensor linear_scale_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, torch::Tensor scale) {
+    const int M = x.size(0);
+    const int K = x.size(1);
+    const int N = weight.size(0);
+
+    auto y = torch::empty({M, N}, x.options());
+
+    dim3 block(TILE_N, TILE_M);
+    dim3 grid((N + TILE_N - 1) / TILE_N, (M + TILE_M - 1) / TILE_M);
+
+    linear_scale_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        scale.data_ptr<float>(),
+        y.data_ptr<float>(),
+        M,
+        K,
+        N
+    );
+
+    return y;
+}
+"""
+
+linear_scale_ext = load_inline(
+    name="linear_scale_ext_kbench_fp32",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["linear_scale_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, scale_shape, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        self.bn = nn.BatchNorm1d(out_features, eps=eps, momentum=momentum)
+        self.linear_scale_ext = linear_scale_ext
+
+    def forward(self, x):
+        x = self.linear_scale_ext.linear_scale_cuda(
+            x.contiguous(),
+            self.gemm.weight.contiguous(),
+            self.gemm.bias.contiguous(),
+            self.scale.contiguous(),
+        )
+        x = self.bn(x)
+        return x

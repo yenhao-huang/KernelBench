@@ -1,0 +1,476 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA implementation for LSTM cell operations fused together.
+# This replaces the standard nn.LSTM with a custom kernel that handles:
+# 1. Input gate, Forget gate, Cell candidate, Output gate calculations (Gates)
+# 2. Cell state update
+# 3. Hidden state update
+# 4. Final linear projection (fc layer)
+
+lstm_and_fc_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper for matrix multiplication: C = A * B^T
+// A: [M, K], B: [N, K] -> C: [M, N]
+__global__ void matmul_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < M && col < N) {
+        float sum = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            sum += A[row * K + k] * B[col * K + k];
+        }
+        C[row * N + col] = sum;
+    }
+}
+
+// Sigmoid activation
+__device__ float sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+// Tanh activation
+__device__ float tanh_act(float x) {
+    return tanhf(x);
+}
+
+// LSTM Cell Forward Kernel
+// Inputs:
+// x: [Batch, SeqLen, InputSize]
+// h_prev: [NumLayers, Batch, HiddenSize]
+// c_prev: [NumLayers, Batch, HiddenSize]
+// Weights:
+// W_i, W_f, W_c, W_o: [HiddenSize, 4*HiddenSize] (concatenated weights for gates)
+// U_i, U_f, U_c, U_o: [HiddenSize, 4*HiddenSize] (recurrent weights)
+// b_i, b_f, b_c, b_o: [4*HiddenSize] (biases)
+// Output:
+// h_out: [NumLayers, Batch, HiddenSize]
+// c_out: [NumLayers, Batch, HiddenSize]
+
+__global__ void lstm_cell_kernel(
+    const float* x,           // [Batch, SeqLen, InputSize] - flattened for simplicity or accessed via stride
+    const float* h_prev,      // [NumLayers, Batch, HiddenSize]
+    const float* c_prev,      // [NumLayers, Batch, HiddenSize]
+    const float* W_gates,     // [4*HiddenSize, InputSize] - Weights for input x (W_x)
+    const float* U_gates,     // [4*HiddenSize, HiddenSize] - Weights for h_prev (W_h)
+    const float* b_gates,     // [4*HiddenSize] - Biases
+    float* h_out,             // [NumLayers, Batch, HiddenSize]
+    float* c_out,             // [NumLayers, Batch, HiddenSize]
+    int batch_size,
+    int hidden_size,
+    int input_size,
+    int num_layers
+) {
+    // Each thread block handles one layer, one batch item, and a chunk of hidden units?
+    // To optimize, let's have each thread handle one output element (h_out[l][b][i])
+    // But we need to read from x[t] and h_prev[l-1][b].
+    
+    int l = blockIdx.z;
+    int b = blockIdx.y;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (l >= num_layers || b >= batch_size || i >= hidden_size) return;
+
+    // Current layer index for weights access is implicit in the kernel launch or passed.
+    // Since we are fusing, let's assume this kernel runs for a specific layer 'l'.
+    // We need to pass pointers to weights for layer l.
+    
+    // However, standard CUDA grid mapping:
+    // blockIdx.z -> Layer
+    // blockIdx.y -> Batch
+    // blockIdx.x * blockDim.x + threadIdx.x -> Hidden Unit Index
+    
+    // Accessing x: The LSTM processes sequence step by step. 
+    // This kernel structure above is for a SINGLE time step if we pass x_t.
+    // But the input x is [Batch, SeqLen, InputSize].
+    // To fuse the whole sequence, we need to iterate over sequence length inside the kernel or launch per step.
+    // Launching per step is easier for memory coalescing and logic.
+    
+    // Let's redefine: This kernel processes ONE time step t for ALL layers and batches.
+    // We will call this kernel SeqLen times from Python/C++.
+}
+
+// Better approach: Kernel that processes one time step for all layers/batches/units
+__global__ void lstm_step_kernel(
+    const float* x_t,           // [Batch, InputSize]
+    const float* h_prev,        // [NumLayers, Batch, HiddenSize]
+    const float* c_prev,        // [NumLayers, Batch, HiddenSize]
+    const float* W_x,           // [4*HiddenSize, InputSize]
+    const float* W_h,           // [4*HiddenSize, HiddenSize]
+    const float* b,             // [4*HiddenSize]
+    float* h_out,               // [NumLayers, Batch, HiddenSize]
+    float* c_out,               // [NumLayers, Batch, HiddenSize]
+    int batch_size,
+    int hidden_size,
+    int input_size,
+    int num_layers
+) {
+    int l = blockIdx.z;
+    int b = blockIdx.y;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (l >= num_layers || b >= batch_size || i >= hidden_size) return;
+
+    // Pointer to previous h and c for this layer and batch
+    const float* h_prev_l_b = h_prev + l * batch_size * hidden_size + b * hidden_size;
+    const float* c_prev_l_b = c_prev + l * batch_size * hidden_size + b * hidden_size;
+    
+    // Pointer to output h and c for this layer and batch
+    float* h_out_l_b = h_out + l * batch_size * hidden_size + b * hidden_size;
+    float* c_out_l_b = c_out + l * batch_size * hidden_size + b * hidden_size;
+
+    // Input x for this batch item
+    const float* x_t_b = x_t + b * input_size;
+
+    // Calculate gate inputs: z = W_x * x_t + W_h * h_prev + b
+    // We compute the 4 gates (i, f, c, o) in parallel using threads.
+    // Each thread computes one element of the 4*hidden_size vector? 
+    // No, that's too much memory bandwidth if we store intermediate z.
+    // Instead, each thread computes one hidden unit output, but needs to read 4*hidden_size values from W_x and W_h?
+    // That would be inefficient.
+    
+    // Optimized approach: Each thread block handles one batch item for all hidden units.
+    // Or use shared memory. Given the constraints of "inline" and simplicity, 
+    // let's stick to a straightforward but efficient mapping:
+    // Thread (b, l, i) computes h_out[l][b][i].
+    // It needs to compute the 4 gates for this specific hidden unit i? 
+    // No, gate j affects all hidden units.
+    
+    // Let's change strategy: Use a kernel where each thread computes one element of the gate vector (4*hidden_size).
+    // Then we need another pass or atomic ops? No, that's complex.
+    
+    // Standard efficient LSTM CUDA implementation often uses cuDNN. 
+    // Since we must write custom, let's implement a simplified but correct version.
+    // We will compute the gate values (4 * hidden_size) for each batch item and layer.
+    // Let's have threads map to (batch, layer, gate_index).
+    
+    int total_gates = 4 * hidden_size;
+    int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (thread_id >= total_gates) return;
+
+    int gate_idx = thread_id;
+    int g = gate_idx / hidden_size; // 0: i, 1: f, 2: c, 3: o
+    int h_idx = gate_idx % hidden_size;
+
+    // We need to sum over input_size and hidden_size.
+    // This is a reduction per thread if we don't use shared memory efficiently.
+    // For simplicity and correctness in this constrained environment, 
+    // we will assume the caller launches enough threads to cover 4*hidden_size * batch_size * num_layers?
+    // No, that's too many threads.
+    
+    // Let's go back to: Thread (b, l, h_idx) computes h_out[b][l][h_idx].
+    // It must compute the 4 gates for this specific h_idx? 
+    // Actually, the gate values are vectors of size hidden_size.
+    // The calculation for h_out[l][b][i] depends on:
+    // i_gate = sigmoid(W_i * x + U_i * h_prev + b_i)[i]
+    // f_gate = sigmoid(W_f * x + U_f * h_prev + b_f)[i]
+    // c_cand = tanh(W_c * x + U_c * h_prev + b_c)[i]
+    // o_gate = sigmoid(W_o * x + U_o * h_prev + b_o)[i]
+    // c_new[i] = f_gate * c_prev[i] + i_gate * c_cand[i]
+    // h_new[i] = o_gate * tanh(c_new[i])
+    
+    // So, for a specific output unit i, we need the gate values at index i.
+    // To get gate value at index i, we need to compute the dot product of the i-th row of W_gates with x and h_prev.
+    
+    float sum_i = 0.0f;
+    float sum_f = 0.0f;
+    float sum_c = 0.0f;
+    float sum_o = 0.0f;
+
+    // Weights are stored as [4*HiddenSize, InputSize] and [4*HiddenSize, HiddenSize]
+    // Row for gate g, hidden unit i is at index (g * hidden_size + i)
+    
+    int row_idx_i = g == 0 ? h_idx : -1; // We need all 4 gates. Let's compute them in one thread? No.
+    
+    // This mapping is tricky. Let's use a different mapping:
+    // Block: (batch, layer)
+    // Thread: hidden_unit_index
+    // Each thread computes the full dot product for its specific hidden unit i across all 4 gates?
+    // No, each gate has its own weights.
+    
+    // Correct Mapping:
+    // We want to compute h_out[b][l][i].
+    // We need:
+    // val_i = W_i_row[i] . x + U_i_row[i] . h_prev + b_i[i]
+    // val_f = W_f_row[i] . x + U_f_row[i] . h_prev + b_f[i]
+    // val_c = W_c_row[i] . x + U_c_row[i] . h_prev + b_c[i]
+    // val_o = W_o_row[i] . x + U_o_row[i] . h_prev + b_o[i]
+    
+    // So each thread (b, l, i) computes 4 dot products.
+    
+    const float* W_i = W_x;       // [HiddenSize, InputSize]
+    const float* W_f = W_x + hidden_size * input_size;
+    const float* W_c = W_x + 2 * hidden_size * input_size;
+    const float* W_o = W_x + 3 * hidden_size * input_size;
+    
+    const float* U_i = W_h;       // [HiddenSize, HiddenSize]
+    const float* U_f = W_h + hidden_size * hidden_size;
+    const float* U_c = W_h + 2 * hidden_size * hidden_size;
+    const float* U_o = W_h + 3 * hidden_size * hidden_size;
+    
+    const float* b_i = b;         // [HiddenSize]
+    const float* b_f = b + hidden_size;
+    const float* b_c = b + 2 * hidden_size;
+    const float* b_o = b + 3 * hidden_size;
+
+    // Dot product for Input Gate
+    for (int k = 0; k < input_size; ++k) {
+        sum_i += W_i[i * input_size + k] * x_t_b[k];
+    }
+    for (int k = 0; k < hidden_size; ++k) {
+        sum_i += U_i[i * hidden_size + k] * h_prev_l_b[k];
+    }
+    sum_i += b_i[i];
+
+    // Dot product for Forget Gate
+    float sum_f_val = 0.0f;
+    for (int k = 0; k < input_size; ++k) {
+        sum_f_val += W_f[i * input_size + k] * x_t_b[k];
+    }
+    for (int k = 0; k < hidden_size; ++k) {
+        sum_f_val += U_f[i * hidden_size + k] * h_prev_l_b[k];
+    }
+    sum_f_val += b_f[i];
+
+    // Dot product for Cell Candidate
+    float sum_c_val = 0.0f;
+    for (int k = 0; k < input_size; ++k) {
+        sum_c_val += W_c[i * input_size + k] * x_t_b[k];
+    }
+    for (int k = 0; k < hidden_size; ++k) {
+        sum_c_val += U_c[i * hidden_size + k] * h_prev_l_b[k];
+    }
+    sum_c_val += b_c[i];
+
+    // Dot product for Output Gate
+    float sum_o_val = 0.0f;
+    for (int k = 0; k < input_size; ++k) {
+        sum_o_val += W_o[i * input_size + k] * x_t_b[k];
+    }
+    for (int k = 0; k < hidden_size; ++k) {
+        sum_o_val += U_o[i * hidden_size + k] * h_prev_l_b[k];
+    }
+    sum_o_val += b_o[i];
+
+    // Apply activations
+    float i_gate = sigmoid(sum_i);
+    float f_gate = sigmoid(sum_f_val);
+    float c_cand = tanh_act(sum_c_val);
+    float o_gate = sigmoid(sum_o_val);
+
+    // Update Cell State
+    float c_new = f_gate * c_prev_l_b[i] + i_gate * c_cand;
+    
+    // Update Hidden State
+    float h_new = o_gate * tanh_act(c_new);
+
+    // Write outputs
+    c_out_l_b[i] = c_new;
+    h_out_l_b[i] = h_new;
+}
+
+// Linear Layer Kernel: y = x * W^T + b
+__global__ void linear_kernel(
+    const float* x,       // [Batch, InputSize]
+    const float* W,       // [OutputSize, InputSize]
+    const float* b,       // [OutputSize]
+    float* y,             // [Batch, OutputSize]
+    int batch_size,
+    int input_size,
+    int output_size
+) {
+    int b_idx = blockIdx.y;
+    int o_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (b_idx >= batch_size || o_idx >= output_size) return;
+
+    float sum = 0.0f;
+    const float* x_b = x + b_idx * input_size;
+    const float* W_o = W + o_idx * input_size;
+
+    for (int k = 0; k < input_size; ++k) {
+        sum += x_b[k] * W_o[k];
+    }
+    y[b_idx * output_size + o_idx] = sum + b[o_idx];
+}
+
+// Host function to run LSTM step
+torch::Tensor lstm_step_cuda(
+    torch::Tensor x_t,      // [Batch, InputSize]
+    torch::Tensor h_prev,   // [NumLayers, Batch, HiddenSize]
+    torch::Tensor c_prev,   // [NumLayers, Batch, HiddenSize]
+    torch::Tensor W_x,      // [4*HiddenSize, InputSize]
+    torch::Tensor W_h,      // [4*HiddenSize, HiddenSize]
+    torch::Tensor b         // [4*HiddenSize]
+) {
+    auto batch_size = x_t.size(0);
+    auto hidden_size = h_prev.size(2);
+    auto input_size = x_t.size(1);
+    auto num_layers = h_prev.size(0);
+
+    auto h_out = torch::zeros_like(h_prev);
+    auto c_out = torch::zeros_like(c_prev);
+
+    const int block_size = 256;
+    
+    // Grid dimensions:
+    // x: (hidden_size + block_size - 1) / block_size
+    // y: batch_size
+    // z: num_layers
+    
+    dim3 grid((hidden_size + block_size - 1) / block_size, batch_size, num_layers);
+    dim3 block(block_size);
+
+    lstm_step_kernel<<<grid, block>>>(
+        x_t.data_ptr<float>(),
+        h_prev.data_ptr<float>(),
+        c_prev.data_ptr<float>(),
+        W_x.data_ptr<float>(),
+        W_h.data_ptr<float>(),
+        b.data_ptr<float>(),
+        h_out.data_ptr<float>(),
+        c_out.data_ptr<float>(),
+        batch_size,
+        hidden_size,
+        input_size,
+        num_layers
+    );
+
+    return std::make_tuple(h_out, c_out);
+}
+
+// Host function to run Linear layer
+torch::Tensor linear_cuda(
+    torch::Tensor x,      // [Batch, InputSize]
+    torch::Tensor W,      // [OutputSize, InputSize]
+    torch::Tensor b       // [OutputSize]
+) {
+    auto batch_size = x.size(0);
+    auto input_size = x.size(1);
+    auto output_size = W.size(0);
+
+    auto y = torch::zeros({batch_size, output_size}, x.options());
+
+    const int block_size = 256;
+    
+    dim3 grid((output_size + block_size - 1) / block_size, batch_size);
+    dim3 block(block_size);
+
+    linear_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        W.data_ptr<float>(),
+        b.data_ptr<float>(),
+        y.data_ptr<float>(),
+        batch_size,
+        input_size,
+        output_size
+    );
+
+    return y;
+}
+"""
+
+lstm_and_fc_cpp_source = (
+    "torch::Tensor lstm_step_cuda(torch::Tensor x_t, torch::Tensor h_prev, torch::Tensor c_prev, torch::Tensor W_x, torch::Tensor W_h, torch::Tensor b);"
+    "torch::Tensor linear_cuda(torch::Tensor x, torch::Tensor W, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code
+lstm_fc_lib = load_inline(
+    name="lstm_fc_lib",
+    cpp_sources=lstm_and_fc_cpp_source,
+    cuda_sources=lstm_and_fc_source,
+    functions=["lstm_step_cuda", "linear_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"]
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.0):
+        """
+        Initialize the LSTM model with custom CUDA operators.
+        """
+        super(ModelNew, self).__init__()
+        
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.output_size = output_size
+        
+        # Initialize weights for LSTM
+        # Weights are typically [4*hidden_size, input_size] and [4*hidden_size, hidden_size]
+        # Biases are [4*hidden_size]
+        
+        # Using Xavier uniform initialization similar to PyTorch's default
+        limit = 1.0 / (hidden_size ** 0.5)
+        
+        self.W_x = nn.Parameter(torch.empty(4 * hidden_size, input_size).uniform_(-limit, limit))
+        self.W_h = nn.Parameter(torch.empty(4 * hidden_size, hidden_size).uniform_(-limit, limit))
+        self.b = nn.Parameter(torch.zeros(4 * hidden_size))
+        
+        # Initialize weights for FC layer
+        fc_limit = 1.0 / (hidden_size ** 0.5)
+        self.fc_W = nn.Parameter(torch.empty(output_size, hidden_size).uniform_(-fc_limit, fc_limit))
+        self.fc_b = nn.Parameter(torch.zeros(output_size))
+
+    def forward(self, x, h0, c0):
+        """
+        Forward pass through the LSTM model using custom CUDA operators.
+        
+        :param x: The input tensor, shape (batch_size, sequence_length, input_size)
+        :param h0: Initial hidden state, shape (num_layers, batch_size, hidden_size)
+        :param c0: Initial cell state, shape (num_layers, batch_size, hidden_size)
+        :return: The final hidden state of the last layer, shape (batch_size, hidden_size)
+        """
+        
+        batch_size = x.size(0)
+        seq_length = x.size(1)
+        
+        h = h0.clone()
+        c = c0.clone()
+        
+        # Process each time step
+        for t in range(seq_length):
+            x_t = x[:, t, :]  # [Batch, InputSize]
+            
+            # Run LSTM step for all layers and batches
+            h_new, c_new = lstm_fc_lib.lstm_step_cuda(
+                x_t, h, c, self.W_x, self.W_h, self.b
+            )
+            
+            h = h_new
+            c = c_new
+            
+        # Get the hidden state of the last layer for the last time step
+        # h shape: [NumLayers, Batch, HiddenSize]
+        h_last_layer = h[-1]  # [Batch, HiddenSize]
+        
+        # Apply Linear Layer using custom CUDA operator
+        out = lstm_fc_lib.linear_cuda(h_last_layer, self.fc_W, self.fc_b)
+        
+        # The problem asks to return state[0], which corresponds to the hidden state of the last layer
+        # In PyTorch LSTM, state[0] is h_n.
+        return h[-1]
+
+# Test code setup (not included in output as per instructions, but for verification)
+# batch_size = 10
+# sequence_length = 512
+# input_size = 128
+# hidden_size = 256
+# num_layers = 6
+# output_size = 10
+# dropout = 0.0
+
+# def get_inputs():
+#     return [torch.rand(batch_size, sequence_length, input_size), torch.rand((num_layers, batch_size, hidden_size)), torch.rand((num_layers, batch_size, hidden_size))]
+
+# def get_init_inputs():
+#     return [input_size, hidden_size, num_layers, output_size, dropout]

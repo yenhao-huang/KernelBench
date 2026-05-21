@@ -1,0 +1,107 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+conv1_cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void conv1_alex_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ y,
+    int total
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    constexpr int C = 3;
+    constexpr int H = 224;
+    constexpr int W = 224;
+    constexpr int OC = 96;
+    constexpr int OH = 55;
+    constexpr int OW = 55;
+    constexpr int K = 11;
+    constexpr int STR = 4;
+    constexpr int PAD = 2;
+
+    int ox = idx % OW;
+    int t = idx / OW;
+    int oy = t % OH;
+    t /= OH;
+    int oc = t % OC;
+    int n = t / OC;
+
+    float acc = b[oc];
+
+    int in_y0 = oy * STR - PAD;
+    int in_x0 = ox * STR - PAD;
+
+    #pragma unroll
+    for (int c = 0; c < C; ++c) {
+        #pragma unroll
+        for (int ky = 0; ky < K; ++ky) {
+            int iy = in_y0 + ky;
+            if ((unsigned)iy < H) {
+                #pragma unroll
+                for (int kx = 0; kx < K; ++kx) {
+                    int ix = in_x0 + kx;
+                    if ((unsigned)ix < W) {
+                        float xv = x[((n * C + c) * H + iy) * W + ix];
+                        float wv = w[((oc * C + c) * K + ky) * K + kx];
+                        acc = fmaf(xv, wv, acc);
+                    }
+                }
+            }
+        }
+    }
+
+    y[idx] = acc;
+}
+
+torch::Tensor conv1_alex_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias) {
+    constexpr int OC = 96;
+    constexpr int OH = 55;
+    constexpr int OW = 55;
+
+    auto n = x.size(0);
+    auto y = torch::empty({n, OC, OH, OW}, x.options());
+
+    int total = (int)(n * OC * OH * OW);
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+
+    conv1_alex_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        y.data_ptr<float>(),
+        total
+    );
+
+    return y;
+}
+"""
+
+conv1_cpp_source = "torch::Tensor conv1_alex_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias);"
+
+conv1_ext = load_inline(
+    name="conv1_alex_inline_ext",
+    cpp_sources=conv1_cpp_source,
+    cuda_sources=conv1_cuda_source,
+    functions=["conv1_alex_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000):
+        super(ModelNew, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=96, kernel_size=11, stride=4, padding=2)
+
+    def forward(self, x):
+        return conv1_ext.conv1_alex_cuda(x.contiguous(), self.conv1.weight.contiguous(), self.conv1.bias.contiguous())
+```

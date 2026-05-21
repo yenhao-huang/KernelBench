@@ -1,0 +1,27 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 94.18,
+  "eval_result": {
+    "compiled": true,
+    "correctness": true,
+    "metadata": {
+      "correctness_trials": "(5 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090"
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_codex_cuda_all/generated_kernels/level_2/problem_87.py",
+  "level": 2,
+  "model_name": "codex-gpt-5.5",
+  "precision": "fp32",
+  "problem_id": 87,
+  "problem_name": "87_Conv2d_Subtract_Subtract_Mish.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_codex_cuda_all/raw_generation/level_2/problem_87.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

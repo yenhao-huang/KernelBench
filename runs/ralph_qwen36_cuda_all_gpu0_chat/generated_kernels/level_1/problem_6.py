@@ -1,0 +1,144 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication
+# We use a tiled approach to optimize memory access patterns and utilize shared memory.
+# Given K is very large (524288) and M, N are small (256), we can optimize by processing
+# blocks of A and B efficiently. However, standard cuBLAS is usually the best for GEMM.
+# But since we must write custom CUDA, we implement a tiled GEMM.
+
+gemm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Block dimensions for tiling
+#define TILE_M 32
+#define TILE_N 32
+#define TILE_K 8 // K dimension tile size, depends on register usage and shared memory
+
+__global__ void matmul_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
+    // Shared memory for tiles of A and B
+    __shared__ float sA[TILE_M][TILE_K];
+    __shared__ float sB[TILE_K][TILE_N];
+
+    // Thread indices within the block
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    // Block indices
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+
+    // Global row and column indices for this thread's output element
+    int row = by * TILE_M + ty;
+    int col = bx * TILE_N + tx;
+
+    float sum = 0.0f;
+
+    // Loop over K dimension in tiles
+    for (int k = 0; k < K; k += TILE_K) {
+        // Load tile from A into shared memory
+        // Check bounds for A
+        if (row < M && (k + tx) < K) {
+            sA[ty][tx] = A[row * K + k + tx];
+        } else {
+            sA[ty][tx] = 0.0f;
+        }
+
+        // Load tile from B into shared memory
+        // Check bounds for B
+        if ((k + ty) < K && col < N) {
+            sB[ty][tx] = B[(k + ty) * N + col];
+        } else {
+            sB[ty][tx] = 0.0f;
+        }
+
+        // Synchronize to ensure all data is loaded
+        __syncthreads();
+
+        // Compute partial dot product for this tile
+        for (int t = 0; t < TILE_K; ++t) {
+            sum += sA[ty][t] * sB[t][tx];
+        }
+
+        // Synchronize before next tile load
+        __syncthreads();
+    }
+
+    // Write result to global memory
+    if (row < M && col < N) {
+        C[row * N + col] = sum;
+    }
+}
+
+torch::Tensor matmul_cuda(torch::Tensor A, torch::Tensor B) {
+    auto M = A.size(0);
+    auto K = A.size(1);
+    auto N = B.size(1);
+
+    // Ensure inputs are contiguous and on CUDA
+    if (!A.is_contiguous()) A = A.contiguous();
+    if (!B.is_contiguous()) B = B.contiguous();
+
+    auto C = torch::zeros({M, N}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+
+    const int block_size_x = TILE_N;
+    const int block_size_y = TILE_M;
+    
+    dim3 block(block_size_x, block_size_y);
+    
+    // Grid dimensions
+    int grid_x = (N + block_size_x - 1) / block_size_x;
+    int grid_y = (M + block_size_y - 1) / block_size_y;
+    dim3 grid(grid_x, grid_y);
+
+    matmul_kernel<<<grid, block>>>(A.data_ptr<float>(), B.data_ptr<float>(), C.data_ptr<float>(), M, N, K);
+
+    // Check for launch errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA Error: %s\\n", cudaGetErrorString(err));
+    }
+
+    return C;
+}
+"""
+
+gemm_cpp_source = (
+    "torch::Tensor matmul_cuda(torch::Tensor A, torch::Tensor B);"
+)
+
+# Compile the inline CUDA code for matrix multiplication
+matmul_custom = load_inline(
+    name="matmul_custom",
+    cpp_sources=gemm_cpp_source,
+    cuda_sources=gemm_source,
+    functions=["matmul_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using custom CUDA matrix multiplication.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.matmul_custom = matmul_custom
+
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """
+        Performs matrix multiplication of A and B using custom CUDA kernel.
+
+        Args:
+            A: Input tensor of shape (M, K)
+            B: Input tensor of shape (K, N)
+
+        Returns:
+            Output tensor of shape (M, N)
+        """
+        return self.matmul_custom.matmul_cuda(A, B)

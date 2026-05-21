@@ -1,0 +1,83 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <float.h>
+
+__global__ void channel_min_tanh2_kernel(
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int n,
+    int c,
+    int h,
+    int w
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n * h * w;
+    if (idx >= total) return;
+
+    int spatial = h * w;
+    int ni = idx / spatial;
+    int s = idx - ni * spatial;
+
+    const float* base = x + ni * c * spatial + s;
+    float v = FLT_MAX;
+
+    #pragma unroll 4
+    for (int ci = 0; ci < c; ++ci) {
+        float cur = base[ci * spatial];
+        v = fminf(v, cur);
+    }
+
+    out[idx] = tanhf(tanhf(v));
+}
+
+torch::Tensor channel_min_tanh2_cuda(torch::Tensor x) {
+    int n = (int)x.size(0);
+    int c = (int)x.size(1);
+    int h = (int)x.size(2);
+    int w = (int)x.size(3);
+
+    auto out = torch::empty({n, 1, h, w}, x.options());
+
+    int total = n * h * w;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+
+    channel_min_tanh2_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        n, c, h, w
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor channel_min_tanh2_cuda(torch::Tensor x);
+"""
+
+_channel_min_tanh2 = load_inline(
+    name="channel_min_tanh2_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["channel_min_tanh2_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.ops = _channel_min_tanh2
+
+    def forward(self, x):
+        x = self.conv(x)
+        return self.ops.channel_min_tanh2_cuda(x)

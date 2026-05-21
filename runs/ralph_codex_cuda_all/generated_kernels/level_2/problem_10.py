@@ -1,0 +1,138 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void pool_hardtanh_mean_tanh_kernel(
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int N,
+    int C,
+    int H,
+    int W,
+    float ht_min,
+    float ht_max
+) {
+    int idx = blockIdx.x;
+    int n = idx / C;
+    int c = idx - n * C;
+
+    int pooled_h = H >> 1;
+    int pooled_w = W >> 1;
+    int pooled_elems = pooled_h * pooled_w;
+
+    float thread_sum = 0.0f;
+
+    for (int p = threadIdx.x; p < pooled_elems; p += blockDim.x) {
+        int ph = p / pooled_w;
+        int pw = p - ph * pooled_w;
+        int h0 = ph << 1;
+        int w0 = pw << 1;
+
+        int base = ((n * C + c) * H + h0) * W + w0;
+        float m = x[base];
+        float v1 = x[base + 1];
+        float v2 = x[base + W];
+        float v3 = x[base + W + 1];
+
+        m = fmaxf(m, v1);
+        m = fmaxf(m, v2);
+        m = fmaxf(m, v3);
+        m = fminf(fmaxf(m, ht_min), ht_max);
+
+        thread_sum += m;
+    }
+
+    __shared__ float smem[256];
+    smem[threadIdx.x] = thread_sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            smem[threadIdx.x] += smem[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        float mean = smem[0] / (float)pooled_elems;
+        out[idx] = tanhf(mean);
+    }
+}
+
+torch::Tensor pool_hardtanh_mean_tanh_cuda(torch::Tensor x, double ht_min, double ht_max) {
+    int N = (int)x.size(0);
+    int C = (int)x.size(1);
+    int H = (int)x.size(2);
+    int W = (int)x.size(3);
+
+    auto out = torch::empty({N, C, 1, 1}, x.options());
+
+    dim3 grid(N * C);
+    dim3 block(256);
+
+    pool_hardtanh_mean_tanh_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N,
+        C,
+        H,
+        W,
+        (float)ht_min,
+        (float)ht_max
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor pool_hardtanh_mean_tanh_cuda(torch::Tensor x, double ht_min, double ht_max);
+"""
+
+_fused_pool_reduce = load_inline(
+    name="fused_pool_hardtanh_mean_tanh_kb",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["pool_hardtanh_mean_tanh_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride,
+        padding,
+        maxpool_kernel_size,
+        maxpool_stride,
+        hardtanh_min,
+        hardtanh_max,
+    ):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+        )
+        self.hardtanh_min = float(hardtanh_min)
+        self.hardtanh_max = float(hardtanh_max)
+        self.fused = _fused_pool_reduce
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        return self.fused.pool_hardtanh_mean_tanh_cuda(
+            x.contiguous(),
+            self.hardtanh_min,
+            self.hardtanh_max,
+        )

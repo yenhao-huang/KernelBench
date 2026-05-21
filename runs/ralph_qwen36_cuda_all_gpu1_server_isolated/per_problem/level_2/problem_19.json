@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 77.539,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "1.123357",
+        "1.123370",
+        "1.123329",
+        "1.123355",
+        "1.123337"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "9.090379",
+        "9.013973",
+        "8.800492",
+        "9.072313",
+        "9.314100"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_2/problem_19.py",
+  "level": 2,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 19,
+  "problem_name": "19_ConvTranspose2d_GELU_GroupNorm.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_2/problem_19.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

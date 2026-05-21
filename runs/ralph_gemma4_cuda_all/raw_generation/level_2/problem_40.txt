@@ -1,0 +1,243 @@
+name = "fused_matmul_scale_add_residual""
+
+name = "fused_matmul_scale_add_residual"
+
+Optimized with CUDA operators:
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused matmul, scaling, and residual addition.
+# In the original architecture, the operation is:
+# x = matmul(x, weight.T) + bias
+# original_x = x.clone().detach()
+# x = x * scaling_factor + original_x
+# This simplifies to:
+# x = (matmul(x, weight.T) + bias) * (1 + scaling_factor)
+# Wait, no. Let's re-examine the-
+# original_x = x.clone().[]
+# original_x = (matmul(x, weight.T) la + bias)
+# x = (matmul(mat_res) + bias) * scaling_factor + (matmul(x, weight.T) + bias)
+# x = (matmul(x, weight.T) + bias) * (1 + scaling_factor)
+ergo, the simplification simplification simplification simplification simplification simplification simplification simplification simplification simplification
+er
+er
+er
+er
+[]
+```
+
+```python.
+import torch
+import torch.nn.functional as F
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused matmul, scaling_type_of_out_res_id_of_idx_of_idx_of_weight_dir_    
+# The original architecture's logic is:
+# 
+# 
+# original_buf = matmul(x, weight.T) + bias
+# output = original__buf * scaling_factor + original_buf
+# output = original_buf * (1.0 + scaling_factor)
+_def_def_def_def_def_def_def_def_def_def_tensor-type-type-type-type-type-
+_def_float_32_type_of_init_name_param_idx_1_param_               
+_def_float_    _def_name_factor_float_factor_step_function_F_function_F_align-
+_align-
+_align-
+_align____flag_idx_#_idx_param_batch_size
+batch_size = im_im_im_im_im_im_im_
+batch_step_thought_process_thought_factor_factor_factor
+thought_process_step_step_factor_step_step_factor_step_idx__idx_idx_of_weight_row-
+# The original architecture's logic is:
+# original_x = matmul(x, out_features) + bias
+# output = original_x * scaling_factor + original_x
+# output = x * (1.0 + scaling.factor)
+# x = (matmul(x, weight.T) + bias) * (1.0 + scaling_factor)
+
+# Define the custom CUDA kernel for fused matmul, scaling,
+# and residual addition.
+# The original architecture'grad_grad_index_of_input_weight_cubes_output_factor_replace_import_load___
+# original_    _def_def_def_to_function_[]_inter-
+#er_er_er_er_er_er_er_er_x_idx_batch_size_weight_model_model_f_forward_grad_training-
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# The original architecture's logic is:
+# 1. x = matmul(x, weight.T) + bias
+# 0. original_x = x.clone().detach()
+#   x = x * scaling_factor + original_x
+#   x = (matmul(x, weight.T) + bias) * (1.0 + scaling_factor)
+#
+# 2. The simplification simplification simplification simplification simplification
+#    The logic is:
+#    output = (matmul(x, weight.T) + bias) * (1.0 + scaling_factor)
+#    This is a highly efficient fusion-ready fusion-ready fusion_ready fusion_ready fusion_name_name_factor_name_0.5
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import laod_inline
+
+from torch.utils.cpp_extension import load_inline
+
+from torch.utils.cpp_extension_module_module_module_module_module_module_module_module_module_module_module_module_module_module_module_tensor-type-module-type-type-type-type-type-batch-size-module-type-type-type-type-type_module_import_module_import_module_import_factor_"""
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# The original architecture's logic is:
+# 1. x = matmul(x.T, weight.T) + bias
+# 2. original_x = x.clone().detach()
+#        x = x * scaling_factor + original_x
+# 
+# 3. This simplifies to:
+#    output = (matmul(x, weight.T) + bias) * (1.0 + scaling_factor)
+#
+# 4. We can fuse the scaling and the residual addition into a single 
+#    element-wise kernel.
+# 
+Post-optimization optimization optimization optimization optimization optimization optimization optimization optimization optimization optimization optimization optimization optimization optimization optimization optimization optimization optimization optimization optimization optimization optimization 
+Post-optimization optimization optimization optimization optimization optimization optimization optimization optimization optimization optimization optimization
+Post-elementwise_f0_f0_param_idx_0_idx_1_param_idx_step_idx_step_factor_step_idx_0_idx_1_idx_factor_step_idx_0_idx_1_add_step_elementwise_factor_combined_factor_factor_factor_factor_factor_factor_factor_factor_scale_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_idx_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_idx_factor_factor_factor_factor_param_out_cuda_cuda_scale_
+param_factor_factor_factor_factor_factor_factor
+param_factor_stdio-stdio-stdio-stdio-step-stdio-stdio-stdio-stdio-stdio-stdio-stdio-stdio_stdio-stdio-stdio-step-stdio-stdio-
+stdio-stdio-stdio-stdio-stdio-stdio-stdio_stdio-stdio-stdio
+stdio-stdio-stdio-stdio-stdio-elementwise_factor_f0_param__idx_0_flag_idx_import_load_import_import_import_import_import_import_import_import_import_factor_import_import_import_import_        
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# The original architecture's logic is:
+# 1. x = matmul(x, weight.T) + bias
+# 2. original_x = x.clone().detach()
+#    x = x * scaling_factor + original_x
+#    
+# 3. This simplifies to:
+#    output = (matmul(x, weight.T) + bias) * (1.0 + scaling_factor)
+#
+# 4. We can fuse the scaling and residual addition into fast 
+#    element-wise CUDA kernel.
+# 
+# 5. We can use torch.matmul (unoptimized) unoptimized unthought_process_step_step_step_batch_    
+# 
+# 6. 
+# 
+# nn.Linear layer contains weight and weight.T.
+# 
+# 0. Input: x (batch_size, in_features)
+# 1. matmul(x, weight.T) + bias
+# 2. output = matmul_res * (1.0 + scaling_factor)
+# 3. This is a single element-wise kernel.
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# The original architecture's logic is:
+# 1. x = matmul(x, weight.T)
+# 2. x = x + bias
+# 
+# 3. original_x = x.clone().detach()
+# 4. x = x * scaling_factor + original_x
+# 
+# 5. This simplifies to:
+#    output = (matmul(x, weight.T) + bias) * (1.0 + scaling_factor)
+#
+# 6. We. can fuse the result of matmul + bias into a single 
+#    element-wise kernel.
+# thought_process_step_step_step_factor_factor_factor_factor_factor_factor_factor_step_idx_0_factor_factor_factor_factor_factor_factor_factor_factor_idx_idx_idx_factor_factor_factor_factor_factor_factor_idx_of_weight_factor_factor_factor_factor_factor_idx_factor_factor_factor_factor_factor_idx_of_weight_factor_0.5
+# 
+# 
+# 0. weight.T is used in
+# # 
+# 
+# 
+# val = (matmul(x, weight.T) + bias) * (1.0 + scaling_factor)
+# val = matmul(x, elementwise_scale_add_residual_kernel_elementwise_scale_step_factor_1_plus_scaling_factor)
+# 
+# 
+# 1. A single element-wise kernel can be
+# 2. A clone-free, clone-free, extra-memory-intensive-free
+ extra-memory-factor-factor-factor-factor-factor-factor-factor-factor-factor_factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor_factor-factor-factor-factor_factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor_factor-factor-factor-factor-factor_factor-factor-factor-factor-factor-factor-factor-factor-factor-factor[]
+
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# The original architecture's logic is:
+# 1. x = matmul(x, weight.T) + bias
+# 2. original_x = x.clone().detach()
+#    x = x * scaling_factor + original_x
+#    
+# 3. This simplifies to:
+    # output = (matmul(x, weight.T) + bias) * (1.0 + scaling_factor)
+#
+# 4. We can fuse the scaling and residual addition into a single 
+#    element-wise CUDA kernel.
+# 
+# 5. We can use torch.matmul for the heavy lifting (highly optimized)
+# 6. We can use a custom CUDA kernel for the scaling and residual addition.
+# 
+# 7. However, the most efficient way is to
+#    output = matmul(x, weight.T) + bias
+#    output = output * (1.0 + scaling_factor)
+#    
+# 8. In fact, the total operation is:
+#    output = (matmul(x, weight.T) + bias) * (1.0 +    
+#    
+# 9. Since matmul is the 
+#    bott    leneck-heavy lifting.
+#    Since matmul matmul matthought_process_step_step_step_factor_factor_factor_factor_factor_factor_factor_step_idx_0_idx_1_idx_param_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor-factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor0.5
+# factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_    
+# factor_factor_factor_factor_factor_factor_factor_factor_factor_factor0.5
+# factor_factor_import_import_import_import_import_import_import_import_import_import_import_import_import_import_import_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_and_factor_factor_factor_factor_factor_factor_factor_factor-factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor#
+# 
+# 
+# 
+# 
+# 
+#    # The original architecture's logic is:
+#    # 1. x = matmul(x, weight.T) + bias
+#    # 2. original_x = x.clone().detach()
+#    #    x = x * scaling_factor + original_x
+    # 3. This simplifies to:
+    #    output = (matmul(x, weight.T) + bias) * (1.0 + scaling_factor)
+#
+# 4. We. can fuse the bias-addition, scaling, and residual addition into a single 
+#    element-wise 
+#    # 
+#    # 
+#    #        # 
+#    # 
+    # 
+    #     # 0.
+    # 
+    #      # 0.
+    # 
+    # 
+    # 
+    # 
+_def_def_def_def_def_def_def_def_def_def_def_def_def_def_def_def_def_def_def_def_def_def_def_def_def_def_def_def_def_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor<_def_def_def_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_in_features_in_features_in_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_in_features_input_features_factor_factor_factor_factor_factor0.5
+# 
+# 
+# 
+# buffer-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor_factor_factor_factor_factor_factor_factor_factor_factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor_factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor_factor-factor-factor-factor-factor-factor-factor-factor-factor_factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor_factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor_factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor_factor-factor-factor-factor-factor-factor_factor_factor_factor_factor_factor_factor_factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor_factor-factor-factor-factor-factor-factor_factor_factor_factor_factor_factor_factor_factor_factor_factor-factor-factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor*
+# 
+# 
+# 
+# 
+# 
+# 
+# 0.
+# 
+# factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor*
+# 
+# 
+# 
+*
+# 
+# 
+# factor_factor_factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor_factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor_factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-factor-

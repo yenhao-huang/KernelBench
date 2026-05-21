@@ -1,0 +1,235 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+from transformers import AutoModelForCausalLM, AutoConfig
+
+# Define custom CUDA kernels for Reformer-specific optimizations.
+# Key areas to optimize:
+# 1. LSH Attention (Locality Sensitive Hashing) - often involves complex indexing and scatter/gather operations.
+# 2. Chunked Feed Forward / Global FFN - large matrix multiplications.
+# 3. Softmax with online computation or fused variants if applicable, though standard softmax is highly optimized in cuDNN/cuBLAS.
+# However, Reformer's main bottleneck is often the LSH attention mechanism due to memory access patterns and lack of fusion in standard PyTorch ops.
+
+# We will implement a fused kernel for the core LSH Attention computation steps that are typically fragmented:
+# 1. Hashing (Linear projection + hashing)
+# 2. Bucketing/Sorting (Grouping queries by hash bucket)
+# 3. Local Attention within buckets (Small dense matmuls + softmax)
+
+# Note: Implementing a full Reformer LSH attention from scratch in inline CUDA is extremely complex due to dynamic memory allocation for variable bucket sizes.
+# Instead, we will focus on optimizing the standard components that are heavy: 
+# 1. The Linear projections (Q, K, V) and FFN layers using highly optimized GEMM calls or custom kernels if needed.
+# 2. However, since PyTorch's native matmul is already backed by cuBLAS which is extremely fast, the main gain in Reformer comes from reducing overhead in the attention logic.
+
+# A more practical approach for "inline" optimization without rewriting the entire transformer engine is to optimize the **Softmax** and **LayerNorm** operations if they are bottlenecks, 
+# or implement a custom **Fused Linear + Activation** kernel.
+
+# Let's implement a Fused LayerNorm + Gelu (or ReLU) kernel, as these are common in FFN blocks and can save memory bandwidth by fusing the operations.
+# Also, we will optimize the standard Attention mechanism's Softmax and Dropout if possible, but let's stick to a robust Fused Linear+Gelu for the FFN part which is compute-heavy.
+
+fused_linear_gelu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Kernel for Fused Linear + Gelu
+// out = Gelu(Wx + b)
+__global__ void fused_linear_gelu_kernel(
+    const float* input, 
+    const float* weight, 
+    const float* bias, 
+    float* output, 
+    int batch_size, 
+    int seq_len, 
+    int in_features, 
+    int out_features) {
+    
+    // Each thread handles one element of the output tensor
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * seq_len * out_features;
+
+    if (idx < total_elements) {
+        int bs_idx = idx / (seq_len * out_features);
+        int sl_idx = (idx % (seq_len * out_features)) / out_features;
+        int feat_idx = idx % out_features;
+
+        // Compute dot product for this output feature
+        float sum = 0.0f;
+        if (bias) {
+            sum = bias[feat_idx];
+        }
+        
+        const float* input_row = input + (bs_idx * seq_len * in_features) + (sl_idx * in_features);
+        const float* weight_col = weight + (feat_idx * in_features);
+
+        for (int i = 0; i < in_features; ++i) {
+            sum += input_row[i] * weight_col[i];
+        }
+
+        // Apply Gelu approximation: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        float x = sum;
+        float cube = x * x * x;
+        float tanh_val = tanhf(0.79788456f * (x + 0.044715f * cube)); // sqrt(2/pi) approx 0.79788456
+        float gelu_val = 0.5f * x * (1.0f + tanh_val);
+
+        output[idx] = gelu_val;
+    }
+}
+
+torch::Tensor fused_linear_gelu_cuda(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    torch::Tensor bias) {
+    
+    auto batch_size = input.size(0);
+    auto seq_len = input.size(1);
+    auto in_features = input.size(2);
+    auto out_features = weight.size(0);
+
+    auto output = torch::empty({batch_size, seq_len, out_features}, input.options());
+
+    const int block_size = 256;
+    int total_elements = batch_size * seq_len * out_features;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    fused_linear_gelu_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.numel() > 0 ? bias.data_ptr<float>() : nullptr,
+        output.data_ptr<float>(),
+        batch_size, seq_len, in_features, out_features
+    );
+
+    return output;
+}
+"""
+
+fused_linear_gelu_cpp_source = (
+    "torch::Tensor fused_linear_gelu_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias);"
+)
+
+# Compile the inline CUDA code
+fused_linear_gelu = load_inline(
+    name="fused_linear_gelu",
+    cpp_sources=fused_linear_gelu_cpp_source,
+    cuda_sources=fused_linear_gelu_source,
+    functions=["fused_linear_gelu_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, model_name, config):
+        super().__init__()
+        self.model_name = model_name
+        self.config = config
+        
+        # Load the original model
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, config=config)
+        
+        # We will replace specific Linear layers in the FFN blocks with our custom fused kernel.
+        # Reformer uses a chunked feed forward network. The standard PyTorch implementation 
+        # does: x -> Linear1 -> Gelu -> Linear2.
+        # We can fuse Linear1 + Gelu into one kernel to save memory writes/reads between these steps.
+        
+        # Identify the FFN layers in the Reformer model structure.
+        # ReformerModelForCausalLM contains ReformerModel which contains ReformerStack.
+        # Each layer has a chunked_feed_forward module.
+        
+        self._replace_ffn_layers()
+
+    def _replace_ffn_layers(self):
+        """
+        Traverse the model and replace standard Linear layers in FFN blocks 
+        with custom modules that use the fused CUDA kernel.
+        Note: This is a simplified replacement strategy. In a real scenario, 
+        we would wrap the entire FFN block or carefully intercept the forward pass.
+        Here, we replace the first linear layer of the FFN to demonstrate the fusion.
+        """
+        # Reformer's FFN structure: 
+        # self.chunked_feed_forward = ChunkedFeedForward(...)
+        # Inside ChunkedFeedForward:
+        #   self.dense_h_to_4h = nn.Linear(config.hidden_size, config.ffn_dim)
+        #   self.act = ACT2FN[config.activation_function] (e.g., gelu_pytorch_tanh)
+        #   self.dense_4h_to_h = nn.Linear(config.ffn_dim, config.hidden_size)
+        
+        # We will replace the dense_h_to_4h linear layer with a custom module that uses our fused kernel.
+        # However, since we need to keep the model structure compatible, we'll create a wrapper.
+        
+        for name, module in self.model.named_modules():
+            if isinstance(module, torch.nn.Linear):
+                # Heuristic: Replace Linear layers that are likely part of FFN (large dimensions)
+                # Or specifically target known Reformer FFN layers by name pattern if possible.
+                # For generality, let's just replace ALL linear layers with a custom wrapper 
+                # that uses the fused kernel IF it has a bias and is followed by an activation in the original graph?
+                # This is tricky without modifying the forward pass logic significantly.
+                
+                # Alternative: Since we can't easily change the forward pass of the pre-trained model 
+                # without rewriting the whole class, let's assume we are building a NEW model architecture 
+                # that mimics Reformer but uses our optimized kernels for the heavy lifting.
+                # But the prompt says "replace the pytorch operators in the given architecture".
+                
+                # Let's try a different approach: Replace the entire `forward` method of the inner layers?
+                # No, that's too invasive.
+                
+                # Let's replace specific known layers by name if we can identify them.
+                # Reformer FFN layers are typically named like 'encoder.layer.X.chunked_feed_forward.dense_h_to_4h'
+                pass
+
+        # Since dynamic replacement of sub-modules in a frozen pre-trained model is complex and error-prone 
+        # without breaking the forward graph, we will create a new ModelNew that wraps the original model 
+        # but overrides the specific heavy operations if possible.
+        
+        # Actually, the best way to "replace operators" in a black-box model like this via inline CUDA 
+        # is to monkey-patch the functions or replace the modules.
+        # Let's replace the `torch.nn.functional.gelu` and `torch.matmul` calls? No, we can't intercept them easily.
+        
+        # Let's go with replacing the Linear layers in the FFN blocks specifically.
+        # We need to access the internal structure.
+        
+        if hasattr(self.model, 'encoder') and hasattr(self.model.encoder, 'layer'):
+            for layer_idx, layer_module in enumerate(self.model.encoder.layer):
+                if hasattr(layer_module, 'chunked_feed_forward'):
+                    ff = layer_module.chunked_feed_forward
+                    if hasattr(ff, 'dense_h_to_4h'):
+                        # Replace the linear layer with a custom module that uses our fused kernel
+                        old_linear = ff.dense_h_to_4h
+                        new_linear = FusedLinearGeluWrapper(old_linear.weight, old_linear.bias)
+                        ff.dense_h_to_4h = new_linear
+
+    def forward(self, x):
+        return self.model(x).logits
+
+
+class FusedLinearGeluWrapper(torch.nn.Module):
+    """
+    A wrapper around a Linear layer that uses the custom fused CUDA kernel for Linear + Gelu.
+    This assumes the next operation in the original graph was Gelu. 
+    In Reformer, dense_h_to_4h is followed by an activation (Gelu).
+    """
+    def __init__(self, weight, bias):
+        super().__init__()
+        self.weight = nn.Parameter(weight)
+        self.bias = nn.Parameter(bias) if bias is not None else None
+        
+    def forward(self, x):
+        # x shape: (batch, seq_len, hidden_size)
+        # weight shape: (ffn_dim, hidden_size)
+        # output shape: (batch, seq_len, ffn_dim)
+        
+        # Use the custom fused kernel
+        return fused_linear_gelu.fused_linear_gelu_cuda(x, self.weight, self.bias if self.bias is not None else torch.empty(0))
+
+# Re-initialize the model with the optimized structure
+model_name = "google/reformer-enwik8"
+config = AutoConfig.from_pretrained(model_name)
+vocab_size = config.vocab_size
+sequence_length = 256
+batch_size = 32
+
+def get_inputs():
+    inputs = torch.randint(0, vocab_size, (batch_size, sequence_length))
+    return [inputs]
+
+def get_init_inputs():
+    return [model_name, config]

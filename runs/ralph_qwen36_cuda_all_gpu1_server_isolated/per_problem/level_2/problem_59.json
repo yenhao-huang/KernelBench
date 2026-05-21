@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 50.767,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "0.002756",
+        "0.002755",
+        "0.002755",
+        "0.002756",
+        "0.002755"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "0.011266",
+        "0.011277",
+        "0.011261",
+        "0.011360",
+        "0.011349"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_2/problem_59.py",
+  "level": 2,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 59,
+  "problem_name": "59_Matmul_Swish_Scaling.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_2/problem_59.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

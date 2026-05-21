@@ -1,0 +1,15 @@
+{
+  "accuracy_all": 0.0,
+  "accuracy_evaluated": 0.0,
+  "compile_rate_all": 0.0,
+  "compiled": 0,
+  "completed": 270,
+  "correct": 0,
+  "evaluated": 0,
+  "expected_total": 270,
+  "is_complete": true,
+  "status_counts": {
+    "extraction_failed": 268,
+    "generation_error": 2
+  }
+}

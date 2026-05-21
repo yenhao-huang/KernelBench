@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 40.059,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "17.074623",
+        "17.073778",
+        "17.071251",
+        "17.074692",
+        "17.073412"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "99.119408",
+        "100.336342",
+        "103.290733",
+        "98.711906",
+        "103.083298"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_gemma4_cuda_all/generated_kernels/level_1/problem_80.py",
+  "level": 1,
+  "model_name": "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
+  "precision": "fp32",
+  "problem_id": 80,
+  "problem_name": "80_conv_standard_2D_square_input_asymmetric_kernel___dilated____padded__.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_gemma4_cuda_all/raw_generation/level_1/problem_80.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

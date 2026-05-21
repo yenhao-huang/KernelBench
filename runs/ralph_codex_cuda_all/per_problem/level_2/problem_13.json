@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 65.592,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "0.000487",
+        "0.000493",
+        "0.000481",
+        "0.000489",
+        "0.000496"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "0.138092",
+        "0.137602",
+        "0.137444",
+        "0.137498",
+        "0.137351"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_codex_cuda_all/generated_kernels/level_2/problem_13.py",
+  "level": 2,
+  "model_name": "codex-gpt-5.5",
+  "precision": "fp32",
+  "problem_id": 13,
+  "problem_name": "13_ConvTranspose3d_Mean_Add_Softmax_Tanh_Scaling.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_codex_cuda_all/raw_generation/level_2/problem_13.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

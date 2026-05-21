@@ -1,0 +1,202 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for a fused Linear + ReLU operation.
+# This fuses the matrix multiplication and the activation function into a single kernel launch,
+# reducing memory bandwidth pressure and kernel launch overhead.
+fused_linear_relu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Kernel for Fused Linear (MatMul) + ReLU
+__global__ void fused_linear_relu_kernel(
+    const float* __restrict__ input, 
+    const float* __restrict__ weight, 
+    const float* __restrict__ bias, 
+    float* __restrict__ output, 
+    int batch_size, 
+    int in_features, 
+    int out_features) 
+{
+    // Each thread block handles one or more output elements.
+    // We use a 2D grid mapping to threads for better occupancy and coalescing.
+    
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int bid = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (bid < batch_size && tid < out_features) {
+        float sum = 0.0f;
+        
+        // Perform the dot product for this specific output neuron and input sample
+        #pragma unroll
+        for (int i = 0; i < in_features; ++i) {
+            sum += input[bid * in_features + i] * weight[tid * in_features + i];
+        }
+        
+        // Add bias
+        if (bias != nullptr) {
+            sum += bias[tid];
+        }
+        
+        // Apply ReLU
+        output[bid * out_features + tid] = (sum > 0.0f) ? sum : 0.0f;
+    }
+}
+
+torch::Tensor fused_linear_relu_cuda(
+    torch::Tensor input, 
+    torch::Tensor weight, 
+    torch::Tensor bias) 
+{
+    auto batch_size = input.size(0);
+    auto in_features = input.size(1);
+    auto out_features = weight.size(0);
+
+    auto output = torch::zeros({batch_size, out_features}, input.options());
+
+    const int block_x = 32;
+    const int block_y = 8; // Total threads per block = 256
+    
+    dim3 block(block_x, block_y);
+    dim3 grid((out_features + block_x - 1) / block_x, (batch_size + block_y - 1) / block_y);
+
+    fused_linear_relu_kernel<<<grid, block>>>(
+        input.data_ptr<float>(), 
+        weight.data_ptr<float>(), 
+        bias.numel() > 0 ? bias.data_ptr<float>() : nullptr, 
+        output.data_ptr<float>(), 
+        batch_size, 
+        in_features, 
+        out_features
+    );
+
+    return output;
+}
+"""
+
+fused_linear_relu_cpp_source = (
+    "torch::Tensor fused_linear_relu_cuda(torch::Tensor input, torch::Tensor weight, torch::Tensor bias);"
+)
+
+# Compile the inline CUDA code for Fused Linear + ReLU
+fused_linear_relu = load_inline(
+    name="fused_linear_relu",
+    cpp_sources=fused_linear_relu_cpp_source,
+    cuda_sources=fused_linear_relu_source,
+    functions=["fused_linear_relu_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_layer_sizes, output_size):
+        """
+        :param input_size: The number of input features
+        :param hidden_layer_sizes: A list of ints containing the sizes of each hidden layer
+        :param output_size: The number of output features
+        """
+        super(ModelNew, self).__init__()
+        
+        # Store weights and biases as parameters so they are registered correctly
+        # and can be moved to GPU/CPU automatically.
+        self.layers = nn.ModuleList()
+        
+        current_input_size = input_size
+        
+        for hidden_size in hidden_layer_sizes:
+            weight = nn.Parameter(torch.randn(hidden_size, current_input_size))
+            bias = nn.Parameter(torch.zeros(hidden_size))
+            self.layers.append((weight, bias))
+            current_input_size = hidden_size
+        
+        # Final layer (usually no ReLU after the last layer in many architectures, 
+        # but following the original structure which applies Linear then potentially nothing or specific activation.
+        # The original code: layers.append(nn.Linear(current_input_size, output_size))
+        # It does NOT append a ReLU after the final linear layer.
+        weight = nn.Parameter(torch.randn(output_size, current_input_size))
+        bias = nn.Parameter(torch.zeros(output_size))
+        self.layers.append((weight, bias))
+
+    def forward(self, x):
+        """
+        :param x: The input tensor, shape (batch_size, input_size)
+        :return: The output tensor, shape (batch_size, output_size)
+        """
+        for i, (weight, bias) in enumerate(self.layers):
+            # Use the custom fused operator for all layers except potentially the last one if desired.
+            # However, to maximize speedup and consistency with the "replace operators" instruction,
+            # we can fuse even the last layer if it had an activation, or just use matmul for the last.
+            # The original architecture: Linear -> ReLU -> ... -> Linear.
+            # So all intermediate layers have ReLU. The last one does not.
+            
+            is_last_layer = (i == len(self.layers) - 1)
+            
+            if not is_last_layer:
+                # Use Fused Linear + ReLU for hidden layers
+                x = fused_linear_relu.fused_linear_relu_cuda(x, weight, bias)
+            else:
+                # Standard MatMul + Bias Add for the final layer (no ReLU in original spec)
+                # We can still use a custom kernel or just torch.mm. 
+                # To keep it simple and robust, we use standard torch operations for the very last step 
+                # as it's often negligible compared to the hidden layers, or implement a simple matmul kernel.
+                # Let's implement a simple fused matmul+add bias kernel for the last layer too for completeness.
+                
+                batch_size = x.size(0)
+                out_features = weight.size(0)
+                in_features = weight.size(1)
+                
+                output = torch.zeros(batch_size, out_features, device=x.device, dtype=x.dtype)
+                
+                block_size = 256
+                num_blocks = (batch_size * out_features + block_size - 1) // block_size
+                
+                # Simple kernel for last layer: y = xW^T + b
+                matmul_bias_kernel_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void matmul_bias_kernel(
+    const float* __restrict__ input, 
+    const float* __restrict__ weight, 
+    const float* __restrict__ bias, 
+    float* __restrict__ output, 
+    int batch_size, 
+    int in_features, 
+    int out_features) 
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * out_features;
+
+    if (idx < total_elements) {
+        int b = idx / out_features;
+        int o = idx % out_features;
+        
+        float sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < in_features; ++i) {
+            sum += input[b * in_features + i] * weight[o * in_features + i];
+        }
+        output[idx] = sum + bias[o];
+    }
+}
+                """
+                
+                # Since we can't easily load inline code inside the forward pass efficiently without caching,
+                # and to ensure the code is self-contained and compiles cleanly as requested,
+                # we will rely on the previously loaded `fused_linear_relu` logic but strip ReLU for the last layer?
+                # Actually, the simplest high-performance approach for the last layer in this specific constrained environment
+                # is to just use standard PyTorch matmul if the overhead of custom kernel compilation/launch isn't worth it 
+                # for a single layer. However, the prompt asks to optimize.
+                
+                # Let's stick to the fused_linear_relu for hidden layers and use standard torch for the last one 
+                # to ensure stability, OR implement a separate simple matmul kernel.
+                # Given the "complete freedom", let's just use standard torch for the final layer to avoid 
+                # complex inline code duplication in forward(). The speedup comes from fusing the ReLUs.
+                
+                x = torch.mm(x, weight.t()) + bias
+                
+        return x

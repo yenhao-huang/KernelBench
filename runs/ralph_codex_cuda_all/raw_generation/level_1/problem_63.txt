@@ -1,0 +1,192 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+conv2d_cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void conv2d_3x3_s1p0_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ y,
+    int N, int C, int H, int W, int OC, int OH, int OW, int has_bias
+) {
+    int ow = blockIdx.x * blockDim.x + threadIdx.x;
+    int oh = blockIdx.y * blockDim.y + threadIdx.y;
+    int noz = blockIdx.z;
+    int oc = noz % OC;
+    int n = noz / OC;
+
+    if (ow >= OW || oh >= OH) return;
+
+    float acc = has_bias ? b[oc] : 0.0f;
+
+    #pragma unroll
+    for (int ic = 0; ic < 16; ++ic) {
+        const float* xp = x + ((n * C + ic) * H + oh) * W + ow;
+        const float* wp = w + ((oc * C + ic) * 3) * 3;
+
+        acc += xp[0] * wp[0];
+        acc += xp[1] * wp[1];
+        acc += xp[2] * wp[2];
+
+        acc += xp[W + 0] * wp[3];
+        acc += xp[W + 1] * wp[4];
+        acc += xp[W + 2] * wp[5];
+
+        acc += xp[2 * W + 0] * wp[6];
+        acc += xp[2 * W + 1] * wp[7];
+        acc += xp[2 * W + 2] * wp[8];
+    }
+
+    y[((n * OC + oc) * OH + oh) * OW + ow] = acc;
+}
+
+__global__ void conv2d_general_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ y,
+    int N, int C, int H, int W, int OC, int K,
+    int stride, int padding, int dilation, int groups,
+    int OH, int OW, int has_bias
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * OC * OH * OW;
+    if (idx >= total) return;
+
+    int ow = idx % OW;
+    int t = idx / OW;
+    int oh = t % OH;
+    t /= OH;
+    int oc = t % OC;
+    int n = t / OC;
+
+    int oc_per_g = OC / groups;
+    int c_per_g = C / groups;
+    int g = oc / oc_per_g;
+    int c_start = g * c_per_g;
+
+    float acc = has_bias ? b[oc] : 0.0f;
+
+    for (int icg = 0; icg < c_per_g; ++icg) {
+        int ic = c_start + icg;
+        for (int kh = 0; kh < K; ++kh) {
+            int ih = oh * stride - padding + kh * dilation;
+            if (ih < 0 || ih >= H) continue;
+            for (int kw = 0; kw < K; ++kw) {
+                int iw = ow * stride - padding + kw * dilation;
+                if (iw < 0 || iw >= W) continue;
+                float xv = x[((n * C + ic) * H + ih) * W + iw];
+                float wv = w[(((oc * c_per_g + icg) * K + kh) * K + kw)];
+                acc += xv * wv;
+            }
+        }
+    }
+
+    y[idx] = acc;
+}
+
+torch::Tensor conv2d_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int stride,
+    int padding,
+    int dilation,
+    int groups
+) {
+    int N = x.size(0);
+    int C = x.size(1);
+    int H = x.size(2);
+    int W = x.size(3);
+    int OC = weight.size(0);
+    int K = weight.size(2);
+    int OH = (H + 2 * padding - dilation * (K - 1) - 1) / stride + 1;
+    int OW = (W + 2 * padding - dilation * (K - 1) - 1) / stride + 1;
+
+    auto y = torch::empty({N, OC, OH, OW}, x.options());
+    int has_bias = bias.numel() > 0;
+
+    if (C == 16 && K == 3 && stride == 1 && padding == 0 && dilation == 1 && groups == 1) {
+        dim3 block(16, 16);
+        dim3 grid((OW + 15) / 16, (OH + 15) / 16, N * OC);
+        conv2d_3x3_s1p0_kernel<<<grid, block>>>(
+            x.data_ptr<float>(), weight.data_ptr<float>(),
+            has_bias ? bias.data_ptr<float>() : nullptr,
+            y.data_ptr<float>(), N, C, H, W, OC, OH, OW, has_bias
+        );
+    } else {
+        int total = N * OC * OH * OW;
+        int block = 256;
+        int grid = (total + block - 1) / block;
+        conv2d_general_kernel<<<grid, block>>>(
+            x.data_ptr<float>(), weight.data_ptr<float>(),
+            has_bias ? bias.data_ptr<float>() : nullptr,
+            y.data_ptr<float>(), N, C, H, W, OC, K,
+            stride, padding, dilation, groups, OH, OW, has_bias
+        );
+    }
+
+    return y;
+}
+"""
+
+conv2d_cpp_source = "torch::Tensor conv2d_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, int stride, int padding, int dilation, int groups);"
+
+conv2d_ext = load_inline(
+    name="custom_conv2d_kernelbench_fp32",
+    cpp_sources=conv2d_cpp_source,
+    cuda_sources=conv2d_cuda_source,
+    functions=["conv2d_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        dilation: int = 1,
+        groups: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.conv2d = nn.Conv2d(
+            in_channels,
+            out_channels,
+            (kernel_size, kernel_size),
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+        )
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+        self._ext = conv2d_ext
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bias = self.conv2d.bias
+        if bias is None:
+            bias = self.conv2d.weight.new_empty((0,))
+        return self._ext.conv2d_cuda(
+            x,
+            self.conv2d.weight,
+            bias,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.groups,
+        )
+```

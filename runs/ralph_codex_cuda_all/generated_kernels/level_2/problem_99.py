@@ -1,0 +1,168 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cpp_sources = """
+torch::Tensor fused_linear_gelu_softmax_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias);
+"""
+
+cuda_sources = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+#define TILE 16
+
+__device__ __forceinline__ float gelu_exact(float x) {
+    return 0.5f * x * (1.0f + erff(x * 0.7071067811865475f));
+}
+
+__global__ void linear_gelu_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ y,
+    int M,
+    int K,
+    int N
+) {
+    __shared__ float xs[TILE][TILE];
+    __shared__ float ws[TILE][TILE];
+
+    int row = blockIdx.y * TILE + threadIdx.y;
+    int col = blockIdx.x * TILE + threadIdx.x;
+
+    float acc = 0.0f;
+
+    for (int t = 0; t < K; t += TILE) {
+        int x_col = t + threadIdx.x;
+        int w_col = t + threadIdx.y;
+
+        xs[threadIdx.y][threadIdx.x] = (row < M && x_col < K) ? x[row * K + x_col] : 0.0f;
+        ws[threadIdx.y][threadIdx.x] = (col < N && w_col < K) ? w[col * K + w_col] : 0.0f;
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE; ++i) {
+            acc += xs[threadIdx.y][i] * ws[i][threadIdx.x];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        float v = acc + b[col];
+        y[row * N + col] = gelu_exact(v);
+    }
+}
+
+__global__ void softmax_rows_kernel(
+    const float* __restrict__ inp,
+    float* __restrict__ out,
+    int M,
+    int N
+) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    __shared__ float smem[256];
+
+    float local_max = -INFINITY;
+    for (int col = tid; col < N; col += blockDim.x) {
+        float v = inp[row * N + col];
+        local_max = fmaxf(local_max, v);
+    }
+
+    smem[tid] = local_max;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] = fmaxf(smem[tid], smem[tid + stride]);
+        }
+        __syncthreads();
+    }
+
+    float maxv = smem[0];
+
+    float local_sum = 0.0f;
+    for (int col = tid; col < N; col += blockDim.x) {
+        local_sum += expf(inp[row * N + col] - maxv);
+    }
+
+    smem[tid] = local_sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            smem[tid] += smem[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    float inv_sum = 1.0f / smem[0];
+
+    for (int col = tid; col < N; col += blockDim.x) {
+        out[row * N + col] = expf(inp[row * N + col] - maxv) * inv_sum;
+    }
+}
+
+torch::Tensor fused_linear_gelu_softmax_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias) {
+    x = x.contiguous();
+    weight = weight.contiguous();
+    bias = bias.contiguous();
+
+    const int M = x.size(0);
+    const int K = x.size(1);
+    const int N = weight.size(0);
+
+    auto temp = torch::empty({M, N}, x.options());
+    auto out = torch::empty({M, N}, x.options());
+
+    dim3 block(TILE, TILE);
+    dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
+
+    linear_gelu_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        temp.data_ptr<float>(),
+        M,
+        K,
+        N
+    );
+
+    softmax_rows_kernel<<<M, 256>>>(
+        temp.data_ptr<float>(),
+        out.data_ptr<float>(),
+        M,
+        N
+    );
+
+    return out;
+}
+"""
+
+_fused_linear_gelu_softmax = load_inline(
+    name="fused_linear_gelu_softmax_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["fused_linear_gelu_softmax_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.ops = _fused_linear_gelu_softmax
+
+    def forward(self, x):
+        return self.ops.fused_linear_gelu_softmax_cuda(
+            x,
+            self.linear.weight,
+            self.linear.bias,
+        )

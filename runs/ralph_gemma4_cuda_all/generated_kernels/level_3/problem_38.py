@@ -1,0 +1,111 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# The optimization strategy focuses on the bottleneck: the transition from the LSTM output 
+# to the Linear layer. In the original model, 'out[:, -1, :]' creates a slice/copy of the 
+# last time step's hidden states, which are then passed to a Linear layer.
+# We can fuse the "last-step selection" and the "Linear projection" into a single CUDA kernel.
+# This reduces memory bandwidth usage by avoiding the materialization of the intermediate 
+# sliced tensor and combines the indexing with the matrix multiplication logic.
+
+# However, since the LSTM itself is a highly complex kernel (cuDNN), the most effective 
+# way to speed up this specific architecture without rewriting cuDNN is to optimize 
+# the post-processing. We implement a fused kernel that performs:
+# 1. Indexing the last time step of the bidirectional LSTM output.
+# 2. Performing the Matrix-Vector multiplication (Linear layer) directly.
+
+fused_linear_last_step_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Fused kernel: extracts the last time step and performs Linear projection
+// out = x_last * weight.T + bias
+__global__ void fused_linear_last_step_kernel(
+    const float* __restrict__ lstm_out, // [batch, seq, hidden*2]
+    const float* __restrict__ weight,   // [output_size, hidden*2]
+    const float* __restrict__ bias,     // [output_size]
+    float* __restrict__ out,            // [batch, output_size]
+    int batch_size,
+    int seq_len,
+    int hidden_dim_2,
+    int output_size) 
+{
+    int b = blockIdx.x; // Each block handles one batch element
+    int row = threadIdx.x; // Each thread handles one output feature
+
+    if (b < batch_size && row < output_size) {
+        float sum = 0.0f;
+        // Pointer to the last time step for this batch element
+        // Index: b * (seq_len * hidden_dim_2) + (seq_len - 1) * hidden_dim_2
+        const float* last_step_ptr = lstm_out + b * seq_len * hidden_dim_2 + (seq_len - 1) * hidden_dim_2;
+        
+        for (int i = 0; i < hidden_dim_2; ++i) {
+            sum += last_step_ptr[i] * weight[row * hidden_dim_2 + i];
+        }
+        
+        out[b * output_size + row] = sum + bias[row];
+    }
+}
+
+torch::Tensor fused_linear_last_step_cuda(torch::Tensor lstm_out, torch::Tensor weight, torch::Tensor bias) {
+    const int batch_size = lstm_out.size(0);
+    const int seq_len = lstm_out.size(1);
+    const int hidden_dim_2 = lstm_out.size(2);
+    const int output_size = weight.size(0);
+
+    auto out = torch::empty({batch_size, output_size}, lstm_out.options());
+
+    // We use one block per batch element to ensure coalesced access to the last_step_ptr
+    // and parallelize across output features.
+    dim3 blocks(batch_size);
+    dim3 threads(output_size);
+
+    // Note: For very large output_size, one might need a 2D grid or a different tiling strategy.
+    // For typical output_size (e.g., 10-1000), this is efficient.
+    fused_linear_last_step_kernel<<<blocks, threads>>>(
+        lstm_out.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        seq_len,
+        hidden_dim_2,
+        output_size
+    );
+
+    return out;
+}
+"""
+
+fused_linear_last_step_cpp_source = (
+    "torch::Tensor fused_linear_last_step_cuda(torch::Tensor lstm_out, torch::Tensor weight, torch::Tensor bias);"
+)
+
+fused_op = load_inline(
+    name="fused_linear_last_step",
+    cpp_sources=fused_linear_last_step_cpp_source,
+    cuda_sources=fused_linear_last_step_source,
+    functions=["fused_linear_last_step_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.0):
+        super(ModelNew, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout, bidirectional=True)
+        self.fc = nn.Linear(hidden_size * 2, output_size)
+        self.fused_op = fused_op
+
+    def forward(self, x, h0, c0):
+        # LSTM remains standard as it uses highly optimized cuDNN kernels
+        out, hn = self.lstm(x, (h0, c0))
+        
+        # Instead of: out = self.fc(out[:, -1, :])
+        # We use the fused kernel to avoid the slicing overhead and combine indexing with matmul
+        # out shape: [batch, seq, hidden*2]
+        # weight shape: [output_size, hidden*2]
+        # bias shape: [output_size]
+        out = self.fused_op.fused_linear_last_step_cuda(out, self.fc.weight, self.fc.bias)
+        
+        return out

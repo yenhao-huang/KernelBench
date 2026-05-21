@@ -1,0 +1,233 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+attn_cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+#include <vector>
+
+#define C 128
+#define HDS 4
+#define DH 32
+#define BATCH 2
+#define THREADS 128
+
+__device__ __forceinline__ float warp_reduce_sum(float v) {
+    for (int offset = 16; offset > 0; offset >>= 1) v += __shfl_down_sync(0xffffffff, v, offset);
+    return v;
+}
+
+__global__ void mha_online_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ wqkv,
+    const float* __restrict__ bqkv,
+    float* __restrict__ ctx,
+    int S
+) {
+    int qpos = blockIdx.x;
+    int bh = blockIdx.y;
+    int b = bh / HDS;
+    int h = bh - b * HDS;
+    int tid = threadIdx.x;
+
+    __shared__ float q[DH];
+    __shared__ float red[4];
+
+    if (tid < DH) {
+        int oc = h * DH + tid;
+        float acc = bqkv[oc];
+        const float* wr = wqkv + oc * C;
+        for (int c = 0; c < C; ++c) {
+            acc += wr[c] * x[((b * C + c) * S) + qpos];
+        }
+        q[tid] = acc;
+    }
+    __syncthreads();
+
+    float m = -3.402823466e38f;
+    float l = 0.0f;
+    float out[DH];
+    #pragma unroll
+    for (int i = 0; i < DH; ++i) out[i] = 0.0f;
+
+    const float scale = 0.1767766952966369f;
+
+    for (int kpos = 0; kpos < S; ++kpos) {
+        float partial = 0.0f;
+        if (tid < DH) {
+            int oc = C + h * DH + tid;
+            float kval = bqkv[oc];
+            const float* wr = wqkv + oc * C;
+            for (int c = 0; c < C; ++c) {
+                kval += wr[c] * x[((b * C + c) * S) + kpos];
+            }
+            partial = q[tid] * kval;
+        }
+
+        float sum = warp_reduce_sum(partial);
+        if ((tid & 31) == 0) red[tid >> 5] = sum;
+        __syncthreads();
+
+        float score = 0.0f;
+        if (tid < 4) score = red[tid];
+        if (tid < 32) score = warp_reduce_sum(score);
+        score = __shfl_sync(0xffffffff, score, 0) * scale;
+
+        float nm = fmaxf(m, score);
+        float alpha = expf(m - nm);
+        float beta = expf(score - nm);
+        float nl = l * alpha + beta;
+
+        for (int d = tid; d < DH; d += blockDim.x) {
+            int oc = 2 * C + h * DH + d;
+            float vval = bqkv[oc];
+            const float* wrv = wqkv + oc * C;
+            for (int c = 0; c < C; ++c) {
+                vval += wrv[c] * x[((b * C + c) * S) + kpos];
+            }
+            out[d] = out[d] * alpha + beta * vval;
+        }
+        m = nm;
+        l = nl;
+        __syncthreads();
+    }
+
+    for (int d = tid; d < DH; d += blockDim.x) {
+        ctx[((b * C + h * DH + d) * S) + qpos] = out[d] / l;
+    }
+}
+
+__global__ void outproj_ln_kernel(
+    const float* __restrict__ ctx,
+    const float* __restrict__ x,
+    const float* __restrict__ wo,
+    const float* __restrict__ bo,
+    const float* __restrict__ lnw,
+    const float* __restrict__ lnb,
+    float* __restrict__ y,
+    int S
+) {
+    int idx = blockIdx.x;
+    int b = idx / S;
+    int pos = idx - b * S;
+    int tid = threadIdx.x;
+
+    __shared__ float vals[C];
+    __shared__ float rsum[4];
+
+    float v = 0.0f;
+    if (tid < C) {
+        float acc = bo[tid];
+        const float* wr = wo + tid * C;
+        for (int c = 0; c < C; ++c) {
+            acc += wr[c] * ctx[((b * C + c) * S) + pos];
+        }
+        acc += x[((b * C + tid) * S) + pos];
+        vals[tid] = acc;
+        v = acc;
+    }
+    __syncthreads();
+
+    float s = (tid < C) ? v : 0.0f;
+    s = warp_reduce_sum(s);
+    if ((tid & 31) == 0) rsum[tid >> 5] = s;
+    __syncthreads();
+
+    float mean = 0.0f;
+    if (tid < 4) mean = rsum[tid];
+    if (tid < 32) mean = warp_reduce_sum(mean);
+    mean = __shfl_sync(0xffffffff, mean, 0) * (1.0f / 128.0f);
+
+    float ds = 0.0f;
+    if (tid < C) {
+        float d = vals[tid] - mean;
+        ds = d * d;
+    }
+    ds = warp_reduce_sum(ds);
+    if ((tid & 31) == 0) rsum[tid >> 5] = ds;
+    __syncthreads();
+
+    float var = 0.0f;
+    if (tid < 4) var = rsum[tid];
+    if (tid < 32) var = warp_reduce_sum(var);
+    var = __shfl_sync(0xffffffff, var, 0) * (1.0f / 128.0f);
+    float inv = rsqrtf(var + 1.0e-5f);
+
+    if (tid < C) {
+        y[((b * C + tid) * S) + pos] = (vals[tid] - mean) * inv * lnw[tid] + lnb[tid];
+    }
+}
+
+torch::Tensor attention_block_cuda(
+    torch::Tensor x,
+    torch::Tensor in_w,
+    torch::Tensor in_b,
+    torch::Tensor out_w,
+    torch::Tensor out_b,
+    torch::Tensor ln_w,
+    torch::Tensor ln_b
+) {
+    int B = x.size(0);
+    int S = x.size(2) * x.size(3);
+    auto flat = x.contiguous().view({B, C, S});
+    auto ctx = torch::empty_like(flat);
+    auto y = torch::empty_like(flat);
+
+    dim3 grid1(S, B * HDS);
+    mha_online_kernel<<<grid1, THREADS>>>(
+        flat.data_ptr<float>(),
+        in_w.data_ptr<float>(),
+        in_b.data_ptr<float>(),
+        ctx.data_ptr<float>(),
+        S
+    );
+
+    outproj_ln_kernel<<<B * S, THREADS>>>(
+        ctx.data_ptr<float>(),
+        flat.data_ptr<float>(),
+        out_w.data_ptr<float>(),
+        out_b.data_ptr<float>(),
+        ln_w.data_ptr<float>(),
+        ln_b.data_ptr<float>(),
+        y.data_ptr<float>(),
+        S
+    );
+
+    return y.view_as(x);
+}
+"""
+
+attn_cpp_source = "torch::Tensor attention_block_cuda(torch::Tensor x, torch::Tensor in_w, torch::Tensor in_b, torch::Tensor out_w, torch::Tensor out_b, torch::Tensor ln_w, torch::Tensor ln_b);"
+
+attention_block_ext = load_inline(
+    name="attention_block_inline_cuda_fp32",
+    cpp_sources=attn_cpp_source,
+    cuda_sources=attn_cuda_source,
+    functions=["attention_block_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.ext = attention_block_ext
+
+    def forward(self, x):
+        return self.ext.attention_block_cuda(
+            x,
+            self.attn.in_proj_weight,
+            self.attn.in_proj_bias,
+            self.attn.out_proj.weight,
+            self.attn.out_proj.bias,
+            self.norm.weight,
+            self.norm.bias,
+        )
+```

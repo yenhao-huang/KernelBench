@@ -1,0 +1,25 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 53.165,
+  "error": "Isolated KernelBench evaluator failed.",
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_4/problem_7.py",
+  "isolated_eval": {
+    "error": "randn() received an invalid combination of arguments - got (NoneType, int), but expected one of:\n * (tuple of ints size, *, torch.Generator generator, tuple of names names, torch.dtype dtype = None, torch.layout layout = None, torch.device device = None, bool pin_memory = False, bool requires_grad = False)\n * (tuple of ints size, *, torch.Generator generator, Tensor out = None, torch.dtype dtype = None, torch.layout layout = None, torch.device device = None, bool pin_memory = False, bool requires_grad = False)\n * (tuple of ints size, *, Tensor out = None, torch.dtype dtype = None, torch.layout layout = None, torch.device device = None, bool pin_memory = False, bool requires_grad = False)\n * (tuple of ints size, *, tuple of names names, torch.dtype dtype = None, torch.layout layout = None, torch.device device = None, bool pin_memory = False, bool requires_grad = False)\n",
+    "error_type": "builtins.TypeError",
+    "ok": false,
+    "subprocess_output_tail": "Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.\n\nLoading weights:   0%|          | 0/148 [00:00<?, ?it/s]\nLoading weights: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 148/148 [00:00<00:00, 2447.11it/s]\n",
+    "subprocess_returncode": 0,
+    "traceback": "Traceback (most recent call last):\n  File \"<string>\", line 18, in <module>\n  File \"/workspace/external/KernelBench/src/kernelbench/eval.py\", line 562, in eval_kernel_against_ref\n    custom_model = ModelNew(*init_inputs)\n  File \"<string>\", line 214, in __init__\n  File \"<string>\", line 214, in <listcomp>\n  File \"<string>\", line 193, in __init__\n  File \"<string>\", line 135, in __init__\n  File \"<string>\", line 110, in __init__\nTypeError: randn() received an invalid combination of arguments - got (NoneType, int), but expected one of:\n * (tuple of ints size, *, torch.Generator generator, tuple of names names, torch.dtype dtype = None, torch.layout layout = None, torch.device device = None, bool pin_memory = False, bool requires_grad = False)\n * (tuple of ints size, *, torch.Generator generator, Tensor out = None, torch.dtype dtype = None, torch.layout layout = None, torch.device device = None, bool pin_memory = False, bool requires_grad = False)\n * (tuple of ints size, *, Tensor out = None, torch.dtype dtype = None, torch.layout layout = None, torch.device device = None, bool pin_memory = False, bool requires_grad = False)\n * (tuple of ints size, *, tuple of names names, torch.dtype dtype = None, torch.layout layout = None, torch.device device = None, bool pin_memory = False, bool requires_grad = False)\n\n"
+  },
+  "level": 4,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 7,
+  "problem_name": "7_gpt2_bs32_seq256.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_4/problem_7.txt",
+  "static_warnings": [
+    "Uses torch computation op: torch.matmul"
+  ],
+  "status": "evaluation_error"
+}

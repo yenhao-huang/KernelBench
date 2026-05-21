@@ -1,0 +1,75 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void mish_add_hardtanh_scale_kernel(float* x, long n, float add_value, float scale) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float v = x[idx];
+        float sp;
+        if (v > 20.0f) {
+            sp = v;
+        } else if (v < -20.0f) {
+            sp = expf(v);
+        } else {
+            sp = log1pf(expf(v));
+        }
+        float y = v * tanhf(sp);
+        y += add_value;
+        y = fminf(1.0f, fmaxf(-1.0f, y));
+        x[idx] = y * scale;
+    }
+}
+
+torch::Tensor mish_add_hardtanh_scale_cuda(torch::Tensor x, double add_value, double scale) {
+    const long n = x.numel();
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+    mish_add_hardtanh_scale_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        n,
+        static_cast<float>(add_value),
+        static_cast<float>(scale)
+    );
+    return x;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor mish_add_hardtanh_scale_cuda(torch::Tensor x, double add_value, double scale);
+"""
+
+fused_activation = load_inline(
+    name="fused_mish_add_hardtanh_scale_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["mish_add_hardtanh_scale_cuda"],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, add_value, scale):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            output_padding,
+        )
+        self.add_value = add_value
+        self.scale = scale
+        self.fused_activation = fused_activation
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        return self.fused_activation.mish_add_hardtanh_scale_cuda(x, self.add_value, self.scale)
+```

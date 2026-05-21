@@ -1,0 +1,17 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 21.619,
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_4/problem_18.py",
+  "level": 4,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 18,
+  "problem_name": "18_EleutherAI-gpt-neo-2p7B_bs512_seq32.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_4/problem_18.txt",
+  "static_errors": [
+    "Contains try-except block (potential fallback bypass)"
+  ],
+  "static_warnings": [],
+  "status": "static_failed"
+}

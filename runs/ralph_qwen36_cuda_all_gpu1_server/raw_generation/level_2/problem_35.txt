@@ -1,0 +1,130 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for the fused operation: Conv2d -> Subtract -> HardSwish -> MaxPool -> Mish
+# Note: Standard Conv2d is complex to implement from scratch efficiently in a single inline block without cuDNN.
+# However, the prompt asks to replace operators to get speedups. 
+# The most significant potential for fusion here is the post-processing chain: Subtract -> HardSwish -> MaxPool -> Mish.
+# But MaxPool is usually handled well by PyTorch/cuDNN. 
+# Let's focus on fusing the element-wise operations and potentially replacing the standard Conv if we were to write a custom one, 
+# but writing a high-performance custom Conv2d from scratch in inline CUDA is extremely verbose and error-prone compared to cuDNN.
+# A better strategy for "speedups" in this specific chain without external libraries like Triton or CUTLASS is to fuse the 
+# element-wise operations (Subtract, HardSwish, Mish) and potentially optimize the MaxPool if needed.
+# However, PyTorch's built-in ops are already quite optimized. 
+# To demonstrate "custom CUDA operators" as requested, we will create a fused kernel for the sequence:
+# x = x - val; x = hardswish(x); x = mish(x).
+# We will leave Conv2d and MaxPool2d to PyTorch's optimized implementations (cuDNN/cuBLAS) as writing a faster custom Conv2d 
+# from scratch in inline CUDA is generally not feasible for general cases compared to cuDNN.
+# Actually, let's look at the operations:
+# 1. Conv2d (Heavy compute, usually best left to cuDNN)
+# 2. Subtract (Element-wise)
+# 3. HardSwish (Element-wise)
+# 4. MaxPool2d (Spatial reduction)
+# 5. Mish (Element-wise)
+
+# We can fuse steps 2, 3, and 5 into a single kernel to reduce memory bandwidth overhead between these element-wise ops.
+# Step 4 (MaxPool) is spatially dependent and harder to fuse with subsequent element-wise ops in the same pass without 
+# significant complexity. However, we can fuse Subtract -> HardSwish -> Mish before or after pooling if the shapes allow.
+# Let's fuse: Subtract -> HardSwish -> Mish into one kernel. We will apply this AFTER pooling for simplicity of shape handling,
+# or BEFORE. The original code does: Conv -> Sub -> HS -> Pool -> Mish.
+# So we can fuse Sub + HS into one kernel, and then Mish is separate? Or fuse all three?
+# Let's fuse Sub + HS + Mish into a single kernel that operates on the tensor after Conv and before Pool? 
+# No, Pool changes spatial dimensions.
+# Original: x = conv(x); x = x - val; x = hardswish(x); x = pool(x); x = mish(x).
+# We can fuse `x - val` and `hardswish(x)` into one kernel. Then let PyTorch handle Pool. Then Mish.
+# Or, we can fuse `hardswish` and `mish`? No, they are separated by Pool.
+# Let's try to fuse the entire post-conv sequence if possible, but Pool breaks the element-wise nature.
+# Best bet for a clear "custom operator" speedup in this specific small chain is to fuse the element-wise ops that are adjacent.
+# Adjacent: Subtract and HardSwish.
+# Then Mish is after Pool.
+# Let's create a fused kernel for `Subtract + HardSwish`.
+
+fused_sub_hardswish_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__device__ __forceinline__ float hardswish(float x) {
+    return x * fminf(fmaxf(x + 3.0f, 0.0f), 6.0f) / 6.0f;
+}
+
+__global__ void fused_sub_hardswish_kernel(const float* input, const float subtract_val, float* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float val = input[idx] - subtract_val;
+        output[idx] = hardswish(val);
+    }
+}
+
+torch::Tensor fused_sub_hardswish_cuda(torch::Tensor input, float subtract_value) {
+    auto size = input.numel();
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    fused_sub_hardswish_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), subtract_value, output.data_ptr<float>(), size);
+
+    return output;
+}
+"""
+
+fused_sub_hardswish_cpp_source = (
+    "torch::Tensor fused_sub_hardswish_cuda(torch::Tensor input, float subtract_value);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_sub_hardswish",
+    cpp_sources=fused_sub_hardswish_cpp_source,
+    cuda_sources=fused_sub_hardswish_source,
+    functions=["fused_sub_hardswish_cuda"],
+    verbose=False,
+    extra_cflags=["-O2"],
+    extra_ldflags=[""]
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model using custom CUDA operators for fused element-wise operations.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, subtract_value, pool_kernel_size):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.subtract_value = subtract_value
+        self.pool = nn.MaxPool2d(pool_kernel_size)
+
+    def forward(self, x):
+        # 1. Convolution (Kept as PyTorch/cuDNN for optimal performance on large tensors)
+        x = self.conv(x)
+        
+        # 2. Fused Subtract + HardSwish using custom CUDA kernel
+        x = fused_ops.fused_sub_hardswish_cuda(x, self.subtract_value)
+        
+        # 3. MaxPool (Kept as PyTorch/cuDNN)
+        x = self.pool(x)
+        
+        # 4. Mish (Element-wise, can be left to PyTorch or fused if we wanted to fuse with previous, 
+        #    but it's separated by Pool. We could potentially fuse Mish into a final kernel, 
+        #    but for this example, the main fusion gain is Sub+HS).
+        x = torch.nn.functional.mish(x)
+        
+        return x
+
+def get_inputs():
+    batch_size = 128
+    in_channels = 64
+    height = width = 128
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    batch_size = 128
+    in_channels = 64
+    out_channels = 128
+    height = width = 128
+    kernel_size = 3
+    subtract_value = 0.5
+    pool_kernel_size = 2
+    return [in_channels, out_channels, kernel_size, subtract_value, pool_kernel_size]
+```

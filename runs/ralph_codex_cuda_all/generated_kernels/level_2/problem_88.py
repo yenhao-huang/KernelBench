@@ -1,0 +1,191 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cpp_sources = """
+torch::Tensor linear_gn_swish_mul_swish_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor gn_weight,
+    torch::Tensor gn_bias,
+    torch::Tensor multiply_weight,
+    int64_t num_groups,
+    double eps
+);
+"""
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+#define TILE 16
+
+__global__ void linear_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ y,
+    int M,
+    int K,
+    int N
+) {
+    __shared__ float xs[TILE][TILE];
+    __shared__ float ws[TILE][TILE];
+
+    int row = blockIdx.y * TILE + threadIdx.y;
+    int col = blockIdx.x * TILE + threadIdx.x;
+    float acc = 0.0f;
+
+    for (int t = 0; t < K; t += TILE) {
+        int x_col = t + threadIdx.x;
+        int w_col = t + threadIdx.y;
+
+        xs[threadIdx.y][threadIdx.x] = (row < M && x_col < K) ? x[row * K + x_col] : 0.0f;
+        ws[threadIdx.y][threadIdx.x] = (col < N && w_col < K) ? w[col * K + w_col] : 0.0f;
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE; ++i) {
+            acc += xs[threadIdx.y][i] * ws[i][threadIdx.x];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        y[row * N + col] = acc + b[col];
+    }
+}
+
+__global__ void gn_swish_mul_swish_kernel(
+    const float* __restrict__ inp,
+    const float* __restrict__ gn_w,
+    const float* __restrict__ gn_b,
+    const float* __restrict__ mul_w,
+    float* __restrict__ out,
+    int M,
+    int N,
+    int G,
+    float eps
+) {
+    int row = blockIdx.x;
+    int group = blockIdx.y;
+    int tid = threadIdx.x;
+    int group_size = N / G;
+    int base = row * N + group * group_size;
+
+    __shared__ float smem[128];
+
+    float sum = 0.0f;
+    for (int i = tid; i < group_size; i += blockDim.x) {
+        sum += inp[base + i];
+    }
+    smem[tid] = sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) smem[tid] += smem[tid + stride];
+        __syncthreads();
+    }
+
+    float mean = smem[0] / (float)group_size;
+
+    float vsum = 0.0f;
+    for (int i = tid; i < group_size; i += blockDim.x) {
+        float d = inp[base + i] - mean;
+        vsum += d * d;
+    }
+    smem[tid] = vsum;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) smem[tid] += smem[tid + stride];
+        __syncthreads();
+    }
+
+    float inv_std = rsqrtf(smem[0] / (float)group_size + eps);
+
+    for (int i = tid; i < group_size; i += blockDim.x) {
+        int col = group * group_size + i;
+        float v = (inp[base + i] - mean) * inv_std;
+        v = v * gn_w[col] + gn_b[col];
+        v = v / (1.0f + expf(-v));
+        v = v * mul_w[col];
+        v = v / (1.0f + expf(-v));
+        out[base + i] = v;
+    }
+}
+
+torch::Tensor linear_gn_swish_mul_swish_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor gn_weight,
+    torch::Tensor gn_bias,
+    torch::Tensor multiply_weight,
+    int64_t num_groups,
+    double eps
+) {
+    int M = (int)x.size(0);
+    int K = (int)x.size(1);
+    int N = (int)weight.size(0);
+
+    auto tmp = torch::empty({M, N}, x.options());
+    auto out = torch::empty({M, N}, x.options());
+
+    dim3 block(TILE, TILE);
+    dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
+    linear_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        tmp.data_ptr<float>(),
+        M, K, N
+    );
+
+    dim3 gn_grid(M, (int)num_groups);
+    gn_swish_mul_swish_kernel<<<gn_grid, 128>>>(
+        tmp.data_ptr<float>(),
+        gn_weight.data_ptr<float>(),
+        gn_bias.data_ptr<float>(),
+        multiply_weight.data_ptr<float>(),
+        out.data_ptr<float>(),
+        M, N, (int)num_groups, (float)eps
+    );
+
+    return out;
+}
+"""
+
+_ext = load_inline(
+    name="linear_gn_swish_mul_swish_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["linear_gn_swish_mul_swish_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, num_groups, multiply_weight_shape):
+        super(ModelNew, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.group_norm = nn.GroupNorm(num_groups, out_features)
+        self.multiply_weight = nn.Parameter(torch.randn(multiply_weight_shape))
+        self.num_groups = num_groups
+
+    def forward(self, x):
+        return _ext.linear_gn_swish_mul_swish_cuda(
+            x,
+            self.gemm.weight,
+            self.gemm.bias,
+            self.group_norm.weight,
+            self.group_norm.bias,
+            self.multiply_weight,
+            self.num_groups,
+            self.group_norm.eps,
+        )

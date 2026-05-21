@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 42.352,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "6.139696",
+        "6.139766",
+        "6.139812",
+        "6.140163",
+        "6.139802"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "37.964363",
+        "38.165524",
+        "37.947784",
+        "39.981480",
+        "39.476879"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_gemma4_cuda_all/generated_kernels/level_1/problem_67.py",
+  "level": 1,
+  "model_name": "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
+  "precision": "fp32",
+  "problem_id": 67,
+  "problem_name": "67_conv_standard_1D.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_gemma4_cuda_all/raw_generation/level_1/problem_67.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

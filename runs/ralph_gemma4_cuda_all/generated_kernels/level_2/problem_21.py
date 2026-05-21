@@ -1,0 +1,101 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Fused kernel for: x = sigmoid(x * scale + bias)
+# This kernel handles the element-wise operations after the convolution.
+# It is highly efficient as it reduces memory bandwidth by performing 
+# multiple operations in a single pass over the data.
+fused_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_bias_scale_sigmoid_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ bias,
+    const float* __restrict__ scale,
+    float* __restrict__ output,
+    int N, int C, int H, int W) {
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C * H * W;
+
+    if (idx < total_elements) {
+        // Calculate channel index for broadcasting bias and scale
+        // input shape: (N, C, H, W)
+        // bias/scale shape: (C, 1, 1)
+        int spatial_size = H * W;
+        int channel_offset = (idx / spatial_size) % C;
+        
+        float val = input[idx];
+        val = val * scale[channel_offset] + bias[channel_offset];
+        output[idx] = 1.0f / (1.0f + expf(-val));
+    }
+}
+
+torch::Tensor fused_ops_cuda(torch::Tensor input, torch::Tensor bias, torch::Tensor scale) {
+    auto N = input.size(0);
+    auto C = input.size(1);
+    auto H = input.size(2);
+    auto W = input.size(3);
+    auto total_elements = input.numel();
+    
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    fused_bias_scale_sigmoid_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        scale.data_ptr<float>(),
+        output.data_ptr<float>(),
+        N, C, H, W
+    );
+
+    return output;
+}
+"""
+
+fused_ops_cpp_source = "torch::Tensor fused_ops_cuda(torch::Tensor input, torch::Tensor bias, torch::Tensor scale);"
+
+# Compile the inline CUDA code
+fused_ops_module = load_inline(
+    name="fused_ops_module",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_source,
+    functions=["fused_ops_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model using a custom CUDA kernel to fuse bias addition, 
+    scaling, and sigmoid activation into a single memory-efficient kernel.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, num_groups, bias_shape, scale_shape):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.bias = nn.Parameter(torch.randn(bias_shape)) 
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        self.group_norm = nn.GroupNorm(num_groups, out_channels)
+        self.fused_ops = fused_ops_module
+
+    def forward(self, x):
+        # 1. Standard Convolution (highly optimized in cuDNN)
+        x = self.conv(x)
+        
+        # 2. Fused Bias + Scale + Sigmoid
+        # This replaces:
+        # x = x + self.bias
+        # x = x * self.scale
+        # x = torch.sigmoid(x)
+        # By doing this in one kernel, we avoid 3 separate read/write passes to global memory.
+        x = self.fused_ops.fused_ops_cuda(x, self.bias, self.scale)
+        
+        # 3. Group Normalization
+        x = self.group_norm(x)
+        
+        return x

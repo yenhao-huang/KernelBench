@@ -1,0 +1,26 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 46.034,
+  "error": "Isolated KernelBench evaluator failed.",
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_3/problem_3.py",
+  "isolated_eval": {
+    "error": "tuple is not a Module subclass",
+    "error_type": "builtins.TypeError",
+    "ok": false,
+    "subprocess_output_tail": "",
+    "subprocess_returncode": 0,
+    "traceback": "Traceback (most recent call last):\n  File \"<string>\", line 18, in <module>\n  File \"/workspace/external/KernelBench/src/kernelbench/eval.py\", line 562, in eval_kernel_against_ref\n    custom_model = ModelNew(*init_inputs)\n  File \"<string>\", line 113, in __init__\n  File \"/workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/nn/modules/container.py\", line 478, in append\n    self.add_module(str(len(self)), module)\n  File \"/workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 653, in add_module\n    raise TypeError(f\"{torch.typename(module)} is not a Module subclass\")\nTypeError: tuple is not a Module subclass\n"
+  },
+  "level": 3,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 3,
+  "problem_name": "3_DeepNarrowMLP.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_3/problem_3.txt",
+  "static_warnings": [
+    "Uses torch computation op: torch.mm",
+    "Uses torch.nn compute layer (only containers, Parameter, init allowed)"
+  ],
+  "status": "evaluation_error"
+}

@@ -1,0 +1,141 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for matrix multiplication (GEMM)
+# This implementation uses a tiled approach with shared memory to optimize memory access patterns.
+gemm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Block dimensions for tiling
+#define BLOCK_M 128
+#define BLOCK_N 128
+#define BLOCK_K 32
+#define THREADS_PER_BLOCK 256 // 16x16 threads per block
+
+__global__ void gemm_kernel(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int M, int N, int K) {
+    // Shared memory for tiles of A and B
+    __shared__ float sA[BLOCK_M][BLOCK_K];
+    __shared__ float sB[BLOCK_K][BLOCK_N];
+
+    // Block indices
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+
+    // Thread indices within the block
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    // Calculate global row and column for this thread's contribution to C
+    int row = by * BLOCK_M + ty;
+    int col = bx * BLOCK_N + tx;
+
+    // Accumulator for the dot product
+    float sum = 0.0f;
+
+    // Loop over K dimension in tiles
+    for (int k = 0; k < K; k += BLOCK_K) {
+        // Load tile of A into shared memory
+        if (row < M && (k + tx) < K) {
+            sA[ty][tx] = A[row * K + k + tx];
+        } else {
+            sA[ty][tx] = 0.0f;
+        }
+
+        // Load tile of B into shared memory
+        if ((k + ty) < K && col < N) {
+            sB[ty][tx] = B[(k + ty) * N + col];
+        } else {
+            sB[ty][tx] = 0.0f;
+        }
+
+        // Synchronize to ensure all data is loaded
+        __syncthreads();
+
+        // Compute partial dot product for this tile
+        for (int i = 0; i < BLOCK_K; ++i) {
+            sum += sA[ty][i] * sB[i][tx];
+        }
+
+        // Synchronize before loading next tile
+        __syncthreads();
+    }
+
+    // Write result to global memory
+    if (row < M && col < N) {
+        C[row * N + col] = sum;
+    }
+}
+
+torch::Tensor gemm_cuda(torch::Tensor A, torch::Tensor B) {
+    auto M = A.size(0);
+    auto K = A.size(1);
+    auto N = B.size(1); // B is already transposed in the model call, so we treat it as (K, N)
+
+    auto out = torch::zeros({M, N}, torch::dtype(torch::kFloat32).device(torch::kCUDA));
+
+    const int block_size_x = 16;
+    const int block_size_y = 16;
+    dim3 block(block_size_x, block_size_y);
+    
+    // Grid dimensions
+    int grid_x = (N + BLOCK_N - 1) / BLOCK_N;
+    int grid_y = (M + BLOCK_M - 1) / BLOCK_M;
+    dim3 grid(grid_x, grid_y);
+
+    gemm_kernel<<<grid, block>>>(A.data_ptr<float>(), B.data_ptr<float>(), out.data_ptr<float>(), M, N, K);
+
+    return out;
+}
+"""
+
+gemm_cpp_source = (
+    "torch::Tensor gemm_cuda(torch::Tensor A, torch::Tensor B);"
+)
+
+# Compile the inline CUDA code for GEMM
+gemm = load_inline(
+    name="gemm",
+    cpp_sources=gemm_cpp_source,
+    cuda_sources=gemm_source,
+    functions=["gemm_cuda"],
+    verbose=True,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs a single matrix multiplication (C = A * B)
+    using a custom CUDA kernel.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.gemm = gemm
+
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """
+        Performs matrix multiplication using the custom CUDA kernel.
+        
+        Args:
+            A: Input tensor of shape (M, K).
+            B: Input tensor of shape (N, K). Note: The original model transposes B to (K, N).
+            
+        Returns:
+            Output tensor of shape (M, N).
+        """
+        # The original model does torch.matmul(A, B.T)
+        # This is equivalent to A @ B.T where B is (N, K), so B.T is (K, N).
+        # Our custom kernel expects A as (M, K) and B as (K, N).
+        # So we pass B directly to the kernel which treats it as (K, N) if we assume 
+        # the input B in forward is already transposed or we handle the transpose logic.
+        
+        # Looking at get_inputs: B is (N, K).
+        # Original model: torch.matmul(A, B.T) -> A(M,K) @ B.T(K,N) -> C(M,N).
+        # Our kernel gemm_cuda expects A(M,K) and B_kernel(K,N).
+        # So we need to pass B.T to our kernel.
+        
+        return self.gemm.gemm_cuda(A, B.t())

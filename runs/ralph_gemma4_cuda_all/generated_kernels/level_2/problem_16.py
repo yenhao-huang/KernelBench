@@ -1,0 +1,102 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernel to fuse Mish, Addition, Hardtanh, and Scaling
+# Mish(x) = x * tanh(softplus(x)) = x * tanh(ln(1 + exp(x)))
+# Hardtanh(x) = clamp(x, min=-1, max=1)
+# Combined: out = clamp(mish(x) + add_val, -1, 1) * scale
+fused_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__device__ __forceinline__ float mish(float x) {
+    // Mish implementation: x * tanh(softplus(x))
+    // softplus(x) = log(1 + exp(x))
+    // To avoid overflow for large x, use: if x > 20, softplus(x) approx x
+    float softplus;
+    if (x > 20.0f) {
+        softplus = x;
+    } else {
+        softplus = logf(1.0f + expf(x));
+    }
+    return x * tanhf(softplus);
+}
+
+__global__ void fused_ops_kernel(const float* __restrict__ input, 
+                                 float* __restrict__ output, 
+                                 float add_val, 
+                                 float scale, 
+                                 int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float val = input[idx];
+        // 1. Mish
+        val = mish(val);
+        // 2. Add
+        val = val + add_val;
+        // 3. Hardtanh
+        if (val < -1.0f) val = -1.0f;
+        else if (val > 1.0f) val = 1.0f;
+        // 4. Scale
+        val = val * scale;
+        
+        output[idx] = val;
+    }
+}
+
+torch::Tensor fused_ops_cuda(torch::Tensor input, float add_val, float scale) {
+    auto size = input.numel();
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    fused_ops_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(), 
+        output.data_ptr<float>(), 
+        add_val, 
+        scale, 
+        size
+    );
+
+    return output;
+}
+"""
+
+fused_ops_cpp_source = """
+torch::Tensor fused_ops_cuda(torch::Tensor input, float add_val, float scale);
+"""
+
+# Compile the inline CUDA code
+fused_ops_module = load_inline(
+    name="fused_ops_module",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_source,
+    functions=["fused_ops_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model that performs a transposed convolution, 
+    then uses a fused CUDA kernel for Mish, Addition, Hardtanh, and Scaling.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, add_value, scale):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride, padding, output_padding)
+        self.add_value = add_value
+        self.scale = scale
+        self.fused_ops = fused_ops_module
+
+    def forward(self, x):
+        # The heavy lifting of ConvTranspose2d is left to cuDNN/PyTorch
+        x = self.conv_transpose(x)
+        
+        # Fuse the element-wise operations into a single CUDA kernel to reduce 
+        # memory bandwidth usage (one read, one write instead of four)
+        # and reduce kernel launch overhead.
+        x = self.fused_ops.fused_ops_cuda(x, float(self.add_value), float(self.scale))
+        
+        return x

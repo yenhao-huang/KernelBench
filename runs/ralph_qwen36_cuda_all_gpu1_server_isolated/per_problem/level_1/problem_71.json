@@ -1,0 +1,23 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 55.076,
+  "error": "Isolated KernelBench evaluator failed.",
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_1/problem_71.py",
+  "isolated_eval": {
+    "error": "\"attribute 'bias' already exists\"",
+    "error_type": "builtins.KeyError",
+    "ok": false,
+    "subprocess_output_tail": "",
+    "subprocess_returncode": 0,
+    "traceback": "Traceback (most recent call last):\n  File \"<string>\", line 18, in <module>\n  File \"/workspace/external/KernelBench/src/kernelbench/eval.py\", line 562, in eval_kernel_against_ref\n    custom_model = ModelNew(*init_inputs)\n  File \"<string>\", line 245, in __init__\n  File \"/workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 619, in register_parameter\n    raise KeyError(f\"attribute '{name}' already exists\")\nKeyError: \"attribute 'bias' already exists\"\n"
+  },
+  "level": 1,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 71,
+  "problem_name": "71_conv_transposed_2D__asymmetric_input__square_kernel.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_1/problem_71.txt",
+  "static_warnings": [],
+  "status": "evaluation_error"
+}

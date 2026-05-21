@@ -1,0 +1,99 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+exclusive_cumsum_cpp_source = """
+torch::Tensor exclusive_cumsum_cuda(torch::Tensor x);
+"""
+
+exclusive_cumsum_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+#define ITEMS_PER_THREAD 32
+#define THREADS 1024
+
+__global__ void exclusive_cumsum_rows_kernel(const float* __restrict__ x,
+                                             float* __restrict__ out,
+                                             int rows,
+                                             int cols) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= rows) return;
+
+    __shared__ float thread_sums[THREADS];
+
+    int base = row * cols;
+    int start = tid * ITEMS_PER_THREAD;
+
+    float vals[ITEMS_PER_THREAD];
+    float running = 0.0f;
+
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        int col = start + i;
+        float v = (col < cols) ? x[base + col] : 0.0f;
+        vals[i] = running;
+        running += v;
+    }
+
+    thread_sums[tid] = running;
+    __syncthreads();
+
+    for (int offset = 1; offset < THREADS; offset <<= 1) {
+        float add = 0.0f;
+        if (tid >= offset) add = thread_sums[tid - offset];
+        __syncthreads();
+        thread_sums[tid] += add;
+        __syncthreads();
+    }
+
+    float block_prefix = (tid == 0) ? 0.0f : thread_sums[tid - 1];
+
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        int col = start + i;
+        if (col < cols) {
+            out[base + col] = block_prefix + vals[i];
+        }
+    }
+}
+
+torch::Tensor exclusive_cumsum_cuda(torch::Tensor x) {
+    auto out = torch::empty_like(x);
+    int rows = x.size(0);
+    int cols = x.size(1);
+
+    dim3 block(THREADS);
+    dim3 grid(rows);
+
+    exclusive_cumsum_rows_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        rows,
+        cols
+    );
+
+    return out;
+}
+"""
+
+exclusive_cumsum_ext = load_inline(
+    name="exclusive_cumsum_ext",
+    cpp_sources=exclusive_cumsum_cpp_source,
+    cuda_sources=exclusive_cumsum_cuda_source,
+    functions=["exclusive_cumsum_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, dim):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.exclusive_cumsum_ext = exclusive_cumsum_ext
+
+    def forward(self, x):
+        return self.exclusive_cumsum_ext.exclusive_cumsum_cuda(x)

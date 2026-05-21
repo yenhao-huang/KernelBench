@@ -1,0 +1,115 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+matmul_cpp_source = """
+torch::Tensor matmul_largek_cuda(torch::Tensor A, torch::Tensor B);
+"""
+
+matmul_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+#define TILE_M 16
+#define TILE_N 16
+#define TILE_K 32
+
+__global__ void matmul_largek_kernel(const float* __restrict__ A,
+                                     const float* __restrict__ B,
+                                     float* __restrict__ C,
+                                     int M, int N, int K) {
+    __shared__ float As[TILE_M][TILE_K];
+    __shared__ float Bs[TILE_K][TILE_N];
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int row = blockIdx.y * TILE_M + ty;
+    int col = blockIdx.x * TILE_N + tx;
+
+    float acc = 0.0f;
+
+    for (int k0 = 0; k0 < K; k0 += TILE_K) {
+        int a_col0 = k0 + tx;
+        int a_col1 = k0 + tx + TILE_N;
+
+        if (row < M && a_col0 < K) {
+            As[ty][tx] = A[row * K + a_col0];
+        } else {
+            As[ty][tx] = 0.0f;
+        }
+
+        if (row < M && a_col1 < K) {
+            As[ty][tx + TILE_N] = A[row * K + a_col1];
+        } else {
+            As[ty][tx + TILE_N] = 0.0f;
+        }
+
+        int b_row0 = k0 + ty;
+        int b_row1 = k0 + ty + TILE_M;
+
+        if (b_row0 < K && col < N) {
+            Bs[ty][tx] = B[b_row0 * N + col];
+        } else {
+            Bs[ty][tx] = 0.0f;
+        }
+
+        if (b_row1 < K && col < N) {
+            Bs[ty + TILE_M][tx] = B[b_row1 * N + col];
+        } else {
+            Bs[ty + TILE_M][tx] = 0.0f;
+        }
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int kk = 0; kk < TILE_K; ++kk) {
+            acc = fmaf(As[ty][kk], Bs[kk][tx], acc);
+        }
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = acc;
+    }
+}
+
+torch::Tensor matmul_largek_cuda(torch::Tensor A, torch::Tensor B) {
+    int M = static_cast<int>(A.size(0));
+    int K = static_cast<int>(A.size(1));
+    int N = static_cast<int>(B.size(1));
+
+    auto C = torch::empty({M, N}, A.options());
+
+    dim3 block(TILE_N, TILE_M);
+    dim3 grid((N + TILE_N - 1) / TILE_N, (M + TILE_M - 1) / TILE_M);
+
+    matmul_largek_kernel<<<grid, block>>>(
+        A.data_ptr<float>(),
+        B.data_ptr<float>(),
+        C.data_ptr<float>(),
+        M, N, K
+    );
+
+    return C;
+}
+"""
+
+matmul_largek = load_inline(
+    name="matmul_largek_inline",
+    cpp_sources=matmul_cpp_source,
+    cuda_sources=matmul_cuda_source,
+    functions=["matmul_largek_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.matmul_largek = matmul_largek
+
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        return self.matmul_largek.matmul_largek_cuda(A, B)

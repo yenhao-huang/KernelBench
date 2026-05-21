@@ -1,0 +1,171 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernel for 1x1 Convolution (Pointwise Conv)
+# This implementation fuses the matrix multiplication (GEMM) logic directly.
+# For a 1x1 conv, this is essentially a batched GEMM:
+# Input shape: (N, C_in, H, W) -> Reshaped to (N*H*W, C_in)
+# Weight shape: (C_out, C_in, 1, 1) -> Reshaped to (C_out, C_in)
+# Output shape: (N, C_out, H, W) -> Reshaped from (N*H*W, C_out)
+
+conv1d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Kernel for 1x1 Convolution with bias support
+__global__ void conv1d_kernel(
+    const float* __restrict__ input,   // [N, C_in, H, W]
+    const float* __restrict__ weight,  // [C_out, C_in, 1, 1]
+    const float* __restrict__ bias,    // [C_out] or nullptr
+    float* __restrict__ output,        // [N, C_out, H, W]
+    int N, int C_in, int C_out, int H, int W
+) {
+    // Each thread handles one element of the output tensor: (n, c_out, h, w)
+    // Total elements = N * C_out * H * W
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C_out * H * W;
+
+    if (idx >= total_elements) return;
+
+    // Decode linear index to coordinates
+    // Output layout: [N, C_out, H, W]
+    int w = idx % W;
+    int rem = idx / W;
+    int h = rem % H;
+    rem = rem / H;
+    int c_out = rem % C_out;
+    int n = rem / C_out;
+
+    // Input layout: [N, C_in, H, W]
+    // We need to sum over C_in for the current (n, h, w) and all c_out
+    
+    float sum = 0.0f;
+    
+    // Pointer arithmetic optimization:
+    // Input stride for channel is H*W
+    // Weight stride for input channel is 1 (since kernel is 1x1, weights are contiguous per output channel)
+    // Actually, weight is [C_out, C_in]. 
+    // For a fixed n, h, w, we iterate c_in.
+    
+    const float* input_ptr = input + n * C_in * H * W + h * W + w;
+    const float* weight_ptr = weight + c_out * C_in;
+
+    for (int c_in = 0; c_in < C_in; ++c_in) {
+        sum += input_ptr[c_in * H * W] * weight_ptr[c_in];
+    }
+
+    if (bias != nullptr) {
+        sum += bias[c_out];
+    }
+
+    output[idx] = sum;
+}
+
+torch::Tensor conv1d_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias) {
+    TORCH_CHECK(x.is_cuda(), "Input must be on CUDA");
+    TORCH_CHECK(weight.is_cuda(), "Weight must be on CUDA");
+    
+    auto N = x.size(0);
+    auto C_in = x.size(1);
+    auto H = x.size(2);
+    auto W = x.size(3);
+    auto C_out = weight.size(0);
+
+    TORCH_CHECK(x.dim() == 4, "Input must be 4D tensor");
+    TORCH_CHECK(weight.dim() == 4 && weight.size(2) == 1 && weight.size(3) == 1, "Weight must be 1x1 kernel");
+
+    auto output = torch::zeros({N, C_out, H, W}, x.options());
+
+    const int block_size = 256;
+    int total_elements = N * C_out * H * W;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    const float* bias_ptr = nullptr;
+    if (bias.numel() > 0) {
+        bias_ptr = bias.data_ptr<float>();
+    }
+
+    conv1d_kernel<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias_ptr,
+        output.data_ptr<float>(),
+        N, C_in, C_out, H, W
+    );
+
+    return output;
+}
+"""
+
+conv1d_cpp_source = (
+    "torch::Tensor conv1d_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias);"
+)
+
+# Compile the inline CUDA code
+conv1d_module = load_inline(
+    name="conv1d_custom",
+    cpp_sources=conv1d_cpp_source,
+    cuda_sources=conv1d_source,
+    functions=["conv1d_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized Pointwise 2D Convolution using custom CUDA operator.
+    """
+    def __init__(self, in_channels: int, out_channels: int, bias: bool = False):
+        super(ModelNew, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.bias = bias
+        
+        # Initialize weights and biases manually to match PyTorch's default initialization
+        # PyTorch Conv2d uses Kaiming uniform for weight and zeros for bias
+        self.weight = nn.Parameter(torch.empty(out_channels, in_channels, 1, 1))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_channels))
+        else:
+            self.register_parameter('bias', None)
+            
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Mimic torch.nn.init.kaiming_uniform_ for weight
+        fan_in = self.in_channels
+        if fan_in > 0:
+            bound = 1.0 / (fan_in ** 0.5)
+        else:
+            bound = float('-inf')
+        nn.init.uniform_(self.weight, -bound, bound)
+        
+        if self.bias is not None:
+            fan_in = self.in_channels
+            bound = 1.0 / (fan_in ** 0.5)
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the pointwise 2D convolution using custom CUDA kernel.
+        """
+        return conv1d_module.conv1d_cuda(x, self.weight, self.bias if self.bias is not None else torch.empty(0))
+
+# Test code setup for context (not included in output as per instructions)
+# batch_size = 16
+# in_channels = 64
+# out_channels = 128
+# width = 1024
+# height = 1024
+
+# def get_inputs():
+#     x = torch.rand(batch_size, in_channels, height, width).cuda()
+#     return [x]
+
+# def get_init_inputs():
+#     return [in_channels, out_channels]

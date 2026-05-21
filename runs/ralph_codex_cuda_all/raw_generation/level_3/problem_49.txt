@@ -1,0 +1,145 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+ssd_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void ssd_final_state_kernel(
+    const float* __restrict__ X,
+    const float* __restrict__ A,
+    const float* __restrict__ Bp,
+    const float* __restrict__ initial,
+    float* __restrict__ out,
+    int Bsz, int L, int H, int P, int N, int block_len,
+    bool has_initial
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = Bsz * H * P * N;
+    if (idx >= total) return;
+
+    int n = idx % N;
+    int t = idx / N;
+    int p = t % P;
+    t /= P;
+    int h = t % H;
+    int b = t / H;
+
+    int chunks = L / block_len;
+
+    float running = 0.0f;
+    if (has_initial) {
+        running = initial[(((b * 1) * H + h) * P + p) * N + n];
+    }
+
+    for (int c = 0; c < chunks; ++c) {
+        int base_l = c * block_len;
+
+        float sumA = 0.0f;
+        for (int l = 0; l < block_len; ++l) {
+            sumA += A[(b * L + base_l + l) * H + h];
+        }
+
+        float suffix = 0.0f;
+        float state = 0.0f;
+        for (int l = block_len - 1; l >= 0; --l) {
+            int seq = base_l + l;
+            float xval = X[(((b * L + seq) * H + h) * P) + p];
+            float bval = Bp[(((b * L + seq) * H + h) * N) + n];
+            state += bval * expf(suffix) * xval;
+            suffix += A[(b * L + seq) * H + h];
+        }
+
+        running = running * expf(sumA) + state;
+    }
+
+    out[((b * H + h) * P + p) * N + n] = running;
+}
+
+torch::Tensor ssd_final_state_cuda(
+    torch::Tensor X,
+    torch::Tensor A,
+    torch::Tensor Bp,
+    c10::optional<torch::Tensor> initial_states,
+    int64_t block_len
+) {
+    int Bsz = X.size(0);
+    int L = X.size(1);
+    int H = X.size(2);
+    int P = X.size(3);
+    int N = Bp.size(3);
+
+    auto out = torch::empty({Bsz, H, P, N}, X.options());
+    const float* initial_ptr = nullptr;
+    bool has_initial = initial_states.has_value();
+
+    if (has_initial) {
+        initial_ptr = initial_states.value().data_ptr<float>();
+    }
+
+    int total = Bsz * H * P * N;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+
+    ssd_final_state_kernel<<<blocks, threads>>>(
+        X.data_ptr<float>(),
+        A.data_ptr<float>(),
+        Bp.data_ptr<float>(),
+        initial_ptr,
+        out.data_ptr<float>(),
+        Bsz, L, H, P, N, (int)block_len,
+        has_initial
+    );
+
+    return out;
+}
+"""
+
+ssd_cpp = r"""
+#include <torch/extension.h>
+torch::Tensor ssd_final_state_cuda(
+    torch::Tensor X,
+    torch::Tensor A,
+    torch::Tensor Bp,
+    c10::optional<torch::Tensor> initial_states,
+    int64_t block_len
+);
+"""
+
+ssd_ext = load_inline(
+    name="ssd_final_state_ext",
+    cpp_sources=ssd_cpp,
+    cuda_sources=ssd_source,
+    functions=["ssd_final_state_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, batch_size, seq_length, n_heads, d_head, d_state, block_len=64):
+        super(ModelNew, self).__init__()
+        self.batch_size = batch_size
+        self.seq_length = seq_length
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.d_state = d_state
+        self.block_len = block_len
+
+        self.A = nn.Parameter(torch.randn(batch_size, seq_length, n_heads))
+        self.B = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+        self.C = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+        self.ssd_ext = ssd_ext
+
+    def forward(self, X, initial_states=None):
+        return self.ssd_ext.ssd_final_state_cuda(
+            X.contiguous(),
+            self.A.contiguous(),
+            self.B.contiguous(),
+            initial_states.contiguous() if initial_states is not None else None,
+            self.block_len,
+        )
+```

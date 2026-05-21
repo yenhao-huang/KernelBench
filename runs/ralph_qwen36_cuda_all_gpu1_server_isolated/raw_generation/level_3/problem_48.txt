@@ -1,0 +1,436 @@
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernels for Mamba optimization
+# We will fuse several operations:
+# 1. segsum: Compute the lower triangular matrix of cumulative sums efficiently.
+# 2. matmul_fused: A generic batched matmul that can be used for the einsums, 
+#    but specifically optimized for the shapes involved in Mamba (b, c, l, h, p) etc.
+#    However, writing a fully generic fused einsum is complex. Instead, we will focus on 
+#    the most expensive parts: the segsum and the specific einsum patterns which are essentially 
+#    batched matrix multiplications with broadcasting.
+
+# Kernel 1: SegSum (Lower triangular cumsum difference)
+segsum_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void segsum_kernel(const float* x, float* out, int T, int batch_size, int n_heads) {
+    // x shape: [batch_size, n_heads, T] (after rearrange in python or handled here)
+    // Actually, the input to this kernel will be prepared as [B, H, T]
+    // Output shape: [B, H, T, T]
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * n_heads * T * T;
+    
+    if (idx < total_elements) {
+        int b = idx / (n_heads * T * T);
+        int rem = idx % (n_heads * T * T);
+        int h = rem / (T * T);
+        rem = rem % (T * T);
+        int i = rem / T;
+        int j = rem % T;
+        
+        // We need x[b, h, :]
+        const float* x_b_h = x + b * n_heads * T + h * T;
+        
+        if (i >= j) {
+            // Sum from j to i
+            float sum = 0.0f;
+            for (int k = j; k <= i; ++k) {
+                sum += x_b_h[k];
+            }
+            out[idx] = sum;
+        } else {
+            out[idx] = -1e20f; // -inf approximation
+        }
+    }
+}
+
+// Optimized SegSum using prefix sums to avoid O(T^2) loop per element
+__global__ void segsum_optimized_kernel(const float* x, float* out, int T, int batch_size, int n_heads) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * n_heads * T;
+
+    if (idx < total_elements) {
+        int b = idx / (n_heads * T);
+        int h = (idx % (n_heads * T)) / T;
+        int t = idx % T;
+        
+        const float* x_b_h = x + b * n_heads * T + h * T;
+        
+        // Compute prefix sum for this specific [b, h] slice
+        // We can do this in a parallel reduction or just sequential if T is small.
+        // For T=64, sequential is fine and avoids shared memory complexity.
+        float current_sum = 0.0f;
+        float prefix[T];
+        
+        for (int k = 0; k < T; ++k) {
+            current_sum += x_b_h[k];
+            prefix[k] = current_sum;
+        }
+        
+        // Store the result for all pairs (i, j) where i >= j
+        // This kernel launches B*H*T threads. Each thread computes one row of the output matrix?
+        // No, let's launch B*H*T*T threads for simplicity and correctness, 
+        // or better: Launch B*H blocks, each block handles T*T elements.
+    }
+}
+
+// Better approach: Launch B*H blocks. Each block computes the T x T segsum matrix for one [b,h]
+__global__ void segsum_block_kernel(const float* x, float* out, int T, int batch_size, int n_heads) {
+    // Grid: (batch_size * n_heads, 1, 1)
+    // Block: (T, T, 1) or similar. Let's use a simple 2D block for T x T.
+    
+    int b = blockIdx.x / n_heads;
+    int h = blockIdx.x % n_heads;
+    
+    const float* x_b_h = x + b * n_heads * T + h * T;
+    float* out_b_h = out + (b * n_heads + h) * T * T;
+    
+    // Shared memory for prefix sums to speed up access? 
+    // For T=64, global memory access is okay if coalesced, but we read x sequentially.
+    
+    int i = blockIdx.y * blockDim.x + threadIdx.x;
+    int j = blockIdx.z * blockDim.y + threadIdx.y;
+    
+    if (i < T && j < T) {
+        float sum = 0.0f;
+        // Compute sum from j to i
+        // Since we are in a kernel, looping is slow. 
+        // Let's use the property: segsum[i,j] = prefix[i] - prefix[j-1]
+        
+        // We need prefix sums. Let's compute them in shared memory or just loop if T is small.
+        // Given T=64, a loop of 64 is acceptable for correctness, but let's try to be efficient.
+        
+        // Actually, let's just do the naive loop for correctness first as T is small (64).
+        // Optimization: Precompute prefix sums in shared memory if needed.
+        
+        float current = 0.0f;
+        for(int k=0; k<=i; ++k) {
+            current += x_b_h[k];
+            if(k < j) continue; // We want sum from j to i
+            // Wait, the loop above accumulates 0..i. 
+            // We need sum(j...i).
+        }
+        
+        // Correct logic:
+        float prefix_i = 0.0f;
+        for(int k=0; k<=i; ++k) prefix_i += x_b_h[k];
+        
+        float prefix_j_minus_1 = 0.0f;
+        if(j > 0) {
+            for(int k=0; k<j; ++k) prefix_j_minus_1 += x_b_h[k];
+        }
+        
+        if (i >= j) {
+            out_b_h[i * T + j] = prefix_i - prefix_j_minus_1;
+        } else {
+            out_b_h[i * T + j] = -1e20f;
+        }
+    }
+}
+
+torch::Tensor segsum_cuda(torch::Tensor x) {
+    // x shape: [batch_size, n_heads, seq_len]
+    auto batch_size = x.size(0);
+    auto n_heads = x.size(1);
+    auto T = x.size(2);
+    
+    auto out = torch::zeros({batch_size, n_heads, T, T}, x.options());
+    
+    const int block_x = 8;
+    const int block_y = 8;
+    dim3 block(block_x, block_y, 1);
+    dim3 grid(batch_size * n_heads, (T + block_x - 1) / block_x, (T + block_y - 1) / block_y);
+    
+    segsum_block_kernel<<<grid, block>>>(x.data_ptr<float>(), out.data_ptr<float>(), T, batch_size, n_heads);
+    
+    return out;
+}
+"""
+
+segsum_cpp_source = "torch::Tensor segsum_cuda(torch::Tensor x);"
+
+# Kernel 2: Fused Einsum for Y_diag and Y_off
+# The einsums are:
+# Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", C_blocks, B_blocks, L, X_blocks)
+# This is complex. Let's break it down.
+# L is [B, H, C, L, S]. It's diagonal in L,S? No, L[i,j] depends on cumsum.
+# Actually, L[h, c, l, s] is non-zero only if l >= s.
+# The term is: sum_{s} C[b,c,l,h,n] * B[b,c,s,h,n] * L[b,h,c,l,s] * X[b,c,s,h,p]
+# Note indices: 
+# C: b,c,l,h,n
+# B: b,c,s,h,n
+# L: b,h,c,l,s
+# X: b,c,s,h,p
+# Output: b,c,l,h,p
+
+# We can rewrite this as:
+# Temp1[b,c,s,h,n] = B[b,c,s,h,n] * (sum_p X[b,c,s,h,p] ... wait no)
+# Let's group by s.
+# For a fixed s, we have B[:,c,s,:,n] and X[:,c,s,:,p].
+# We can compute M[b,c,s,h,n,p] = sum_n (B[b,c,s,h,n] * X[b,c,s,h,p])? No, n is summed over in einsum.
+# Einsum: ...hn... ...hn... -> ...h... (sum over n)
+# So first step: Compute K[b,c,s,h,p] = sum_n B[b,c,s,h,n] * X[b,c,s,h,p] ? 
+# No, the indices are:
+# C: b c l h n
+# B: b c s h n
+# L: b h c l s
+# X: b c s h p
+# Result: b c l h p
+
+# Let's regroup:
+# Inner product over n between C[b,c,l,h,:] and B[b,c,s,h,:].
+# Let Dot[b,c,l,s,h] = sum_n C[b,c,l,h,n] * B[b,c,s,h,n]
+# Then Y_diag[b,c,l,h,p] = sum_s Dot[b,c,l,s,h] * L[b,h,c,l,s] * X[b,c,s,h,p]
+
+# This is still complex. Let's use standard torch operations which are highly optimized 
+# and only replace the most bottlenecked parts if necessary. 
+# However, the prompt asks for custom CUDA operators to get speedups.
+# The `segsum` is O(T^2) per head/block. With T=64, it's 4096 ops. 
+# The einsums are large matrix multiplications.
+
+# Let's implement a fused kernel for the specific pattern:
+# Y = C * (L * B) * X ? No.
+
+# Alternative: Use `torch.linalg.matmul` or `torch.bmm` which are already optimized via CUTLASS.
+# The main overhead in PyTorch is often the Python loop and small tensor allocations.
+# But here we have large tensors.
+
+# Let's focus on optimizing the `segsum` and the recurrence step which involves 
+# element-wise ops and reductions.
+
+# Actually, for Mamba, the most critical part is the SSM scan. 
+# The provided code uses a "chunked" approach with explicit matrix multiplications.
+# This is often slower than a dedicated SSM kernel because of memory bandwidth.
+# However, implementing a full parallel SSM scan in CUDA is very complex (requires log(N) steps or specialized algorithms).
+
+# Given the constraints and the example, I will implement:
+# 1. `segsum_cuda` as defined above.
+# 2. A fused kernel for the state update and output calculation if possible, 
+#    but to ensure correctness and compilation, I will stick to replacing `segsum` 
+#    and potentially fusing the element-wise operations in the recurrence.
+
+# Let's refine the segsum kernel to be faster using shared memory prefix sums.
+segsum_fast_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void segsum_fast_kernel(const float* x, float* out, int T, int batch_size, int n_heads) {
+    // Each block handles one [b, h] slice.
+    // Grid: (batch_size * n_heads, 1, 1)
+    // Block: (T, T, 1) is too large for registers if we store everything.
+    // Let's use a 2D grid of blocks? No, let's keep it simple.
+    
+    int b = blockIdx.x / n_heads;
+    int h = blockIdx.x % n_heads;
+    
+    const float* x_b_h = x + b * n_heads * T + h * T;
+    float* out_b_h = out + (b * n_heads + h) * T * T;
+    
+    // Shared memory for prefix sums
+    __shared__ float s_prefix[64]; // Max T=64
+    
+    int tid = threadIdx.x;
+    int i = blockIdx.y * blockDim.x + threadIdx.x;
+    int j = blockIdx.z * blockDim.y + threadIdx.y;
+    
+    if (i < T && j < T) {
+        // Load prefix sums into shared memory
+        // We need the full prefix sum array for this [b,h]
+        // Since all threads in the block share the same x_b_h, we can compute prefix sums once.
+        
+        float val = x_b_h[tid];
+        s_prefix[tid] = val;
+        __syncthreads();
+        
+        // Parallel prefix sum (scan)
+        for (int stride = 1; stride < T; stride *= 2) {
+            if (tid >= stride) {
+                s_prefix[tid] += s_prefix[tid - stride];
+            }
+            __syncthreads();
+        }
+        
+        // Now s_prefix[k] contains sum(x[0]...x[k])
+        float prefix_i = s_prefix[i];
+        float prefix_j_minus_1 = (j > 0) ? s_prefix[j-1] : 0.0f;
+        
+        if (i >= j) {
+            out_b_h[i * T + j] = prefix_i - prefix_j_minus_1;
+        } else {
+            out_b_h[i * T + j] = -1e20f;
+        }
+    }
+}
+
+torch::Tensor segsum_fast_cuda(torch::Tensor x) {
+    auto batch_size = x.size(0);
+    auto n_heads = x.size(1);
+    auto T = x.size(2);
+    
+    auto out = torch::zeros({batch_size, n_heads, T, T}, x.options());
+    
+    // Launch configuration: 
+    // One block per [b,h]. Block size 8x8=64 threads. T=64 fits in 8x8 grid of blocks?
+    // No, we want one block to handle the whole T*T matrix for a single [b,h].
+    // So Grid: (batch_size * n_heads, 1, 1)
+    // Block: (T, T, 1) -> 64*64=4096 threads. This is too many for one block (max 1024).
+    
+    // Alternative: Use a grid of blocks to cover the T*T matrix.
+    // Grid: (batch_size * n_heads, (T+7)/8, (T+7)/8)
+    // Block: (8, 8, 1)
+    
+    dim3 block(8, 8, 1);
+    dim3 grid(batch_size * n_heads, (T + 7) / 8, (T + 7) / 8);
+    
+    segsum_fast_kernel<<<grid, block>>>(x.data_ptr<float>(), out.data_ptr<float>(), T, batch_size, n_heads);
+    
+    return out;
+}
+"""
+
+segsum_fast_cpp_source = "torch::Tensor segsum_fast_cuda(torch::Tensor x);"
+
+# Load the extensions
+segsum_module = load_inline(
+    name="segsum_module",
+    cpp_sources=segsum_fast_cpp_source,
+    cuda_sources=segsum_fast_source,
+    functions=["segsum_fast_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, batch_size, seq_length, n_heads, d_head, d_state, block_len=64):
+        """
+        Optimized Mamba Structured State Space model implementation.
+        """
+        super(ModelNew, self).__init__()
+        
+        assert seq_length % block_len == 0, "Sequence length must be divisible by block length"
+        
+        self.batch_size = batch_size
+        self.seq_length = seq_length
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.d_state = d_state
+        self.block_len = block_len
+        
+        # Initialize parameters
+        self.A = nn.Parameter(torch.randn(batch_size, seq_length, n_heads))
+        self.B = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+        self.C = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+        
+    def segsum(self, x):
+        """
+        Optimized segment sum calculation using custom CUDA kernel.
+        Input x shape: [batch_size, n_heads, T]
+        Output shape: [batch_size, n_heads, T, T]
+        """
+        # Ensure x is contiguous and on the correct device
+        if not x.is_contiguous():
+            x = x.contiguous()
+        
+        return segsum_module.segsum_fast_cuda(x)
+
+    def forward(self, X, initial_states=None):
+        """
+        Forward pass implementing the SSD operation with optimized CUDA kernels.
+        """
+        # Rearrange into blocks/chunks
+        X_blocks, A_blocks, B_blocks, C_blocks = [
+            rearrange(x, "b (c l) ... -> b c l ...", l=self.block_len)
+            for x in (X, self.A, self.B, self.C)
+        ]
+        
+        A_blocks = rearrange(A_blocks, "b c l h -> b h c l")
+        A_cumsum = torch.cumsum(A_blocks, dim=-1)
+        
+        # 1. Compute diagonal block outputs
+        # L shape: [B, H, C, L, S]
+        # Input to segsum: A_blocks is [B, H, C, L]. We need to apply segsum over the last two dims?
+        # The original code: self.segsum(A_blocks) where A_blocks is [B, C, L, H] -> rearranged to [B, H, C, L]
+        # Wait, in the original code:
+        # A_blocks = rearrange(A_blocks, "b c l h -> b h c l")
+        # segsum expects input shape [B, H, T] where T is the sequence length for cumsum.
+        # Here, the "sequence" dimension for the recurrence within a chunk is L (block_len).
+        # But A_blocks has shape [B, H, C, L]. The cumsum is over L.
+        # The segsum in the original code was:
+        # x_cumsum = torch.cumsum(x, dim=-1)
+        # x_segsum = x_cumsum[..., :, None] - x_cumsum[..., None, :]
+        # This implies x was [B, H, T].
+        # In our case, A_blocks is [B, H, C, L]. We need to compute segsum for each c.
+        # So we can reshape A_blocks to [B*H*C, L] and apply segsum, then reshape back.
+        
+        B_H_C, L = A_blocks.shape[0]*A_blocks.shape[1]*A_blocks.shape[2], A_blocks.shape[3]
+        A_reshaped = A_blocks.reshape(B_H_C, L)
+        L_segsum = self.segsum(A_reshaped) # Shape: [B*H*C, L, L]
+        L = L_segsum.reshape(self.batch_size, self.n_heads, self.block_len, self.block_len, self.block_len)
+        # Wait, original L shape was [B, H, C, L, S]. 
+        # My reshape: [B*H*C, L, L] -> [B, H, C, L, L]. Correct.
+        
+        Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", 
+                             C_blocks, B_blocks, L, X_blocks)
+        
+        # 2. Compute intra-chunk states
+        decay_states = torch.exp((A_cumsum[:, :, :, -1:] - A_cumsum))
+        states = torch.einsum("bclhn,bhcl,bclhp->bchpn", 
+                            B_blocks, decay_states, X_blocks)
+        
+        # 3. Compute inter-chunk recurrence
+        if initial_states is None:
+            initial_states = torch.zeros_like(states[:, :1])
+        states = torch.cat([initial_states, states], dim=1)
+        
+        # For the next segsum, we need A_cumsum[:, :, :, -1] which is [B, H, C]
+        # We pad it to [B, H, C, 2] for the segsum logic? 
+        # Original: F.pad(A_cumsum[:, :, :, -1], (1, 0)) -> Shape [B, H, C, 2]
+        # Then segsum on this? 
+        # The original code did: self.segsum(F.pad(...))
+        # But segsum in original code took x with dim=-1 as sequence.
+        # Here, the "sequence" is the chunk dimension C.
+        # So we need to apply segsum over the C dimension of A_cumsum_last.
+        
+        A_cumsum_last = A_cumsum[:, :, :, -1] # [B, H, C]
+        A_padded = F.pad(A_cumsum_last, (1, 0)) # [B, H, C+1]
+        
+        # Reshape for segsum: [B*H, C+1]
+        B_H, C_plus_1 = A_padded.shape[0]*A_padded.shape[1], A_padded.shape[2]
+        A_padded_reshaped = A_padded.reshape(B_H, C_plus_1)
+        
+        decay_chunk_segsum = self.segsum(A_padded_reshaped) # [B*H, C+1, C+1]
+        decay_chunk = decay_chunk_segsum.reshape(self.batch_size, self.n_heads, self.block_len + 1, self.block_len + 1)
+        
+        new_states = torch.einsum("bhzc,bchpn->bzhpn", decay_chunk, states)
+        states = new_states[:, :-1]
+        
+        # 4. Compute state-to-output conversion
+        state_decay_out = torch.exp(A_cumsum)
+        Y_off = torch.einsum('bclhn,bchpn,bhcl->bclhp', 
+                           C_blocks, states, state_decay_out)
+        
+        # Combine diagonal and off-diagonal terms
+        Y = rearrange(Y_diag + Y_off, "b c l h p -> b (c l) h p")
+        
+        return Y
+
+# Test parameters
+batch_size = 2048
+seq_length = 128
+n_heads = 8
+d_head = 64
+d_state = 16
+block_len = 64
+
+def get_inputs():
+    return [torch.rand(batch_size, seq_length, n_heads, d_head)]
+
+def get_init_inputs():
+    return [batch_size, seq_length, n_heads, d_head, d_state, block_len]
+```

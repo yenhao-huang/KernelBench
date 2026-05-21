@@ -1,0 +1,168 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for the fused operation:
+# 1. Transposed Convolution (using cuDNN via PyTorch's native call is often fastest, 
+#    but to strictly follow "custom CUDA operator" spirit and fuse subsequent ops, 
+#    we will implement a custom kernel that takes the output of conv_transpose or performs it internally.
+#    However, implementing a full generic ConvTranspose2d in raw CUDA is extremely complex and error-prone.
+#    A more practical optimization for this specific chain (Conv -> Add Bias -> Clamp -> Scale -> Clamp -> Div) 
+#    is to fuse the post-processing steps (Add, Clamp, Scale, Clamp, Div) into a single kernel, 
+#    assuming the ConvTranspose2d output is available. 
+#    
+#    Alternatively, we can replace the entire forward pass logic with a custom kernel if we assume 
+#    the weights are fixed or passed in. But since nn.ConvTranspose2d is complex, let's focus on 
+#    fusing the element-wise operations which are memory-bound and benefit greatly from fusion.
+#    
+#    Strategy: 
+#    1. Keep nn.ConvTranspose2d for the heavy lifting (it's highly optimized in cuDNN).
+#    2. Replace the sequence: Add Bias -> Clamp(0,1) -> Scale -> Clamp(0,1) -> Div with a single custom CUDA kernel.
+#    
+#    This reduces memory bandwidth pressure by avoiding intermediate tensor allocations for each step.
+
+fused_post_process_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void fused_post_process_kernel(
+    const float* input, 
+    const float* bias, 
+    float* output, 
+    int batch_size, 
+    int channels, 
+    int height, 
+    int width, 
+    float scaling_factor
+) {
+    // Total number of elements in the spatial/batch dimensions excluding channels for broadcasting logic
+    // The tensor shape is (batch_size, channels, height, width)
+    // Bias shape is (channels, 1, 1), so it broadcasts over batch, height, width.
+    
+    int total_elements = batch_size * channels * height * width;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < total_elements) {
+        // Calculate coordinates
+        int w = idx % width;
+        int rem = idx / width;
+        int h = rem % height;
+        rem = rem / height;
+        int c = rem % channels;
+        int b = rem / channels;
+
+        // Load input value
+        float val = input[idx];
+
+        // Add bias: bias is at index (c, 0, 0) in the flattened bias tensor if we view it as (C, H, W) with H=W=1
+        // Or simply access bias[c] since it's (C, 1, 1)
+        float val_with_bias = val + bias[c];
+
+        // First clamp: min=0.0, max=1.0
+        if (val_with_bias < 0.0f) {
+            val_with_bias = 0.0f;
+        } else if (val_with_bias > 1.0f) {
+            val_with_bias = 1.0f;
+        }
+
+        // Scale
+        float scaled_val = val_with_bias * scaling_factor;
+
+        // Second clamp: min=0.0, max=1.0
+        if (scaled_val < 0.0f) {
+            scaled_val = 0.0f;
+        } else if (scaled_val > 1.0f) {
+            scaled_val = 1.0f;
+        }
+
+        // Divide
+        float final_val = scaled_val / scaling_factor;
+
+        output[idx] = final_val;
+    }
+}
+
+torch::Tensor fused_post_process_cuda(torch::Tensor input, torch::Tensor bias, float scaling_factor) {
+    auto batch_size = input.size(0);
+    auto channels = input.size(1);
+    auto height = input.size(2);
+    auto width = input.size(3);
+    
+    auto output = torch::empty_like(input);
+
+    const int block_size = 256;
+    int total_elements = batch_size * channels * height * width;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    fused_post_process_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(), 
+        bias.data_ptr<float>(), 
+        output.data_ptr<float>(), 
+        batch_size, 
+        channels, 
+        height, 
+        width, 
+        scaling_factor
+    );
+
+    return output;
+}
+"""
+
+fused_post_process_cpp_source = (
+    "torch::Tensor fused_post_process_cuda(torch::Tensor input, torch::Tensor bias, float scaling_factor);"
+)
+
+# Compile the inline CUDA code
+fused_post_process = load_inline(
+    name="fused_post_process",
+    cpp_sources=fused_post_process_cpp_source,
+    cuda_sources=fused_post_process_source,
+    functions=["fused_post_process_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model that performs a transposed convolution, then fuses the subsequent 
+    element-wise operations (Add Bias, Clamp, Scale, Clamp, Divide) into a single CUDA kernel.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape, scaling_factor):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
+        self.bias = nn.Parameter(torch.randn(bias_shape)) 
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        # Perform the heavy transposed convolution using optimized cuDNN backend
+        x = self.conv_transpose(x)
+        
+        # Fuse the remaining element-wise operations into a single custom CUDA kernel
+        # This avoids multiple memory reads/writes for intermediate tensors
+        x = fused_post_process.fused_post_process_cuda(x, self.bias, self.scaling_factor)
+        
+        return x
+
+# Helper functions to match the interface expected by the prompt structure
+def get_inputs():
+    batch_size = 128
+    in_channels = 64  
+    out_channels = 64  
+    height = width = 128 
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    batch_size = 128
+    in_channels = 64  
+    out_channels = 64  
+    height = width = 128 
+    kernel_size = 3
+    stride = 2
+    padding = 1
+    output_padding = 1
+    bias_shape = (out_channels, 1, 1)
+    scaling_factor = 2.0
+    return [in_channels, out_channels, kernel_size, stride, padding, output_padding, bias_shape, scaling_factor]

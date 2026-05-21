@@ -1,0 +1,226 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <float.h>
+
+__global__ void conv1_relu_pool_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ y,
+    int N
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * 6 * 14 * 14;
+    if (idx >= total) return;
+
+    int pw = idx % 14;
+    int t = idx / 14;
+    int ph = t % 14;
+    t /= 14;
+    int oc = t % 6;
+    int n = t / 6;
+
+    float best = 0.0f;
+    #pragma unroll
+    for (int dy = 0; dy < 2; ++dy) {
+        #pragma unroll
+        for (int dx = 0; dx < 2; ++dx) {
+            int oh = ph * 2 + dy;
+            int ow = pw * 2 + dx;
+            float acc = b[oc];
+            #pragma unroll
+            for (int kh = 0; kh < 5; ++kh) {
+                #pragma unroll
+                for (int kw = 0; kw < 5; ++kw) {
+                    acc += x[((n * 32 + oh + kh) * 32 + ow + kw)] *
+                           w[((oc * 5 + kh) * 5 + kw)];
+                }
+            }
+            acc = acc > 0.0f ? acc : 0.0f;
+            best = acc > best ? acc : best;
+        }
+    }
+    y[idx] = best;
+}
+
+__global__ void conv2_relu_pool_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ y,
+    int N
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * 16 * 5 * 5;
+    if (idx >= total) return;
+
+    int pw = idx % 5;
+    int t = idx / 5;
+    int ph = t % 5;
+    t /= 5;
+    int oc = t % 16;
+    int n = t / 16;
+
+    float best = 0.0f;
+    #pragma unroll
+    for (int dy = 0; dy < 2; ++dy) {
+        #pragma unroll
+        for (int dx = 0; dx < 2; ++dx) {
+            int oh = ph * 2 + dy;
+            int ow = pw * 2 + dx;
+            float acc = b[oc];
+            #pragma unroll
+            for (int ic = 0; ic < 6; ++ic) {
+                #pragma unroll
+                for (int kh = 0; kh < 5; ++kh) {
+                    #pragma unroll
+                    for (int kw = 0; kw < 5; ++kw) {
+                        acc += x[((n * 6 + ic) * 14 + oh + kh) * 14 + ow + kw] *
+                               w[(((oc * 6 + ic) * 5 + kh) * 5 + kw)];
+                    }
+                }
+            }
+            acc = acc > 0.0f ? acc : 0.0f;
+            best = acc > best ? acc : best;
+        }
+    }
+    y[idx] = best;
+}
+
+__global__ void linear_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ y,
+    int N,
+    int K,
+    int O,
+    int relu
+) {
+    extern __shared__ float s[];
+    int n = blockIdx.x;
+    int o = blockIdx.y;
+    int tid = threadIdx.x;
+
+    float sum = 0.0f;
+    for (int k = tid; k < K; k += blockDim.x) {
+        sum += x[n * K + k] * w[o * K + k];
+    }
+    s[tid] = sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) s[tid] += s[tid + stride];
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float v = s[0] + b[o];
+        if (relu && v < 0.0f) v = 0.0f;
+        y[n * O + o] = v;
+    }
+}
+
+torch::Tensor lenet_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor c1w, torch::Tensor c1b,
+    torch::Tensor c2w, torch::Tensor c2b,
+    torch::Tensor f1w, torch::Tensor f1b,
+    torch::Tensor f2w, torch::Tensor f2b,
+    torch::Tensor f3w, torch::Tensor f3b
+) {
+    int N = x.size(0);
+    int C = f3b.size(0);
+    auto opts = x.options();
+
+    auto p1 = torch::empty({N, 6, 14, 14}, opts);
+    auto p2 = torch::empty({N, 16, 5, 5}, opts);
+    auto h1 = torch::empty({N, 120}, opts);
+    auto h2 = torch::empty({N, 84}, opts);
+    auto out = torch::empty({N, C}, opts);
+
+    int threads = 256;
+    int blocks1 = (N * 6 * 14 * 14 + threads - 1) / threads;
+    int blocks2 = (N * 16 * 5 * 5 + threads - 1) / threads;
+
+    conv1_relu_pool_kernel<<<blocks1, threads>>>(
+        x.data_ptr<float>(), c1w.data_ptr<float>(), c1b.data_ptr<float>(),
+        p1.data_ptr<float>(), N
+    );
+
+    conv2_relu_pool_kernel<<<blocks2, threads>>>(
+        p1.data_ptr<float>(), c2w.data_ptr<float>(), c2b.data_ptr<float>(),
+        p2.data_ptr<float>(), N
+    );
+
+    dim3 grid1(N, 120);
+    linear_kernel<<<grid1, threads, threads * sizeof(float)>>>(
+        p2.data_ptr<float>(), f1w.data_ptr<float>(), f1b.data_ptr<float>(),
+        h1.data_ptr<float>(), N, 400, 120, 1
+    );
+
+    dim3 grid2(N, 84);
+    linear_kernel<<<grid2, threads, threads * sizeof(float)>>>(
+        h1.data_ptr<float>(), f2w.data_ptr<float>(), f2b.data_ptr<float>(),
+        h2.data_ptr<float>(), N, 120, 84, 1
+    );
+
+    dim3 grid3(N, C);
+    linear_kernel<<<grid3, threads, threads * sizeof(float)>>>(
+        h2.data_ptr<float>(), f3w.data_ptr<float>(), f3b.data_ptr<float>(),
+        out.data_ptr<float>(), N, 84, C, 0
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor lenet_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor c1w, torch::Tensor c1b,
+    torch::Tensor c2w, torch::Tensor c2b,
+    torch::Tensor f1w, torch::Tensor f1b,
+    torch::Tensor f2w, torch::Tensor f2b,
+    torch::Tensor f3w, torch::Tensor f3b
+);
+"""
+
+lenet_ext = load_inline(
+    name="lenet5_fused_cuda_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["lenet_forward_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 6, 5, 1)
+        self.conv2 = nn.Conv2d(6, 16, 5, 1)
+        self.fc1 = nn.Linear(16 * 5 * 5, 120)
+        self.fc2 = nn.Linear(120, 84)
+        self.fc3 = nn.Linear(84, num_classes)
+
+    def forward(self, x):
+        return lenet_ext.lenet_forward_cuda(
+            x.contiguous(),
+            self.conv1.weight.contiguous(),
+            self.conv1.bias.contiguous(),
+            self.conv2.weight.contiguous(),
+            self.conv2.bias.contiguous(),
+            self.fc1.weight.contiguous(),
+            self.fc1.bias.contiguous(),
+            self.fc2.weight.contiguous(),
+            self.fc2.bias.contiguous(),
+            self.fc3.weight.contiguous(),
+            self.fc3.bias.contiguous(),
+        )

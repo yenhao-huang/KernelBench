@@ -1,0 +1,281 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+mbconv_cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__device__ __forceinline__ float relu6f(float x) {
+    return fminf(fmaxf(x, 0.0f), 6.0f);
+}
+
+__global__ void conv1x1_bn_relu6_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    const float* __restrict__ mean,
+    const float* __restrict__ var,
+    float* __restrict__ y,
+    int N, int C, int OC, int H, int Wd,
+    float eps
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * OC * H * Wd;
+    if (idx >= total) return;
+
+    int ow = idx % Wd;
+    int oh = (idx / Wd) % H;
+    int oc = (idx / (Wd * H)) % OC;
+    int n = idx / (Wd * H * OC);
+
+    float acc = 0.0f;
+    int in_base = ((n * C) * H + oh) * Wd + ow;
+    int w_base = oc * C;
+    #pragma unroll 4
+    for (int c = 0; c < C; ++c) {
+        acc += x[in_base + c * H * Wd] * w[w_base + c];
+    }
+
+    float z = (acc - mean[oc]) * rsqrtf(var[oc] + eps) * gamma[oc] + beta[oc];
+    y[idx] = relu6f(z);
+}
+
+__global__ void depthwise5_bn_relu6_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    const float* __restrict__ mean,
+    const float* __restrict__ var,
+    float* __restrict__ y,
+    int N, int C, int H, int Wd, int OH, int OW,
+    int stride, float eps
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C * OH * OW;
+    if (idx >= total) return;
+
+    int ow = idx % OW;
+    int oh = (idx / OW) % OH;
+    int c = (idx / (OW * OH)) % C;
+    int n = idx / (OW * OH * C);
+
+    int ih0 = oh * stride - 2;
+    int iw0 = ow * stride - 2;
+    float acc = 0.0f;
+
+    #pragma unroll
+    for (int kh = 0; kh < 5; ++kh) {
+        int ih = ih0 + kh;
+        if (ih >= 0 && ih < H) {
+            #pragma unroll
+            for (int kw = 0; kw < 5; ++kw) {
+                int iw = iw0 + kw;
+                if (iw >= 0 && iw < Wd) {
+                    int x_idx = ((n * C + c) * H + ih) * Wd + iw;
+                    int w_idx = c * 25 + kh * 5 + kw;
+                    acc += x[x_idx] * w[w_idx];
+                }
+            }
+        }
+    }
+
+    float z = (acc - mean[c]) * rsqrtf(var[c] + eps) * gamma[c] + beta[c];
+    y[idx] = relu6f(z);
+}
+
+__global__ void conv1x1_bn_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    const float* __restrict__ mean,
+    const float* __restrict__ var,
+    float* __restrict__ y,
+    int N, int C, int OC, int H, int Wd,
+    float eps
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * OC * H * Wd;
+    if (idx >= total) return;
+
+    int ow = idx % Wd;
+    int oh = (idx / Wd) % H;
+    int oc = (idx / (Wd * H)) % OC;
+    int n = idx / (Wd * H * OC);
+
+    float acc = 0.0f;
+    int in_base = ((n * C) * H + oh) * Wd + ow;
+    int w_base = oc * C;
+    #pragma unroll 4
+    for (int c = 0; c < C; ++c) {
+        acc += x[in_base + c * H * Wd] * w[w_base + c];
+    }
+
+    y[idx] = (acc - mean[oc]) * rsqrtf(var[oc] + eps) * gamma[oc] + beta[oc];
+}
+
+torch::Tensor conv1x1_bn_relu6_cuda(
+    torch::Tensor x, torch::Tensor w,
+    torch::Tensor gamma, torch::Tensor beta,
+    torch::Tensor mean, torch::Tensor var,
+    double eps
+) {
+    int N = x.size(0), C = x.size(1), H = x.size(2), Wd = x.size(3), OC = w.size(0);
+    auto y = torch::empty({N, OC, H, Wd}, x.options());
+    int total = N * OC * H * Wd;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+    conv1x1_bn_relu6_kernel<<<grid, block>>>(
+        x.data_ptr<float>(), w.data_ptr<float>(),
+        gamma.data_ptr<float>(), beta.data_ptr<float>(),
+        mean.data_ptr<float>(), var.data_ptr<float>(),
+        y.data_ptr<float>(), N, C, OC, H, Wd, (float)eps
+    );
+    return y;
+}
+
+torch::Tensor depthwise5_bn_relu6_cuda(
+    torch::Tensor x, torch::Tensor w,
+    torch::Tensor gamma, torch::Tensor beta,
+    torch::Tensor mean, torch::Tensor var,
+    int stride, double eps
+) {
+    int N = x.size(0), C = x.size(1), H = x.size(2), Wd = x.size(3);
+    int OH = (H + 4 - 5) / stride + 1;
+    int OW = (Wd + 4 - 5) / stride + 1;
+    auto y = torch::empty({N, C, OH, OW}, x.options());
+    int total = N * C * OH * OW;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+    depthwise5_bn_relu6_kernel<<<grid, block>>>(
+        x.data_ptr<float>(), w.data_ptr<float>(),
+        gamma.data_ptr<float>(), beta.data_ptr<float>(),
+        mean.data_ptr<float>(), var.data_ptr<float>(),
+        y.data_ptr<float>(), N, C, H, Wd, OH, OW, stride, (float)eps
+    );
+    return y;
+}
+
+torch::Tensor conv1x1_bn_cuda(
+    torch::Tensor x, torch::Tensor w,
+    torch::Tensor gamma, torch::Tensor beta,
+    torch::Tensor mean, torch::Tensor var,
+    double eps
+) {
+    int N = x.size(0), C = x.size(1), H = x.size(2), Wd = x.size(3), OC = w.size(0);
+    auto y = torch::empty({N, OC, H, Wd}, x.options());
+    int total = N * OC * H * Wd;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+    conv1x1_bn_kernel<<<grid, block>>>(
+        x.data_ptr<float>(), w.data_ptr<float>(),
+        gamma.data_ptr<float>(), beta.data_ptr<float>(),
+        mean.data_ptr<float>(), var.data_ptr<float>(),
+        y.data_ptr<float>(), N, C, OC, H, Wd, (float)eps
+    );
+    return y;
+}
+"""
+
+mbconv_cpp_source = r"""
+torch::Tensor conv1x1_bn_relu6_cuda(
+    torch::Tensor x, torch::Tensor w,
+    torch::Tensor gamma, torch::Tensor beta,
+    torch::Tensor mean, torch::Tensor var,
+    double eps
+);
+torch::Tensor depthwise5_bn_relu6_cuda(
+    torch::Tensor x, torch::Tensor w,
+    torch::Tensor gamma, torch::Tensor beta,
+    torch::Tensor mean, torch::Tensor var,
+    int stride, double eps
+);
+torch::Tensor conv1x1_bn_cuda(
+    torch::Tensor x, torch::Tensor w,
+    torch::Tensor gamma, torch::Tensor beta,
+    torch::Tensor mean, torch::Tensor var,
+    double eps
+);
+"""
+
+_mbconv_ops = load_inline(
+    name="mbconv_custom_cuda_ops",
+    cpp_sources=mbconv_cpp_source,
+    cuda_sources=mbconv_cuda_source,
+    functions=[
+        "conv1x1_bn_relu6_cuda",
+        "depthwise5_bn_relu6_cuda",
+        "conv1x1_bn_cuda",
+    ],
+    verbose=False,
+    extra_cuda_cflags=["-O3"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, expand_ratio):
+        super(ModelNew, self).__init__()
+        self.use_residual = stride == 1 and in_channels == out_channels
+        self.has_expand = expand_ratio != 1
+        self.stride = stride
+        self.kernel_size = kernel_size
+        hidden_dim = in_channels * expand_ratio
+
+        if self.has_expand:
+            self.expand_weight = nn.Parameter(torch.empty(hidden_dim, in_channels, 1, 1))
+            self.expand_bn = nn.BatchNorm2d(hidden_dim)
+            nn.init.kaiming_uniform_(self.expand_weight, a=5 ** 0.5)
+
+        self.depthwise_weight = nn.Parameter(torch.empty(hidden_dim, 1, kernel_size, kernel_size))
+        self.depthwise_bn = nn.BatchNorm2d(hidden_dim)
+        nn.init.kaiming_uniform_(self.depthwise_weight, a=5 ** 0.5)
+
+        self.project_weight = nn.Parameter(torch.empty(out_channels, hidden_dim, 1, 1))
+        self.project_bn = nn.BatchNorm2d(out_channels)
+        nn.init.kaiming_uniform_(self.project_weight, a=5 ** 0.5)
+
+    def forward(self, x):
+        identity = x
+
+        if self.has_expand:
+            x = _mbconv_ops.conv1x1_bn_relu6_cuda(
+                x.contiguous(),
+                self.expand_weight.view(self.expand_weight.size(0), self.expand_weight.size(1)).contiguous(),
+                self.expand_bn.weight,
+                self.expand_bn.bias,
+                self.expand_bn.running_mean,
+                self.expand_bn.running_var,
+                self.expand_bn.eps,
+            )
+
+        x = _mbconv_ops.depthwise5_bn_relu6_cuda(
+            x.contiguous(),
+            self.depthwise_weight.view(self.depthwise_weight.size(0), self.kernel_size * self.kernel_size).contiguous(),
+            self.depthwise_bn.weight,
+            self.depthwise_bn.bias,
+            self.depthwise_bn.running_mean,
+            self.depthwise_bn.running_var,
+            self.stride,
+            self.depthwise_bn.eps,
+        )
+
+        x = _mbconv_ops.conv1x1_bn_cuda(
+            x.contiguous(),
+            self.project_weight.view(self.project_weight.size(0), self.project_weight.size(1)).contiguous(),
+            self.project_bn.weight,
+            self.project_bn.bias,
+            self.project_bn.running_mean,
+            self.project_bn.running_var,
+            self.project_bn.eps,
+        )
+
+        if self.use_residual:
+            x = x + identity
+
+        return x
+```

@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 68.186,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "1.059640",
+        "1.059640",
+        "1.059640",
+        "1.059640",
+        "1.059640"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "1.914669",
+        "1.914671",
+        "1.914668",
+        "1.914672",
+        "1.914670"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_2/problem_13.py",
+  "level": 2,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 13,
+  "problem_name": "13_ConvTranspose3d_Mean_Add_Softmax_Tanh_Scaling.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_2/problem_13.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

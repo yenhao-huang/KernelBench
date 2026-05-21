@@ -1,0 +1,528 @@
+thought
+```thought
+临界点: The user wants an optimized version of a Mamba-like SSD (Structured State Space) model.
+The original model uses `rearrange`, `cumsum`, `einsum`, and a custom `segsum` (which is $O(T^2)$ and very slow).
+The core of the computation is a recurrence/convolution-like operation in the state space.
+
+Key bottlenecks:
+1. `segsum`: It computes a full $T \times T$ matrix of cumulative sums. This is extremely memory intensive and slow.
+2. `einsum`: Multiple high-dimensional einsums.
+3. `torch.exp`: Called multiple times.
+
+Optimization Strategy:
+1. Replace `segsum` and the subsequent `einsum` logic with a fused CUDA kernel.
+2. The `segsum` logic is essentially computing $\exp(\sum_{j=i}^k A_j)$.
+3. The `Y_diag` and `states` calculations can be fused into a single kernel that processes blocks.
+4. However, writing a full Mamba/SSD kernel from scratch in a single response is extremely complex. I will focus on optimizing the most expensive part: the `segsum` and the exponential decay logic.
+5. Actually, the `segsum` is used to compute the kernel $K_{ij} = \exp(\sum_{k=i}^j A_k)$.
+6. A better way to implement this is to realize that for a fixed block, we are doing a scan-based operation.
+
+Let's implement a fused kernel for the "Intra-chunk" and "Diagonal" parts.
+The `segsum` is $O(L^2)$ where $L$ is block length.
+The `Y_diag` is $O(B \cdot C \cdot L \cdot H \cdot N \cdot D)$.
+The `states` is $O(B \cdot C \cdot L \cdot H \cdot P \cdot N)$.
+
+Wait, the `segsum` in the original code is:
+`x_cumsum[..., :, None] - x_cumsum[..., None, :]`
+This is actually $x\_cumsum[i] - x\_cumsum[j]$.
+If $i \le j$, this is $\sum_{k=1}^i A_k - \sum_{k=1}^j A_k = -\sum_{k=i+1}^j A_k$.
+The code uses `torch.tril` with `diagonal=0`.
+So for $i \le j$, it's $x\_cumsum[i] - x\_cumsum[j]$.
+Wait, the `segsum` logic in the provided code is:
+`x_cumsum[..., :, None] - x_cumsum[..., None, :]`
+If $i=1, j=2$, `x_cumsum[1] - x_cumsum[2] = -A[2]`.
+The `mask` is `tril(diagonal=0)`, so it keeps $i \ge j$.
+If $i \ge j$, `x_cumsum[i] - x_cumsum[j] = A[j+1] + ... + A[i]`.
+This is the sum of $A$ from $j+1$ to $i$.
+The `exp` of this is the decay factor.
+
+Actually, the most efficient way to implement this is to use a prefix sum (scan) approach.
+Since I need to provide a working CUDA kernel, I will implement a fused kernel that computes the `decay_states` and the `states` accumulation, as that's the core of the recurrence.
+
+However, the `segsum` is used for `L = torch.exp(self.segsum(A_blocks))`.
+And `Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", C_blocks, B_blocks, L, X_blocks)`.
+This is a very specific tensor contraction.
+
+Let's simplify. The bottleneck is the $O(L^2)$ memory and the $O(L^2)$ computation in `segsum`.
+I will replace the `segsum` and the `exp` with a fused kernel that computes the required values.
+Actually, I'll implement a kernel that performs the "Intra-chunk" state computation which is the most complex part.
+
+Wait, looking at the `segsum` again:
+`x_cumsum[..., :, None] - x_cumsum[..., None, :]`
+For $i \ge j$, it is $\sum_{k=j+1}^i A_k$.
+The `Y_diag` uses `L` which is $\exp(\text{segsum})$.
+The `states` uses `decay_states` which is $\exp(A\_cumsum[last] - A\_cumsum)$.
+
+I will provide a fused kernel for the `segsum` part to avoid the $O(L^2)$ memory allocation.
+But even better, I will implement a kernel that computes the `states` and `Y_diag` components.
+
+Actually, the most impactful optimization is to replace the `segsum` (which creates a huge $L \times L$ tensor) with a kernel that computes the values on the fly or uses a more efficient scan.
+
+Let's write a CUDA kernel that computes the `L` matrix (the decay matrix) and performs the contraction.
+Given the complexity, I will implement a kernel that computes the `decay_states` and the `states` accumulation.
+
+Actually, I'll implement a kernel that computes the `segsum` part more efficiently.
+The `segsum` is used to create a matrix $M_{ij} = \exp(\sum_{k=j}^i A_k)$.
+This is exactly what is needed for the SSD/Mamba scan.
+
+Let's focus on the `states` calculation:
+`decay_states = torch.exp((A_cumsum[:, :, :, -1:] - A_cumsum))`
+`states = torch.einsum("bclhn,bhcl,bclhp->bchpn", B_blocks, decay_states, X_blocks)`
+This is: $S_{b,c,h,p,n} = \sum_{l} B_{b,c,l,h,n} \cdot \exp(A\_cumsum_{b,h,c,L-1} - A\_cumsum_{b,h,c,l}) \cdot X_{b,c,l,h,p}$
+Wait, the indices in `einsum` are:
+`B_blocks`: `bclhn` (batch, chunk, length, head, d_state)
+`decay_states`: `bhcl` (batch, head, chunk, length) -- wait, the original code says `decay_states = torch.exp((A_cumsum[:, :, :, -1:] - A_cumsum))`. `A_cumsum` is `bhcl`. So `decay_states` is `bhcl`.
+`X_blocks`: `bclhp` (batch, chunk, length, head, d_head)
+Result `states`: `bchpn` (batch, head, chunk, d_head, d_state)
+
+This is a highly structured contraction.
+I will implement a CUDA kernel that computes `states` directly.
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+from torch.utils.cpp_extension import load_inline
+
+# CUDA kernel for the intra-chunk state computation
+# This kernel computes: states[b, h, c, p, n] = sum_{l} B[b, c, l, h, n] * exp(A_cumsum[b, h, c, L-1] - A_cumsum[b, h, c, l]) * X[b, c, l, h, p]
+# This avoids the large intermediate decay_states tensor and the einsum.
+
+intra_chunk_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void intra_chunk_states_kernel(
+    const float* __restrict__ B,      // [B, C, L, H, N]
+    const float* __restrict__ A_cumsum, // [B, H, C, L]
+    const float* __restrict__ X,      // [B, C, L, H, P]
+    float* __restrict__ states,       // [B, H, C, P, N]
+    int batch_size, int n_heads, int chunk_len, int d_head, int d_state) {
+
+    // Indexing for states: [b, h, c, p, n]
+    int n_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int p_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    int idx = n_idx + p_idx * d_state + (n_idx * d_head * d_state / d_state); // This is wrong, let's use flat indexing
+    // Correct indexing:
+    // states[b, h, c, p, n] = b * (H*C*P*N) + h * (C*P*N) + c * (P*N) + p * N + n
+    
+    // We'll use a simpler approach: one thread per (b, h, c, p, n) is too many.
+    // Let's use one thread per (b, h, c, p, n) but only if the total size is reasonable.
+    // Or better: one thread per (b, h, c, p, n) and use a grid of (B*H*C, P, N)
+}
+"""
+```
+Actually, the `segsum` is the most problematic part for memory.
+Let's implement a kernel that computes the `states` and `Y_diag` parts.
+Wait, the `Y_diag` part is:
+`Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", C_blocks, B_blocks, L, X_blocks)`
+where `L` is `exp(segsum(A_blocks))`.
+`segsum(A_blocks)` is $M_{ij} = \sum_{k=j}^i A_k$.
+So $L_{ij} = \exp(\sum_{k=j}^i A_k)$.
+This is $L_{ij} = \exp(A_i) \cdot \exp(A_{i-1}) \dots \exp(A_j)$.
+This is a scan.
+
+Given the constraints and the complexity of writing a perfect Mamba kernel in one go, I will provide an optimized version that:
+1. Replaces the $O(L^2)$ `segsum` with a more efficient approach.
+2. Fuses the `exp` and `einsum` for the `states` calculation.
+
+Actually, I'll implement a kernel that computes the `states` tensor directly.
+The `states` tensor has shape `(batch, n_heads, chunk_len, d_head, d_state)`.
+The loop is over `l` (the sequence length within the chunk).
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+from torch.utils.cpp_extension import load_inline
+
+# CUDA source for fused intra-chunk state computation
+# This kernel computes: states[b, h, c, p, n] = sum_{l=0}^{L-1} B[b, c, l, h, n] * exp(A_cumsum[b, h, c, L-1] - A_cumsum[b, h, c, l]) * X[b, c, l, h, p]
+# Note: The original code uses A_cumsum[..., -1:] - A_cumsum. 
+# A_cumsum is the cumulative sum of A_blocks.
+# A_cumsum[l] = A[0] + ... + A[l].
+# A_cumsum[L-1] - A_cumsum[l] = A[l+1] + ... + A[L-1].
+# This is the decay from step l to the end of the chunk.
+
+intra_chunk_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void intra_chunk_kernel(
+    const float* __restrict__ B,       // [B, C, L, H, N]
+    const float* __restrict__ A_cumsum, // [B, H, C, L]
+    const float* __restrict__ X,       // [B, C, L, H, P]
+    float* __restrict__ states,        // [B, H, C, P, N]
+    int B_size, int H, int C, int L, int P, int N) {
+
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    int p = blockIdx.y * blockDim.y + threadIdx.y;
+    int ch = blockIdx.z; // index for (b * H * C)
+
+    if (n >= N || p >= P || ch >= B_size * H * C) return;
+
+    int b = ch / (H * C);
+    int h = (ch / C - b * H);
+    int c = ch % C;
+
+    float sum = 0.0f;
+    float a_last = A_cumsum[((b * H + h) * C + c) * L + (L - 1)];
+
+    for (int l = 0; l < L; ++l) {
+        float a_l = A_cumsum[((b * H + h) * C + c) * L + l];
+        float decay = expf(a_last - a_l);
+        
+        // B[b, c, l, h, n]
+        float b_val = B[(((b * C + c) * L + l) * H + h) * N + n];
+        // X[b, c, l, h, p]
+        float x_val = X[(((b * C + c) * L + l) * H + h) * P + p];
+        
+        sum += b_val * decay * x_val;
+    }
+
+    states[((b * H + h) * C + c) * (P * N) + p * N + n] = sum;
+}
+
+torch::Tensor intra_chunk_cuda(torch::Tensor B, torch::Tensor A_cumsum, torch::Tensor X) {
+    int B_size = B.size(0);
+    int C = B.size(1);
+    int L = B.size(2);
+    int H = B.size(3);
+    int N = B.size(4);
+    int P = X.size(4);
+
+    auto states = torch::zeros({B_size, H, C, P, N}, B.options());
+
+    dim3 block(16, 16);
+    dim3 grid((N + 15) / 16, (P + 15) / 16, B_size * H * C);
+
+    intra_chunk_kernel<<<grid, block>>>(
+        B.data_ptr<float>(),
+        A_cumsum.data_ptr<float>(),
+        X.data_ptr<float>(),
+        states.data_ptr<float>(),
+        B_size, H, C, L, P, N
+    );
+
+    return states;
+}
+"""
+
+intra_chunk_cpp_source = "torch::Tensor intra_chunk_cuda(torch::Tensor B, torch::Tensor A_cumsum, torch::Tensor X);"
+
+class ModelNew(nn.Module):
+    def __init__(self, batch_size, seq_length, n_heads, d_head, d_state, block_len=64):
+        super(ModelNew, self).__init__()
+        self.batch_size = batch_size
+        self.seq_length = seq_length
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.d_state = d_state
+        self.block_len = block_len
+        
+        self.A = nn.Parameter(torch.randn(batch_size, seq_length, n_heads))
+        self.B = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+        self.C = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+
+        self.intra_chunk_op = load_inline(
+            name="intra_chunk_op",
+            cpp_sources=intra_chunk_cpp_source,
+            cuda_sources=intra_chunk_cuda_source,
+            functions=["intra_chunk_cuda"],
+            verbose=False
+        )
+
+    def segsum(self, x):
+        T = x.size(-1)
+        x_cumsum = torch.cumsum(x, dim=-1)
+        x_segsum = x_cumsum[..., :, None] - x_cumsum[..., None, :]
+        mask = torch.tril(torch.ones(T, T, device=x.device, dtype=bool), diagonal=0)
+        x_segsum = x_segsum.masked_fill(~mask, -float('inf'))
+        return x_segsum
+
+    def forward(self, X, initial_states=None):
+        from einops import rearrange
+        X_blocks, A_blocks, B_blocks, C_blocks = [
+            rearrange(x, "b (c l) ... -> b c l ...", l=self.block_len)
+            for x in (X, self.A, self.B, self.C)
+        ]
+        
+        A_blocks = rearrange(A_blocks, "b c l h -> b h c l")
+        A_cumsum = torch.cumsum(A_blocks, dim=-1)
+        
+        # 1. Compute diagonal block outputs
+        # We keep the original segsum for Y_diag as it's a different contraction, 
+        # but we optimize the most expensive part (states).
+        L_mat = torch.exp(self.segsum(A_blocks))
+        Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", 
+                             C_blocks, B_blocks, L_mat, X_blocks)
+        
+        # 2. Compute intra-chunk states using custom CUDA kernel
+        # This replaces the decay_states and states einsum.
+        states = self.intra_chunk_op.intra_chunk_cuda(B_blocks, A_cumsum, X_blocks)
+        
+        # 3. Compute inter-chunk recurrence
+        if initial_states is None:
+            initial_states = torch.zeros_like(states[:, :1])
+        states = torch.cat([initial_states, states], dim=1)
+        
+        decay_chunk = torch.exp(self.segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0))))
+        new_states = torch.einsum("bhzc,bchpn->bzhpn", decay_chunk, states)
+        return new_states[:, -1]
+```
+
+Wait, I need to make sure the `segsum` is not the bottleneck. The user wants me to optimize the architecture. The `segsum` is $O(L^2)$ and it's used twice.
+However, the `states` calculation is the most expensive part in terms of tensor sizes.
+The `Y_diag` is also expensive.
+
+Let's refine the `intra_chunk_cuda` to be more robust and handle the `segsum` logic if possible.
+Actually, the `segsum` is used for `L = torch.exp(self.segsum(A_blocks))`.
+`L[i, j] = exp(sum_{k=j}^i A[k])`.
+This is used in `Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", C_blocks, B_blocks, L, X_blocks)`.
+The indices are: `b, c, l, h, n` (C), `b, c, s, h, n` (B), `b, h, c, l, s` (L), `b, c, s, h, p` (X).
+Wait, the `L` indices in `einsum` are `bhcls`.
+So `L[b, h, c, l, s]` is the decay from `s` to `l`.
+This is exactly what `segsum` computes.
+
+I will provide a version that replaces the `states` calculation with the custom kernel. This is the most significant speedup for large $N$ and $P$.
+
+One detail: `segsum` uses `-torch.inf`. In CUDA, `exp(-inf)` is `0`, which is correct.
+
+Final check on the `intra_chunk_kernel` logic:
+`states[b, h, c, p, n] = sum_{l} B[b, c, l, h, n] * exp(A_cumsum[b, h, c, L-1] - A_cumsum[b, h, c, l]) * X[b, c, l, h, p]`
+This matches the original:
+`decay_states = torch.exp((A_cumsum[:, :, :, -1:] - A_cumsum))`
+`states = torch.einsum("bclhn,bhcl,bclhp->bchpn", B_blocks, decay_states, X_blocks)`
+`decay_states` is `bhcl`.
+`states[b, h, c, p, n] = sum_{l} B[b, c, l, h, n] * decay_states[b, h, c, l] * X[b, c, l, h, p]`
+`decay_states[b, h, c, l] = exp(A_cumsum[b, h, c, L-1] - A_cumsum[b, h, c, l])`.
+Yes, it matches.
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+from torch.utils.cpp_extension import load_inline
+
+# CUDA source for fused intra-chunk state computation
+# This kernel computes: states[b, h, c, p, n] = sum_{l=0}^{L-1} B[b, c, l, h, n] * exp(A_cumsum[b, h, c, L-1] - A_cumsum[b, h, c, l]) * X[b, c, l, h, p]
+# This avoids the large intermediate decay_states tensor and the einsum.
+
+intra_chunk_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void intra_chunk_kernel(
+    const float* __restrict__ B,       // [B, C, L, H, N]
+    const float* __restrict__ A_cumsum, // [B, H, C, L]
+    const float* __restrict__ X,       // [B, C, L, H, P]
+    float* __restrict__ states,        // [B, H, C, P, N]
+    int B_size, int H, int C, int L, int P, int N) {
+
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    int p = blockIdx.y * blockDim.y + threadIdx.y;
+    int ch = blockIdx.z; // index for (b * H * C)
+
+    if (n >= N || p >= P || ch >= B_size * H * C) return;
+
+    int b = ch / (H * C);
+    int h = (ch / C - b * H);
+    int c = ch % C;
+
+    float sum = 0.0f;
+    float a_last = A_cumsum[((b * H + h) * C + c) * L + (L - 1)];
+
+    for (int l = 0; l < L; ++l) {
+        float a_l = A_cumsum[((b * H + h) * C + c) * L + l];
+        float decay = expf(a_last - a_l);
+        
+        // B[b, c, l, h, n]
+        float b_val = B[(((b * C + c) * L + l) * H + h) * N + n];
+        // X[b, c, l, h, p]
+        float x_val = X[(((b * C + c) * L + l) * H + h) * P + p];
+        
+        sum += b_val * decay * x_val;
+    }
+
+    states[((b * H + h) * C + c) * (P * N) + p * N + n] = sum;
+}
+
+torch::Tensor intra_chunk_cuda(torch::Tensor B, torch::Tensor A_cumsum, torch::Tensor X) {
+    int B_size = B.size(0);
+    int C = B.size(1);
+    int L = B.size(2);
+    int H = B.size(3);
+    int N = B.size(4);
+    int P = X.size(4);
+
+    auto states = torch::zeros({B_size, H, C, P, N}, B.options());
+
+    dim3 block(16, 16);
+    dim3 grid((N + 15) / 16, (P + 15) / 16, B_size * H * C);
+
+    intra_chunk_kernel<<<grid, block>>>(
+        B.data_ptr<float>(),
+        A_cumsum.data_ptr<float>(),
+        X.data_ptr<float>(),
+        states.data_ptr<float>(),
+        B_size, H, C, L, P, N
+    );
+
+    return states;
+}
+"""
+
+intra_chunk_cpp_source = "torch::Tensor intra_chunk_cuda(torch::Tensor B, torch::Tensor A_cumsum, torch::Tensor X);"
+
+class ModelNew(nn.Module):
+    def __init__(self, batch_size, seq_length, n_heads, d_head, d_state, block_len=64):
+        super(ModelNew, self).__init__()
+        self.batch_size = batch_size
+        self.seq_length = seq_length
+        self.n_heads = n_heads
+        self.d_head = d_head
+        self.d_state = d_state
+        self.block_len = block_len
+        
+        self.A = nn.Parameter(torch.randn(batch_size, seq_length, n_heads))
+        self.B = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+        self.C = nn.Parameter(torch.randn(batch_size, seq_length, n_heads, d_state))
+
+        self.intra_chunk_op = load_inline(
+            name="intra_chunk_op",
+            cpp_sources=intra_chunk_cpp_source,
+            cuda_sources=intra_chunk_cuda_source,
+            functions=["intra_chunk_cuda"],
+            verbose=False
+        )
+
+    def segsum(self, x):
+        T = x.size(-1)
+        x_cumsum = torch.cumsum(x, dim=-1)
+        x_segsum = x_cumsum[..., :, None] - x_cumsum[..., None, :]
+        mask = torch.tril(torch.ones(T, T, device=x.device, dtype=bool), diagonal=0)
+        x_segsum = x_segsum.masked_fill(~mask, -float('inf'))
+        return x_segsum
+
+    def forward(self, X, initial_states=None):
+        from einops import rearrange
+        X_blocks, A_blocks, B_blocks, C_blocks = [
+            rearrange(x, "b (c l) ... -> b c l ...", l=self.block_len)
+            for x in (X, self.A, self.B, self.C)
+        ]
+        
+        A_blocks = rearrange(A_blocks, "b c l h -> b h c l")
+        A_cumsum = torch.cumsum(A_blocks, dim=-1)
+        
+        L_mat = torch.exp(self.segsum(A_blocks))
+        Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", 
+                             C_blocks, B_blocks, L_mat, X_blocks)
+        
+        states = self.intra_chunk_op.intra_chunk_cuda(B_blocks, A_cumsum, X_blocks)
+        
+        if initial_states is None:
+            initial_states = torch.zeros_like(states[:, :1])
+        states = torch.cat([initial_states, states], dim=1)
+        
+        decay_chunk = torch.exp(self.segsum(F.pad(A_cumsum[:, :, :, -1], (1, 0))))
+        new_states = torch.einsum("bhzc,bchpn->bzhpn", decay_chunk, states)
+        return new_states[:, -1]
+```
+
+Wait, I noticed a small error in my `intra_chunk_kernel` indexing for `states`.
+`states[((b * H + h) * C + c) * (P * N) + p * N + n]`
+The shape is `(B, H, C, P, N)`.
+The index for `(b, h, c, p, n)` is:
+`b * (H*C*P*N) + h * (C*P*N) + c * (P*N) + p * N + n`.
+My code: `((b * H + h) * C + c) * (P * N) + p * N + n`
+`= (b*H*C + h*C + c) * P * N + p * N + n`
+`= b*H*C*P*N + h*C*P*N + c*P*N + p*N + n`.
+Yes, it is correct.
+
+One more thing: `A_cumsum` in the original code is `bhcl`.
+In my kernel, I access it as `A_cumsum[((b * H + h) * C + c) * L + l]`.
+This is correct for shape `(B, H, C, L)`.
+
+Final check on `Y_diag` einsum:
+`Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", C_blocks, B_blocks, L, X_blocks)`
+`C_blocks`: `b, c, l, h, n`
+`B_blocks`: `b, c, s, h, n`
+`L`: `b, h, c, l, s`
+`X_blocks`: `b, c, s, h, p`
+Result: `b, c, l, h, p`
+The indices match.
+
+The `segsum` is still $O(L^2)$ but it's only $L=64$ in the example, so it's not the main bottleneck compared to the $O(B \cdot H \cdot C \cdot P \cdot N)$ part.
+
+One final detail: `import torch` and `from einops import rearrange` should be inside the class or at the top. I'll put them at the top.
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+from torch.utils.cpp_extension import load_inline
+
+# CUDA source for fused intra-chunk state computation
+# This kernel computes: states[b, h, c, p, n] = sum_{l=0}^{L-1} B[b, c, l, h, n] * exp(A_cumsum[b, h, c, L-1] - A_cumsum[b, h, c, l]) * X[b, c, l, h, p]
+# This avoids the large intermediate decay_states tensor and the einsum.
+
+intra_chunk_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void intra_chunk_kernel(
+    const float* __restrict__ B,       // [B, C, L, H, N]
+    const float* __restrict__ A_cumsum, // [B, H, C, L]
+    const float* __restrict__ X,       // [B, C, L, H, P]
+    float* __restrict__ states,        // [B, H, C, P, N]
+    int B_size, int H, int C, int L, int P, int N) {
+
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    int p = blockIdx.y * blockDim.y + threadIdx.y;
+    int ch = blockIdx.z; // index for (b * H * C)
+
+    if (n >= N || p >= P || ch >= B_size * H * C) return;
+
+    int b = ch / (H * C);
+    int h = (ch / C - b * H);
+    int c = ch % C;
+
+    float sum = 0.0f;
+    float a_last = A_cumsum[((b * H + h) * C + c) * L + (L - 1)];
+
+    for (int l = 0; l < L; ++l) {
+        float a_l = A_cumsum[((b * H + h) * C + c) * L + l];
+        float decay = expf(a_last - a_l);
+        
+        // B[b, c, l, h, n]
+        float b_val = B[(((b * C + c) * L + l) * H + h) * N + n];
+        // X[b, c, l, h, p]
+        float x_val = X[(((b * C + c) * L + l) * H + h) * P + p];
+        
+        sum += b_val * decay * x_val;
+    }
+
+    states[((b * H + h) * C + c) * (P * N) + p * N + n] = sum;
+}
+
+torch::Tensor intra_chunk_cuda(torch::Tensor B, torch::Tensor A_cumsum, torch::Tensor X) {
+    int B_size = B.size(0);
+    int C = B.size(1);
+    int L = B.size(2);
+    int H = B.size(3);
+    int N = B.size(4);
+    int P = X.size(4);
+
+    auto states = torch::zeros({B_size, H, C, P, N}, B.options());
+
+    dim3 block(16, 16);
+    dim3 grid((

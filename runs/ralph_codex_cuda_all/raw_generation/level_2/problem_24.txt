@@ -1,0 +1,144 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cpp_sources = """
+torch::Tensor conv3d_min_softmax_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias);
+"""
+
+cuda_sources = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void conv3d_min_softmax_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    float* __restrict__ out,
+    int N, int Cin, int D, int H, int Wd,
+    int Cout, int K, int Do, int Ho, int Wo
+) {
+    int pos = blockIdx.x;
+    int ow = pos % Wo;
+    int tmp = pos / Wo;
+    int oh = tmp % Ho;
+    int n = tmp / Ho;
+    int tid = threadIdx.x;
+
+    __shared__ float vals[32];
+
+    if (tid < Cout) {
+        float minv = INFINITY;
+
+        for (int od = 0; od < Do; ++od) {
+            float acc = b[tid];
+
+            #pragma unroll
+            for (int ci = 0; ci < 3; ++ci) {
+                #pragma unroll
+                for (int kz = 0; kz < 3; ++kz) {
+                    int iz = od + kz;
+                    #pragma unroll
+                    for (int ky = 0; ky < 3; ++ky) {
+                        int iy = oh + ky;
+                        #pragma unroll
+                        for (int kx = 0; kx < 3; ++kx) {
+                            int ix = ow + kx;
+                            int x_idx = (((n * Cin + ci) * D + iz) * H + iy) * Wd + ix;
+                            int w_idx = ((((tid * Cin + ci) * K + kz) * K + ky) * K + kx);
+                            acc += x[x_idx] * w[w_idx];
+                        }
+                    }
+                }
+            }
+
+            minv = fminf(minv, acc);
+        }
+
+        vals[tid] = minv;
+    }
+
+    __syncthreads();
+
+    float maxv = -INFINITY;
+    if (tid == 0) {
+        for (int c = 0; c < Cout; ++c) {
+            maxv = fmaxf(maxv, vals[c]);
+        }
+        vals[31] = maxv;
+    }
+
+    __syncthreads();
+
+    maxv = vals[31];
+    float sumv = 0.0f;
+
+    if (tid == 0) {
+        for (int c = 0; c < Cout; ++c) {
+            float e = expf(vals[c] - maxv);
+            vals[c] = e;
+            sumv += e;
+        }
+        vals[30] = sumv;
+    }
+
+    __syncthreads();
+
+    sumv = vals[30];
+
+    if (tid < Cout) {
+        int out_idx = (((n * Cout + tid) * Ho + oh) * Wo + ow);
+        out[out_idx] = vals[tid] / sumv;
+    }
+}
+
+torch::Tensor conv3d_min_softmax_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias) {
+    int N = x.size(0);
+    int Cin = x.size(1);
+    int D = x.size(2);
+    int H = x.size(3);
+    int Wd = x.size(4);
+
+    int Cout = weight.size(0);
+    int K = weight.size(2);
+
+    int Do = D - K + 1;
+    int Ho = H - K + 1;
+    int Wo = Wd - K + 1;
+
+    auto out = torch::empty({N, Cout, Ho, Wo}, x.options());
+
+    int blocks = N * Ho * Wo;
+    conv3d_min_softmax_kernel<<<blocks, 32>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, Cin, D, H, Wd, Cout, K, Do, Ho, Wo
+    );
+
+    return out;
+}
+"""
+
+fused_conv_min_softmax = load_inline(
+    name="fused_conv3d_min_softmax_fp32",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["conv3d_min_softmax_cuda"],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, dim):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.dim = dim
+        self.op = fused_conv_min_softmax
+
+    def forward(self, x):
+        return self.op.conv3d_min_softmax_cuda(x, self.conv.weight, self.conv.bias)
+```

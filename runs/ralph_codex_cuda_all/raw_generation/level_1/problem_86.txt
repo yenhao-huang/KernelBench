@@ -1,0 +1,211 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void depthwise3x3_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    float* __restrict__ y,
+    int B, int C, int H, int W,
+    int OH, int OW,
+    int stride, int padding, int dilation
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * C * OH * OW;
+    if (idx >= total) return;
+
+    int ow = idx % OW;
+    int oh = (idx / OW) % OH;
+    int c = (idx / (OW * OH)) % C;
+    int b = idx / (OW * OH * C);
+
+    float acc = 0.0f;
+    #pragma unroll
+    for (int kh = 0; kh < 3; ++kh) {
+        int ih = oh * stride + kh * dilation - padding;
+        if (ih >= 0 && ih < H) {
+            #pragma unroll
+            for (int kw = 0; kw < 3; ++kw) {
+                int iw = ow * stride + kw * dilation - padding;
+                if (iw >= 0 && iw < W) {
+                    int x_idx = ((b * C + c) * H + ih) * W + iw;
+                    int w_idx = c * 9 + kh * 3 + kw;
+                    acc += x[x_idx] * w[w_idx];
+                }
+            }
+        }
+    }
+    y[idx] = acc;
+}
+
+__global__ void pointwise1x1_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    float* __restrict__ y,
+    int B, int IC, int OC, int H, int W
+) {
+    constexpr int TILE_M = 16;
+    constexpr int TILE_N = 16;
+    __shared__ float as[TILE_M][TILE_N + 1];
+    __shared__ float bs[TILE_N][TILE_N + 1];
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int m = blockIdx.y * TILE_M + ty;
+    int oc = blockIdx.x * TILE_N + tx;
+    int HW = H * W;
+    int M = B * HW;
+
+    float acc = 0.0f;
+
+    for (int k0 = 0; k0 < IC; k0 += TILE_N) {
+        int k_a = k0 + tx;
+        if (m < M && k_a < IC) {
+            int b = m / HW;
+            int s = m - b * HW;
+            int h = s / W;
+            int ww = s - h * W;
+            as[ty][tx] = x[((b * IC + k_a) * H + h) * W + ww];
+        } else {
+            as[ty][tx] = 0.0f;
+        }
+
+        int k_b = k0 + ty;
+        if (k_b < IC && oc < OC) {
+            bs[ty][tx] = w[oc * IC + k_b];
+        } else {
+            bs[ty][tx] = 0.0f;
+        }
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int k = 0; k < TILE_N; ++k) {
+            acc += as[ty][k] * bs[k][tx];
+        }
+
+        __syncthreads();
+    }
+
+    if (m < M && oc < OC) {
+        int b = m / HW;
+        int s = m - b * HW;
+        int h = s / W;
+        int ww = s - h * W;
+        y[((b * OC + oc) * H + h) * W + ww] = acc;
+    }
+}
+
+torch::Tensor depthwise_sep_conv_cuda(
+    torch::Tensor x,
+    torch::Tensor dw,
+    torch::Tensor pw,
+    int stride,
+    int padding,
+    int dilation
+) {
+    int B = x.size(0);
+    int C = x.size(1);
+    int H = x.size(2);
+    int W = x.size(3);
+    int OC = pw.size(0);
+    int K = dw.size(2);
+
+    int OH = (H + 2 * padding - dilation * (K - 1) - 1) / stride + 1;
+    int OW = (W + 2 * padding - dilation * (K - 1) - 1) / stride + 1;
+
+    auto mid = torch::empty({B, C, OH, OW}, x.options());
+    auto out = torch::empty({B, OC, OH, OW}, x.options());
+
+    int total_dw = B * C * OH * OW;
+    int threads = 256;
+    int blocks_dw = (total_dw + threads - 1) / threads;
+    depthwise3x3_kernel<<<blocks_dw, threads>>>(
+        x.data_ptr<float>(),
+        dw.data_ptr<float>(),
+        mid.data_ptr<float>(),
+        B, C, H, W, OH, OW, stride, padding, dilation
+    );
+
+    dim3 block(16, 16);
+    dim3 grid((OC + 15) / 16, (B * OH * OW + 15) / 16);
+    pointwise1x1_kernel<<<grid, block>>>(
+        mid.data_ptr<float>(),
+        pw.data_ptr<float>(),
+        out.data_ptr<float>(),
+        B, C, OC, OH, OW
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor depthwise_sep_conv_cuda(
+    torch::Tensor x,
+    torch::Tensor dw,
+    torch::Tensor pw,
+    int stride,
+    int padding,
+    int dilation
+);
+"""
+
+depthwise_sep_ext = load_inline(
+    name="depthwise_sep_conv_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["depthwise_sep_conv_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        dilation: int = 1,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.depthwise = nn.Conv2d(
+            in_channels,
+            in_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=in_channels,
+            bias=False,
+        )
+        self.pointwise = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=1,
+            bias=False,
+        )
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.op = depthwise_sep_ext
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.op.depthwise_sep_conv_cuda(
+            x.contiguous(),
+            self.depthwise.weight.contiguous(),
+            self.pointwise.weight.contiguous(),
+            self.stride,
+            self.padding,
+            self.dilation,
+        )
+```

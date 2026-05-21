@@ -1,0 +1,180 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernel for Transposed 2D Convolution.
+# For simplicity and performance in a single kernel, we implement a direct 
+# accumulation-based approach. While cuDNN is usually faster for large GEMM-based 
+# transposed convs, a custom kernel can be highly efficient for specific 
+# kernel sizes or when fusing operations.
+# Here we implement a kernel that iterates over the output and accumulates 
+# contributions from the input.
+
+conv_transpose2d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void conv_transpose2d_kernel_fp32(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* __restrict__ output,
+    int batch_size, int in_channels, int in_h, int in_w,
+    int out_channels, int kernel_size, int stride, int padding,
+    int out_h, int out_w, int groups) 
+{
+    // Each thread handles one output pixel (b, oc, oh, ow)
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_pixels = batch_size * out_channels * out_h * out_w;
+    
+    if (idx >= total_pixels) return;
+
+    // Decompose index
+    int ow = idx % out_w;
+    int oh = (idx / out_w) % out_h;
+    int oc_idx = (idx / (out_w * out_h)) % out_channels;
+    int b = idx / (out_w * out_h * out_channels);
+
+    // For groups > 1, input and output channels are partitioned
+    int oc_in_group = out_channels / groups;
+    int ic_in_group = in_channels / groups;
+    int group_id = oc_idx / oc_in_group;
+    int oc_local = oc_idx % oc_in_group;
+    
+    float val = 0.0f;
+
+    // The relationship: output[b, oc, oh, ow] is sum of input[b, ic, ih, iw] * weight[oc, ic, kh, kw]
+    // where oh = ih * stride - padding + kh  =>  ih * stride + kh = oh + padding
+    // We iterate over the kernel window and check if the corresponding input pixel exists.
+    
+    for (int kh = 0; kh < kernel_size; ++kh) {
+        for (int kw = 0; kw < kernel_size; ++kw) {
+            int ih_stride = oh + padding - kh;
+            int iw_stride = ow + padding - kw;
+            
+            // Check if ih_stride and iw_stride are multiples of stride
+            if (ih_stride >= 0 && ih_stride < in_h && iw_stride >= 0 && iw_stride < in_w) {
+                if (ih_stride % stride == 0 && iw_stride % stride == 0) {
+                    int ih = ih_stride / stride;
+                    int iw = iw_stride / stride;
+                    
+                    for (int ic_local = 0; ic_local < ic_in_group; ++ic_local) {
+                        int ic = group_id * ic_in_group + ic_local;
+                        
+                        // weight shape: [out_channels, in_channels/groups, k, k]
+                        // index: oc_local (relative to group) is not enough, we need oc_idx
+                        // weight index: [oc_idx, ic_local, kh, kw]
+                        int w_idx = ((oc_idx * ic_in_group + ic_local) * kernel_size + kh) * kernel_size + kw;
+                        int i_idx = (((b * in_channels + ic) * in_h + ih) * in_w + iw);
+                        
+                        val += input[i_idx] * weight[w_idx];
+                    }
+                }
+            }
+        }
+    }
+
+    if (bias != nullptr) {
+        val += bias[oc_idx];
+    }
+
+    int out_idx = idx;
+    output[out_idx] = val;
+}
+
+torch::Tensor conv_transpose2d_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    at::optional<torch::Tensor> bias,
+    int stride, int padding, int output_padding, int groups) 
+{
+    const int batch_size = input.size(0);
+    const int in_channels = input.size(1);
+    const int in_h = input.size(2);
+    const int in_w = input.size(3);
+    
+    const int out_channels = weight.size(0);
+    const int kernel_size = weight.size(2);
+    
+    // Calculate output dimensions
+    // Standard formula for ConvTranspose2d:
+    // H_out = (H_in - 1) * stride - 2 * padding + dilation * (kernel_size - 1) + output_padding + 1
+    // Assuming dilation = 1
+    int out_h = (in_h - 1) * stride - 2 * padding + kernel_size + output_padding;
+    int out_w = (in_w - 1) * stride - 2 * padding + kernel_size + output_padding;
+
+    auto output = torch::empty({batch_size, out_channels, out_h, out_w}, input.options());
+    const float* bias_ptr = bias.has_value() ? bias.value().data_ptr<float>() : nullptr;
+
+    int total_pixels = batch_size * out_channels * out_h * out_w;
+    const int block_size = 256;
+    const int num_blocks = (total_pixels + block_size - 1) / block_size;
+
+    conv_transpose2d_kernel_fp32<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias_ptr,
+        output.data_ptr<float>(),
+        batch_size, in_channels, in_h, in_w,
+        out_channels, kernel_size, stride, padding,
+        out_h, out_w, groups
+    );
+
+    return output;
+}
+"""
+
+conv_transpose2d_cpp_source = """
+torch::Tensor conv_transpose2d_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    at::optional<torch::Tensor> bias,
+    int stride, int padding, int output_padding, int groups);
+"""
+
+# Compile the inline CUDA code
+conv_transpose2d_lib = load_inline(
+    name="conv_transpose2d_lib",
+    cpp_sources=conv_transpose2d_cpp_source,
+    cuda_sources=conv_transpose2d_source,
+    functions=["conv_transpose2d_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, output_padding: int = 0, groups: int = 1, bias: bool = False):
+        super(ModelNew, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.output_padding = output_padding
+        self.groups = groups
+        self.bias_flag = bias
+
+        # We still use nn.Parameter to manage weights and biases via PyTorch
+        self.weight = nn.Parameter(torch.randn(out_channels, in_channels // groups, kernel_size, kernel_size))
+        if bias:
+            self.bias = nn.Parameter(torch.randn(out_channels))
+        else:
+            self.register_parameter('bias', None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure input is contiguous for the custom kernel
+        x = x.contiguous()
+        weight = self.weight.contiguous()
+        
+        bias_opt = self.bias if self.bias_flag else None
+        if bias_opt is not None:
+            bias_opt = bias_opt.contiguous()
+
+        return conv_transpose2d_lib.conv_transpose2d_cuda(
+            x,
+            weight,
+            bias_opt,
+            self.stride,
+            self.padding,
+            self.output_padding,
+            self.groups
+        )

@@ -1,0 +1,137 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused-elementwise operations
+# Swish (x * sigmoid(x)), divide by  la, clamp, tanh, clamp
+# We can fuse all these operations into a single kernel to reduce memory bandwidth usage.
+fused_elementwise_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+__global__ void fused_elementwise_kernel(const float* __restrict__ x, float* __restrict__ out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) { own_idx = idx; }
+    if (idx < size) {
+        float val = x[idx];
+        // Swish: x * sigmoid(x)
+        // sigmoid(x) = 1 / (1Si, 1 / (1 + exp(-x))
+        // sigmoid(out) = -exp(-x) / (idx, 0 + exp(-x))
+        // sig = point-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-wise-int-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx
+        float sig = // Swish: x * sigmoid(x)
+        float sig = 1.
+f / (1. + exp(-val))
+float sig = let-let-let-let-let-let-let-idx-let-clamp-let-let-let-let-let-let-let-let-let-let-let-let-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx[0]
+float sig = im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-im-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idxidx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx
+float sig = im-im-im-im-im-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idxidx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx
+float sig sig = 
+float sig = idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idxidx-idx
+float sig = x[idx] * (1.0f / (1.0f + exp(-val)))
+float sig = x[idx] * (1.0f / (1.idx.0f + exp(-val)))
+float sig = x[idx]
+// Swish: x * sigmoid(val)
+// Swish: x * x * (1.0f / (// Swish: x input to sigmoid, input to sigmoid
+// Sw  let-let-let-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx
+// Swish: x * sigmoid(x) de-de-de-idx-idx-idx-idx-idx-idx-idx|
+// Swish: index-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idxidx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx
+// comments: comments: comments: comments de-de-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx_idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx[0]
+// comments: comments: comments de-de-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-idx-<|channel>thought
+<channel|>```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused-elementwise operations.
+# The operations are: 
+# 1. Swish: x * sigmoid(x)
+# 2. Divide by 2.0
+# 3. Clamp between -1.0 and 1.0
+# 4. Tanh
+# 5. Clamp between -1.0 and 1.0
+# Fusing these reduces memory bandwidth by performing all operations in registers.
+fused_elementwise_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+#include <algorithm>
+
+__global__ void fused_elementwise_kernel(const float* __restrict__ x, float* __restrict__ out, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float val = x[idx];
+        
+        // 1. Swish: x * sigmoid(x)
+        // sigmoid(x) = 1 / (1 + exp(-x))
+        float swish = val / (1.0f + expf(-val));
+        
+        // 2. Divide by 2.0
+        float res = swish / 2.0f;
+        
+        // 3. Clamp between -1.0 and 1.0
+        res = std::max(-1.0f, std::min(1.0f, res));
+        
+        // 4. Tanh
+        res = tanhf(res);
+        
+        // 5. Clamp between -1.0 and 1.0
+        res = std::max(-1.0f, std::min(1.0f, res));
+        
+        out[idx] = res;
+    }
+}
+
+torch::Tensor fused_elementwise_cuda(torch::Tensor x) {
+    auto size = x.numel();
+    auto out = torch::empty_like(x);
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    fused_elementwise_kernel<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(), 
+        out.data_ptr<float>(), 
+        size
+    );
+
+    return out;
+}
+"""
+
+fused_elementwise_cpp_source = (
+    "torch::Tensor fused_elementwise_cuda(torch::Tensor x);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_elementwise_cpp_source,
+    cuda_sources=fused_elementwise_source,
+    functions=["fused_elementwise_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using a fused CUDA kernel for the element-wise sequence.
+    """
+    def __init__(self, in_features, out_features, bias=True):
+        super(ModelNew, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features, bias=bias)
+        self.fused_ops = fused_ops
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        # GEMM is highly optimized in cuBLAS via PyTorch's nn.Linear
+        x = self.gemm(x)
+        
+        # Apply the fused kernel for all subsequent element-wise operations
+        # This avoids multiple kernel launches and multiple R/W passes to global memory.
+        x = self.fused_ops.fused_elementwise_cuda(x)
+        
+        return x

@@ -1,0 +1,213 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for Max reduction
+max_reduction_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <float.h>
+
+__global__ void max_reduction_kernel(const float* input, float* output, int batch_size, int dim1, int dim2) {
+    // We assume the reduction is over the last dimension (dim2) for simplicity in this 3D tensor case.
+    // If dim was different, we would need more complex indexing. 
+    // Given the input shape (batch_size, dim1, dim2), and typical usage, let's assume reduction over dim2.
+    // Each thread block handles one element of the output tensor.
+    // Output shape: (batch_size, dim1)
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * dim1;
+
+    if (idx < total_elements) {
+        int b = idx / dim1;
+        int d1 = idx % dim1;
+        
+        float max_val = -FLT_MAX;
+        const float* row_ptr = input + (b * dim1 + d1) * dim2;
+        
+        // Loop over the reduction dimension
+        for (int i = 0; i < dim2; ++i) {
+            if (row_ptr[i] > max_val) {
+                max_val = row_ptr[i];
+            }
+        }
+        output[idx] = max_val;
+    }
+}
+
+torch::Tensor max_reduction_cuda(torch::Tensor x, int dim) {
+    // Assuming input is 3D: (batch_size, dim1, dim2)
+    // And we are reducing over the last dimension (dim=2) or a specific one.
+    // For this example, we hardcode logic for reducing over the last dimension of a 3D tensor.
+    // If the user passes dim=2, we reduce over dim2.
+    
+    if (x.dim() != 3) {
+        throw std::runtime_error("Expected 3D tensor");
+    }
+    
+    int batch_size = x.size(0);
+    int dim1 = x.size(1);
+    int dim2 = x.size(2);
+    
+    // If dim is not the last one, we would need to permute. 
+    // For this specific problem statement and input generation, let's assume reduction over the last dimension (dim=2).
+    // If dim=1, we reduce over dim1. Let's handle both common cases or just the last one as per standard max_pool-like behavior.
+    // The prompt says "Max reduction over a specific dimension". 
+    // Let's implement a general 3D reduction for dim=2 (last) and dim=1 (middle).
+    
+    torch::Tensor output;
+    
+    if (dim == 2) {
+        output = torch::empty({batch_size, dim1}, x.options());
+        const int block_size = 256;
+        const int num_blocks = (batch_size * dim1 + block_size - 1) / block_size;
+        
+        max_reduction_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), output.data_ptr<float>(), batch_size, dim1, dim2);
+    } else if (dim == 1) {
+        output = torch::empty({batch_size, dim2}, x.options());
+        // For dim=1 reduction, each thread handles one (b, d2) pair.
+        int total_elements = batch_size * dim2;
+        const int block_size = 256;
+        const int num_blocks = (total_elements + block_size - 1) / block_size;
+        
+        // We need a different kernel or logic for reducing over dim1. 
+        // Let's use a simple loop in the same kernel structure but with different indexing.
+        // To keep it simple and robust, let's just implement the last dimension reduction as it's the most common "max" operation on features.
+        // However, to be safe, let's assume the test case might use dim=2.
+        // If dim=1 is required, we'd need a separate kernel or more complex indexing.
+        // Given the complexity of writing two kernels inline, and the example input shape (128, 4096, 4095), 
+        // reducing over the last dimension (4095) is a very standard operation.
+        
+        // Let's stick to dim=2 for this implementation as it maps directly to the provided kernel above.
+        // If the user calls with dim=1, this will fail or produce wrong results if not handled.
+        // But looking at get_init_inputs returning [1], it suggests dim might be 1.
+        // Let's write a more generic kernel that handles any dimension for 3D tensors? 
+        // That's complex. Let's assume the primary optimization target is the last dimension or we handle both.
+        
+        // Actually, let's just implement the reduction over the LAST dimension (dim=2) as it's the most performant and common.
+        // If dim=1 is passed, PyTorch's native max might be used if we don't override, but here we are replacing.
+        // Let's assume the question implies optimizing the operation regardless of dim, but for simplicity in inline code, 
+        // let's handle dim=2. If dim=1 is needed, we can add a second kernel.
+        
+        // Re-reading: "get_init_inputs" returns [1]. This likely sets self.dim = 1.
+        // So we MUST support dim=1.
+        
+        output = torch::empty({batch_size, dim2}, x.options());
+        const int block_size = 256;
+        const int num_blocks = (batch_size * dim2 + block_size - 1) / block_size;
+        
+        // Kernel for reducing over dim=1
+        max_reduction_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), output.data_ptr<float>(), batch_size, dim2, dim1); 
+        // Note: The kernel above assumes reduction over the LAST dimension of the input view.
+        // If we pass (batch_size, dim2) as output, and input is (batch_size, dim1, dim2), 
+        // reducing over dim1 means for each (b, d2), we scan dim1.
+        // The kernel above scans the last dimension of the contiguous memory layout if we view it correctly?
+        // No, the kernel above assumes the reduction dimension is the innermost loop index `i` going up to `dim2`.
+        // So if we want to reduce over dim1 (size 4096), we need a kernel that loops 4096 times.
+        
+        // Let's create a specific kernel for reducing over the MIDDLE dimension.
+    } else {
+        throw std::runtime_error("Unsupported dimension for reduction in custom kernel");
+    }
+    
+    return output;
+}
+
+// Kernel for reducing over the middle dimension (dim=1)
+__global__ void max_reduction_dim1_kernel(const float* input, float* output, int batch_size, int dim1, int dim2) {
+    // Output shape: (batch_size, dim2)
+    // Each thread handles one element in the output.
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * dim2;
+
+    if (idx < total_elements) {
+        int b = idx / dim2;
+        int d2 = idx % dim2;
+        
+        float max_val = -FLT_MAX;
+        // The input is (batch_size, dim1, dim2).
+        // For a fixed b and d2, we iterate over d1 from 0 to dim1-1.
+        // The stride for d1 is dim2.
+        const float* col_ptr = input + (b * dim1 + 0) * dim2 + d2;
+        
+        for (int i = 0; i < dim1; ++i) {
+            if (col_ptr[i * dim2] > max_val) { // Stride is dim2 because we are moving along dim1
+                max_val = col_ptr[i * dim2];
+            }
+        }
+        output[idx] = max_val;
+    }
+}
+
+torch::Tensor max_reduction_cuda_general(torch::Tensor x, int dim) {
+    if (x.dim() != 3) {
+        throw std::runtime_error("Expected 3D tensor");
+    }
+    
+    int batch_size = x.size(0);
+    int dim1 = x.size(1);
+    int dim2 = x.size(2);
+    
+    torch::Tensor output;
+    
+    if (dim == 2) {
+        // Reduce over last dimension
+        output = torch::empty({batch_size, dim1}, x.options());
+        const int block_size = 256;
+        const int num_blocks = (batch_size * dim1 + block_size - 1) / block_size;
+        max_reduction_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), output.data_ptr<float>(), batch_size, dim1, dim2);
+    } else if (dim == 1) {
+        // Reduce over middle dimension
+        output = torch::empty({batch_size, dim2}, x.options());
+        const int block_size = 256;
+        const int num_blocks = (batch_size * dim2 + block_size - 1) / block_size;
+        max_reduction_dim1_kernel<<<num_blocks, block_size>>>(x.data_ptr<float>(), output.data_ptr<float>(), batch_size, dim1, dim2);
+    } else {
+        throw std::runtime_error("Unsupported dimension for reduction in custom kernel");
+    }
+    
+    return output;
+}
+"""
+
+max_reduction_cpp_source = (
+    "torch::Tensor max_reduction_cuda_general(torch::Tensor x, int dim);"
+)
+
+# Compile the inline CUDA code
+max_reduction = load_inline(
+    name="max_reduction",
+    cpp_sources=max_reduction_cpp_source,
+    cuda_sources=max_reduction_source,
+    functions=["max_reduction_cuda_general"],
+    verbose=False,
+    extra_cflags=["-O2"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Max reduction over a specific dimension using custom CUDA operators.
+    """
+    def __init__(self, dim: int):
+        """
+        Initializes the model with the dimension to reduce over.
+
+        Args:
+            dim (int): The dimension to reduce over.
+        """
+        super(ModelNew, self).__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Max reduction over the specified dimension to the input tensor using custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after Max reduction over the specified dimension.
+        """
+        return max_reduction.max_reduction_cuda_general(x, self.dim)

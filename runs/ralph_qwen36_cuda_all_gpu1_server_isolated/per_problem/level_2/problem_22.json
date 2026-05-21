@@ -1,0 +1,44 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 74.251,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "7.607297",
+        "7.608166",
+        "7.606096",
+        "7.603335",
+        "7.602354"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "8.409203",
+        "8.460617",
+        "8.637276",
+        "8.277565",
+        "8.222824"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_2/problem_22.py",
+  "level": 2,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 22,
+  "problem_name": "22_Matmul_Scale_ResidualAdd_Clamp_LogSumExp_Mish.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_2/problem_22.txt",
+  "static_warnings": [
+    "Uses torch computation op: torch.logsumexp"
+  ],
+  "status": "evaluated"
+}

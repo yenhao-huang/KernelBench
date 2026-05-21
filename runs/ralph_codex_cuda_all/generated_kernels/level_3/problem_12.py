@@ -1,0 +1,187 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+vgg19_cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <float.h>
+
+__global__ void relu_inplace_kernel(float* x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = x[i];
+        x[i] = v > 0.0f ? v : 0.0f;
+    }
+}
+
+__global__ void maxpool2x2_kernel(const float* __restrict__ x, float* __restrict__ y,
+                                  int N, int C, int H, int W) {
+    int OH = H >> 1;
+    int OW = W >> 1;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C * OH * OW;
+    if (idx >= total) return;
+
+    int ow = idx % OW;
+    int oh = (idx / OW) % OH;
+    int c = (idx / (OW * OH)) % C;
+    int n = idx / (OW * OH * C);
+
+    int base = ((n * C + c) * H + (oh << 1)) * W + (ow << 1);
+    float a = x[base];
+    float b = x[base + 1];
+    float d = x[base + W];
+    float e = x[base + W + 1];
+    float m = fmaxf(fmaxf(a, b), fmaxf(d, e));
+    y[idx] = m;
+}
+
+__global__ void linear_kernel(const float* __restrict__ x,
+                              const float* __restrict__ w,
+                              const float* __restrict__ b,
+                              float* __restrict__ y,
+                              int B, int IN, int OUT,
+                              int do_relu) {
+    int out_col = blockIdx.x;
+    int batch = blockIdx.y;
+    int tid = threadIdx.x;
+
+    float sum = 0.0f;
+    const float* xb = x + batch * IN;
+    const float* wb = w + out_col * IN;
+
+    for (int k = tid; k < IN; k += blockDim.x) {
+        sum += xb[k] * wb[k];
+    }
+
+    __shared__ float smem[256];
+    smem[tid] = sum;
+    __syncthreads();
+
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] += smem[tid + s];
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float v = smem[0] + b[out_col];
+        if (do_relu && v < 0.0f) v = 0.0f;
+        y[batch * OUT + out_col] = v;
+    }
+}
+
+torch::Tensor relu_inplace_cuda(torch::Tensor x) {
+    int n = x.numel();
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    relu_inplace_kernel<<<blocks, threads>>>(x.data_ptr<float>(), n);
+    return x;
+}
+
+torch::Tensor maxpool2x2_cuda(torch::Tensor x) {
+    int N = x.size(0);
+    int C = x.size(1);
+    int H = x.size(2);
+    int W = x.size(3);
+    auto y = torch::empty({N, C, H / 2, W / 2}, x.options());
+    int total = N * C * (H / 2) * (W / 2);
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    maxpool2x2_kernel<<<blocks, threads>>>(x.data_ptr<float>(), y.data_ptr<float>(), N, C, H, W);
+    return y;
+}
+
+torch::Tensor linear_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor b, bool do_relu) {
+    int B = x.size(0);
+    int IN = x.size(1);
+    int OUT = w.size(0);
+    auto y = torch::empty({B, OUT}, x.options());
+    dim3 grid(OUT, B);
+    linear_kernel<<<grid, 256>>>(x.data_ptr<float>(), w.data_ptr<float>(), b.data_ptr<float>(),
+                                 y.data_ptr<float>(), B, IN, OUT, do_relu ? 1 : 0);
+    return y;
+}
+"""
+
+vgg19_cpp_source = r"""
+torch::Tensor relu_inplace_cuda(torch::Tensor x);
+torch::Tensor maxpool2x2_cuda(torch::Tensor x);
+torch::Tensor linear_cuda(torch::Tensor x, torch::Tensor w, torch::Tensor b, bool do_relu);
+"""
+
+vgg19_ops = load_inline(
+    name="vgg19_custom_ops",
+    cpp_sources=vgg19_cpp_source,
+    cuda_sources=vgg19_cuda_source,
+    functions=["relu_inplace_cuda", "maxpool2x2_cuda", "linear_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000):
+        super(ModelNew, self).__init__()
+
+        self.c1 = nn.Conv2d(3, 64, kernel_size=3, padding=1)
+        self.c2 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
+
+        self.c3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.c4 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
+
+        self.c5 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
+        self.c6 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
+        self.c7 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
+        self.c8 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
+
+        self.c9 = nn.Conv2d(256, 512, kernel_size=3, padding=1)
+        self.c10 = nn.Conv2d(512, 512, kernel_size=3, padding=1)
+        self.c11 = nn.Conv2d(512, 512, kernel_size=3, padding=1)
+        self.c12 = nn.Conv2d(512, 512, kernel_size=3, padding=1)
+
+        self.c13 = nn.Conv2d(512, 512, kernel_size=3, padding=1)
+        self.c14 = nn.Conv2d(512, 512, kernel_size=3, padding=1)
+        self.c15 = nn.Conv2d(512, 512, kernel_size=3, padding=1)
+        self.c16 = nn.Conv2d(512, 512, kernel_size=3, padding=1)
+
+        self.fc1 = nn.Linear(512 * 7 * 7, 4096)
+        self.fc2 = nn.Linear(4096, 4096)
+        self.fc3 = nn.Linear(4096, num_classes)
+        self.ops = vgg19_ops
+
+    def _cr(self, conv, x):
+        return self.ops.relu_inplace_cuda(conv(x))
+
+    def forward(self, x):
+        x = self._cr(self.c1, x)
+        x = self._cr(self.c2, x)
+        x = self.ops.maxpool2x2_cuda(x)
+
+        x = self._cr(self.c3, x)
+        x = self._cr(self.c4, x)
+        x = self.ops.maxpool2x2_cuda(x)
+
+        x = self._cr(self.c5, x)
+        x = self._cr(self.c6, x)
+        x = self._cr(self.c7, x)
+        x = self._cr(self.c8, x)
+        x = self.ops.maxpool2x2_cuda(x)
+
+        x = self._cr(self.c9, x)
+        x = self._cr(self.c10, x)
+        x = self._cr(self.c11, x)
+        x = self._cr(self.c12, x)
+        x = self.ops.maxpool2x2_cuda(x)
+
+        x = self._cr(self.c13, x)
+        x = self._cr(self.c14, x)
+        x = self._cr(self.c15, x)
+        x = self._cr(self.c16, x)
+        x = self.ops.maxpool2x2_cuda(x)
+
+        x = x.contiguous().view(x.size(0), -1)
+        x = self.ops.linear_cuda(x, self.fc1.weight, self.fc1.bias, True)
+        x = self.ops.linear_cuda(x, self.fc2.weight, self.fc2.bias, True)
+        x = self.ops.linear_cuda(x, self.fc3.weight, self.fc3.bias, False)
+        return x

@@ -1,0 +1,279 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for the fused operation:
+# 1. Linear (Matmul + Bias)
+# 2. BatchNorm1d (Running mean/variance handling is complex in inline, 
+#    but since we are replacing the *operators* to get speedups, and BN inference 
+#    is just (x - mean)/sqrt(var+eps), we can fuse this if we pass stats.
+#    However, standard PyTorch nn.Linear + nn.BatchNorm1d inference is:
+#    y = (Wx + b) * gamma / sqrt(var + eps) + beta
+#    The provided model does: matmul -> bn -> add_bias -> div -> sigmoid_mul
+#    
+#    Let's fuse the entire forward pass into a single kernel for maximum performance.
+#    Input: x (B, in_features), weight (out_features, in_features), bias_linear (out_features)
+#           running_mean, running_var, gamma, beta from BN
+#           bias_add (scalar or vector), divide_value
+#    Output: result (B, out_features)
+
+fused_model_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+// Helper for fast sigmoid approximation or standard exp-based sigmoid
+__device__ inline float sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+__global__ void fused_linear_bn_bias_div_swish_kernel(
+    const float* __restrict__ x,          // [B, in_features]
+    const float* __restrict__ weight,     // [out_features, in_features]
+    const float* __restrict__ bias_linear,// [out_features] (if any, though nn.Linear handles it internally usually, 
+                                          // but here we treat matmul as Wx. PyTorch Linear is Wx + b. 
+                                          // We need to pass the linear bias separately or include it in weight logic?
+                                          // Standard approach: Pass W and b_linear separately for clarity)
+    const float* __restrict__ bn_gamma,   // [out_features]
+    const float* __restrict__ bn_beta,    // [out_features]
+    const float* __restrict__ bn_running_mean, // [out_features]
+    const float* __restrict__ bn_running_var,  // [out_features]
+    const float bn_eps,
+    const float bias_add_val,             // Scalar or vector? The model uses self.bias which is (1,) or similar. 
+                                          // If it's a scalar broadcasted, we pass one value. If vector, array.
+                                          // Model: self.bias = nn.Parameter(torch.randn(bias_shape)). 
+                                          // If bias_shape=(1,), it's a scalar broadcast.
+    const float divide_value,
+    float* __restrict__ out               // [B, out_features]
+) {
+    int batch_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int feat_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    int B = gridDim.y * blockDim.y; // Assuming full coverage or check bounds
+    int out_f = gridDim.x * blockDim.x;
+    
+    // We need dimensions. Passing them via global constants or struct is better, 
+    // but for inline simplicity, we can assume fixed max sizes or pass dims.
+    // Let's use a simpler approach: 1D grid mapping to (batch, feature) pairs.
+}
+
+// Better approach: 2D grid where each thread handles one output element (b, f)
+__global__ void fused_kernel(
+    const float* x, 
+    const float* weight, 
+    const float* bias_linear,
+    const float* bn_gamma,
+    const float* bn_beta,
+    const float* bn_running_mean,
+    const float* bn_running_var,
+    float bn_eps,
+    const float* bias_add, // Pointer to scalar or vector. If scalar, bias_add[0].
+    int bias_is_scalar,
+    float divide_value,
+    float* out,
+    int batch_size,
+    int in_features,
+    int out_features
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * out_features;
+
+    if (idx >= total_elements) return;
+
+    int b = idx / out_features;
+    int f = idx % out_features;
+
+    // 1. Linear: y = x @ W^T + bias_linear
+    float sum = 0.0f;
+    const float* x_row = &x[b * in_features];
+    const float* w_col = &weight[f * in_features]; // Weight is [out, in], so row f is the weights for output feature f
+    
+    #pragma unroll
+    for (int i = 0; i < in_features; ++i) {
+        sum += x_row[i] * w_col[i];
+    }
+    
+    if (bias_linear != nullptr) {
+        sum += bias_linear[f];
+    }
+
+    // 2. BatchNorm1d Inference: y = gamma * (x - mean) / sqrt(var + eps) + beta
+    float bn_mean = bn_running_mean[f];
+    float bn_var = bn_running_var[f];
+    float inv_std = rsqrtf(bn_var + bn_eps);
+    
+    sum = bn_gamma[f] * (sum - bn_mean) * inv_std + bn_beta[f];
+
+    // 3. Add Bias: x + self.bias
+    if (bias_is_scalar) {
+        sum += bias_add[0];
+    } else {
+        sum += bias_add[f];
+    }
+
+    // 4. Divide: x / divide_value
+    sum /= divide_value;
+
+    // 5. Swish: x * sigmoid(x)
+    float sig = sigmoid(sum);
+    out[idx] = sum * sig;
+}
+
+torch::Tensor fused_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias_linear,
+    torch::Tensor bn_gamma,
+    torch::Tensor bn_beta,
+    torch::Tensor bn_running_mean,
+    torch::Tensor bn_running_var,
+    float bn_eps,
+    torch::Tensor bias_add,
+    bool bias_is_scalar,
+    float divide_value
+) {
+    int batch_size = x.size(0);
+    int in_features = x.size(1);
+    int out_features = weight.size(0);
+
+    auto out = torch::empty_like(x);
+
+    const int block_size = 256;
+    int total_elements = batch_size * out_features;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    // Ensure bias_add is contiguous if passed as tensor
+    auto bias_add_contig = bias_add.contiguous();
+    
+    fused_kernel<<<num_blocks, block_size>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias_linear.data_ptr<float>(),
+        bn_gamma.data_ptr<float>(),
+        bn_beta.data_ptr<float>(),
+        bn_running_mean.data_ptr<float>(),
+        bn_running_var.data_ptr<float>(),
+        bn_eps,
+        bias_add_contig.data_ptr<float>(),
+        bias_is_scalar ? 1 : 0,
+        divide_value,
+        out.data_ptr<float>(),
+        batch_size,
+        in_features,
+        out_features
+    );
+
+    return out;
+}
+"""
+
+fused_cpp_source = (
+    "torch::Tensor fused_forward_cuda("
+    "torch::Tensor x,"
+    "torch::Tensor weight,"
+    "torch::Tensor bias_linear,"
+    "torch::Tensor bn_gamma,"
+    "torch::Tensor bn_beta,"
+    "torch::Tensor bn_running_mean,"
+    "torch::Tensor bn_running_var,"
+    "float bn_eps,"
+    "torch::Tensor bias_add,"
+    "bool bias_is_scalar,"
+    "float divide_value"
+    ");"
+);
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_cpp_source,
+    cuda_sources=fused_model_source,
+    functions=["fused_forward_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using a single fused CUDA kernel for Linear + BatchNorm1d + BiasAdd + Div + Swish.
+    """
+    def __init__(self, in_features, out_features, bn_eps=1e-5, bn_momentum=0.1, bias_shape=(1,), divide_value=1.0):
+        super(ModelNew, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.bn_eps = bn_eps
+        self.divide_value = divide_value
+        
+        # Initialize parameters to match the original model's initialization logic
+        # nn.Linear initializes weight with Kaiming uniform and bias with uniform
+        # We will store them as buffers or parameters. 
+        # Note: To make this drop-in compatible, we need to initialize these tensors 
+        # exactly as nn.Linear and nn.BatchNorm1d would.
+        
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias_linear = nn.Parameter(torch.empty(out_features))
+        
+        self.bn_gamma = nn.Parameter(torch.ones(out_features))
+        self.bn_beta = nn.Parameter(torch.zeros(out_features))
+        
+        # BatchNorm running stats
+        self.register_buffer('bn_running_mean', torch.zeros(out_features))
+        self.register_buffer('bn_running_var', torch.ones(out_features))
+        
+        # Bias for addition step
+        self.bias_add_param = nn.Parameter(torch.randn(bias_shape))
+        
+        # Initialize weights similar to PyTorch defaults
+        nn.init.kaiming_uniform_(self.weight, a=0, mode='fan_in', nonlinearity='linear')
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        nn.init.uniform_(self.bias_linear, -bound, bound)
+        
+        # BatchNorm init
+        self.bn_running_mean.zero_()
+        self.bn_running_var.fill_(1.0)
+
+    def forward(self, x):
+        # Extract bias_add value. If shape is (1,), it's a scalar broadcast.
+        # If shape is (out_features,), it's a vector.
+        # The original model: self.bias = nn.Parameter(torch.randn(bias_shape))
+        # In forward: x + self.bias
+        
+        bias_val = self.bias_add_param.item() if self.bias_add_param.numel() == 1 else None
+        
+        # Prepare tensors for CUDA kernel
+        # Ensure all tensors are contiguous and on the same device
+        dev = x.device
+        
+        w = self.weight.to(dev)
+        bl = self.bias_linear.to(dev)
+        bg = self.bn_gamma.to(dev)
+        bb = self.bn_beta.to(dev)
+        bm = self.bn_running_mean.to(dev)
+        bv = self.bn_running_var.to(dev)
+        
+        ba = self.bias_add_param.to(dev)
+        is_scalar = (ba.numel() == 1)
+        
+        # Call fused kernel
+        out = fused_ops.fused_forward_cuda(
+            x,
+            w,
+            bl,
+            bg,
+            bb,
+            bm,
+            bv,
+            self.bn_eps,
+            ba,
+            is_scalar,
+            self.divide_value
+        )
+        
+        return out
+
+import math
+```

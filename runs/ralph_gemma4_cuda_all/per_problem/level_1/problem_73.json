@@ -1,0 +1,32 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 25.403,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "runtime_error": "output padding must be smaller than either stride or dilation, but got output_padding_depth: 4 output_padding_height: 4 output_padding_width: 4 stride_depth: 2 stride_height: 2 stride_width: 2 dila...",
+      "runtime_error_name": "builtins.RuntimeError",
+      "runtime_error_traceback": "Traceback (most recent call last):\n  File \"/workspace/external/KernelBench/src/kernelbench/eval.py\", line 782, in run_and_check_correctness\n    output_new = model_new(*inputs)\n  File \"/workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1776, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n  File \"/workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1787, in _call_impl\n    return forward_call(*args, **kwargs)\n  File \"<string>\", line 280, in forward\n  File \"/workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1776, in _wrapped_call_impl\n    return self._call_impl(*args, **kwargs)\n  File \"/workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py\", line 1787, in _call_impl\n    return forward_call(*args, **kwargs)\n  File \"/workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/nn/modules/conv.py\", line 1367, in forward\n    return F.conv_transpose3d(\nRuntimeError: output padding must be smaller than either stride or dilation, but got output_padding_depth: 4 output_padding_height: 4 output_padding_width: 4 stride_depth: 2 stride_height: 2 stride_width: 2 dilation_depth: 1 dilation_height: 1 dilation_width: 1\n"
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_gemma4_cuda_all/generated_kernels/level_1/problem_73.py",
+  "level": 1,
+  "model_name": "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
+  "precision": "fp32",
+  "problem_id": 73,
+  "problem_name": "73_conv_transposed_3D_asymmetric_input_square_kernel__strided_padded__grouped.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_gemma4_cuda_all/raw_generation/level_1/problem_73.txt",
+  "static_warnings": [
+    "Uses torch.nn compute layer (only containers, Parameter, init allowed)",
+    "Uses torch.nn.functional op: torch.nn.functional.conv_transpose3d"
+  ],
+  "status": "evaluated"
+}

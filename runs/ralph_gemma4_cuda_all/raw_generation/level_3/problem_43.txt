@@ -1,0 +1,478 @@
+thought
+<channel|>```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from torch.utils.cpp_extension import load_inline
+
+# Custom CUDA kernel for Fused Masked Softmax Attention
+# This kernel performs: 
+# 1. Scaled Dot Product (q @ k.T)
+# 2. Causal Masking (setting upper triangle to -inf)
+# 3. Softmax
+# 4. Weighted Sum (att @ v)
+# To keep the implementation robust and within reasonable complexity for an inline kernel,
+# we implement a fused kernel that handles the attention mechanism.
+# For high performance, we use a simplified version of the FlashAttention logic:
+# We compute the attention scores row by row to avoid storing the large (B, nh, T, T) matrix.
+
+fused_attention_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_attention_kernel(
+    const float* __restrict__ q, // (B, nh, T, hs)
+    const float* __restrict__ k, // (B, nh, T, hs)
+    const float* __restrict__ v, // (B, nh, T, hs)
+    float* __restrict__ out,     // (B, nh, T, hs)
+    int B, int nh, int T, int hs, float scale) 
+{
+    // Each block handles one row (one query vector) of the attention matrix
+    // Block index: (batch_idx, head_idx, query_idx)
+    int b = blockIdx.z;
+    int nh_idx = blockIdx.y;
+    int t_q = blockIdx.x;
+
+    if (b >= B || nh_idx >= nh || t_q >= T) return;
+
+    extern __shared__ float shared_mem[];
+    // shared_mem will be used for online softmax: [max_val, sum_exp]
+    // But for simplicity in this inline version, we'll use registers for the row.
+    
+    float max_val = -1e20f;
+    
+    // 1. Compute dot products and find max for numerical stability
+    // We need to iterate through all keys (T)
+    // Since we can't easily store all scores in shared memory if T is large,
+    // we do two passes or use a local buffer.
+    
+    // For a single thread per row is too slow. We use one warp per row or 
+    // one thread per hs. Let's use one thread per hs to compute the dot product.
+    
+    // Actually, a simpler approach for this specific task:
+    // Each block handles one (b, nh, t_q). 
+    // We use one thread to compute the entire row's dot products to find max and sum.
+    // This is efficient if T is not extremely large.
+    
+    int tid = threadIdx.x;
+    
+    // We'll use a single thread per block to compute the row to avoid complex synchronization
+    // and ensure correctness for the softmax.
+    if (tid == 0) {
+        float row_max = -1e20f;
+        
+        // First pass: find max
+        for (int t_k = 0; t_k <= t_q; ++t_k) { // Causal mask: t_k <= t_q
+            float score = 0.0f;
+            for (int i = 0; i < hs; ++i) {
+                score += q[((b * nh + nh_idx) * T + t_q) * hs + i] * 
+                         k[((b * nh + nh_idx) * T + t_k) * hs + i];
+            }
+            score *= scale;
+            if (score > row_max) row_max = score;
+        }
+        
+        float sum_exp = 0.0f;
+        // Second pass: compute sum of exps
+        // We need to store scores to avoid recomputing, but T can be 1024.
+        // Let's use a small local array if T is small, or just recompute.
+        // Recomputing is safer for memory.
+        for (int t_k = 0; t_k <= t_q; ++t_k) {
+            float score = 0.0f;
+            for (int i = 0; i < hs; ++i) {
+                score += q[((b * nh + nh_idx) * T + t_q) * hs + i] * 
+                         k[((b * nh + nh_idx) * T + t_k) * hs + i];
+            }
+            score = (score * scale) - row_max;
+            sum_exp += expf(score);
+        }
+
+        // Third pass: compute weighted sum of V
+        for (int t_k = 0; t_k <= t_q; ++t_k) {
+            float score = 0.0f;
+            for (int i = 0; i < hs; ++i) {
+                score += q[((b * nh + nh_idx) * T + t_q) * hs + i] * 
+                         k[((b * nh + nh_idx) * T + t_k) * hs + i];
+            }
+            float weight = expf((score * scale) - row_max) / sum_exp;
+            
+            for (int i = 0; i < hs; ++i) {
+                out[((b * nh + nh_idx) * T + t_q) * hs + i] += weight * v[((b * nh + nh_idx) * T + t_k) * hs + i];
+            }
+        }
+    }
+}
+
+// The above kernel is a naive single-thread implementation for correctness.
+// Let's provide a more performant version using one thread per hs.
+
+__global__ void fused_attention_kernel_optimized(
+    const float* __restrict__ q, 
+    const float* __restrict__ k, 
+    const float* __restrict__ v, 
+    float* __restrict__ out,     
+    int B, int nh, int T, int hs, float scale) 
+{
+    int b = blockIdx.z;
+    int nh_idx = blockIdx.y;
+    int t_q = blockIdx.x;
+    int tid = threadIdx.x; // thread index in [0, hs-1]
+
+    // Each block handles one (b, nh, t_q). 
+    // We use one thread per hs to compute the dot product for all t_k.
+    
+    // 1. Compute dot products for all t_k <= t_q
+    // We'll use shared memory to store the scores for the current row.
+    // Since T can be 1024, we can't store all scores in shared memory easily.
+    // Instead, we'll use a two-pass approach with a reduction.
+    
+    // For simplicity and to ensure it works for any T, we'll use a block-wide reduction.
+    // But to keep this code concise and functional, we'll implement a version where 
+    // each thread handles one hs and we use __shfl_down_sync for reductions.
+
+    // However, the most robust way for an inline kernel is to have each thread 
+    // compute its part of the dot product.
+    
+    // Let's use a simpler approach: Each block handles one (b, nh, t_q).
+    // We use one thread per hs.
+    
+    // Step 1: Compute dot products for all t_k <= t_q
+    // We'll use a local array in registers if hs is small, but hs is usually 64-128.
+    // Let's just compute the dot product for each t_k.
+    
+    // To avoid the O(T^2) complexity in a single kernel, we'll use the fact that 
+    // we only need the sum of (softmax(score) * v).
+    
+    // We'll use a simple loop. To make it fast, we'll use one thread per hs.
+    // We'll use a shared memory buffer to store the max and sum_exp.
+    
+    extern __shared__ float s_mem[]; 
+    float* s_max = s_mem; 
+    float* s_sum_exp = s_mem + 1;
+
+    // Each thread computes its own dot product for all t_k
+    // This is still not quite right for a parallel kernel.
+    
+    // Let's use the most standard approach: 
+    // One block per (b, nh, t_q). 
+    // Threads in block: 0 to hs-1.
+    // Each thread computes dot product for all t_k <= t_q for its specific hs.
+    
+    // This is still slow. Let's use a simpler approach:
+    // One block per (b, nh, t_q).
+    // Threads in block: 0 to T-1 (if T is small) or use a loop.
+    
+    // Given the constraints, let's implement a version where each thread 
+    // handles one t_k and we use reduction.
+}
+"""
+
+# Since writing a high-performance FlashAttention kernel from scratch in an inline block 
+# is extremely error-prone and long, I will provide a highly optimized version 
+# that uses PyTorch's efficient operations but fuses the masking and softmax 
+# into a single custom kernel to reduce memory bandwidth.
+
+fused_attn_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_softmax_mask_kernel(
+    const float* __restrict__ att,
+    float* __restrict__ out,
+    int B, int nh, int T, int T_max) {
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = B * nh * T * T;
+    
+    if (idx < total_elements) {
+        // idx = (((b * nh + nh_idx) * T + t_q) * T + t_k)
+        // We need to find the row start
+        int row_start = (idx / T) * T;
+        int row_idx = idx / T;
+        
+        // This is not efficient. Let's re-index.
+        // We want to process one row at a time.
+    }
+}
+"""
+
+# Let's use a more practical approach: 
+# Replace the attention part with a single kernel that performs:
+# (q @ k.T) * scale -> mask -> softmax -> @ v
+# We'll use a kernel where each block handles one row (b, nh, t_q).
+
+fused_attention_kernel_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void attention_row_kernel(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    float* __restrict__ out,
+    int B, int nh, int T, int hs, float scale) 
+{
+    int b = blockIdx.z;
+    int nh_idx = blockIdx.y;
+    int t_q = blockIdx.x;
+
+    int q_offset = ((b * nh + nh_idx) * T + t_q) * hs;
+    int out_offset = ((b * nh + nh_idx) * T + t_q) * hs;
+
+    // We use a single thread per block to compute the row to ensure correctness 
+    // and avoid complex synchronization. For T=1024, this is acceptable.
+    // To optimize, we'll use one thread per hs and use __shfl_down_sync.
+    
+    int tid = threadIdx.x; // 0 to hs-1
+
+    // 1. Compute dot products for all t_k <= t_q
+    // We'll use a local array in shared memory to store scores if T is small,
+    // but T can be 1024. Let's use a two-pass approach.
+    
+    // Pass 1: Find max score
+    float local_max = -1e20f;
+    
+    // We'll use a loop over t_k. Each thread handles one hs.
+    // To find the max, we need to reduce across all t_k.
+    // This is tricky. Let's use a simpler approach: 
+    // Each thread computes its own dot product for all t_k.
+    
+    // Actually, let's use the most efficient way for a single-block-per-row:
+    // Each thread handles one hs.
+    // We'll use a shared memory buffer to store the max and sum_exp.
+    
+    // For the sake of a working, robust, and fast-enough kernel:
+    // We'll use one thread per hs.
+    
+    // We'll use a shared memory to store the max and sum_exp for the row.
+    // But we need to compute the dot product for all t_k.
+    
+    // Let's use a simpler kernel: Each block handles one row (b, nh, t_q).
+    // Each thread in the block handles one t_k.
+    // This works if T <= blockDim.x.
+}
+"""
+
+# Re-thinking: The most effective way to provide a working solution is to 
+# implement a kernel that performs the attention calculation.
+# I will implement a kernel where each block handles one row (b, nh, t_q).
+# The number of threads in the block will be T.
+
+fused_attention_source_final = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void attention_kernel(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    float* __restrict__ out,
+    int B, int nh, int T, int hs, float scale) 
+{
+    int t_q = blockIdx.x;
+    int nh_idx = blockIdx.y;
+    int b = blockIdx.z;
+
+    int tid = threadIdx.x; // 0 to T-1
+
+    // 1. Compute scores for all t_k <= t_q
+    // We'll use shared memory to store scores for the current row.
+    // Since T can be 1024, we'll use a shared memory of size 1024.
+    extern __shared__ float shared_scores[];
+
+    float my_score = -1e20f;
+    if (tid < T && tid <= t_q) {
+        float score = 0.0f;
+        int q_idx = ((b * nh + nh_idx) * T + t_q) * hs;
+        int k_idx = ((b * nh + nh_idx) * T + tid) * hs;
+        for (int i = 0; i < hs; ++i) {
+            score += q[q_idx + i] * k[k_idx + i];
+        }
+        my_score = score * scale;
+        shared_scores[tid] = my_score;
+    } else {
+        shared_scores[tid] = -1e20f;
+    }
+    __syncthreads();
+
+    // 2. Find max score in the row
+    float row_max = -1e20f;
+    for (int i = 0; i < T; ++i) {
+        if (shared_scores[i] > row_max) row_max = shared_scores[i];
+    }
+    // Note: This reduction is serial. For T=1024, it's okay. 
+    // A real implementation would use __shfl_down_sync.
+    __syncthreads();
+
+    // 3. Compute sum of exps
+    float row_sum_exp = 0.0f;
+    for (int i = 0; i <= t_q; ++i) {
+        if (shared_scores[i] > -1e19f) {
+            row_sum_exp += expf(shared_scores[i] - row_max);
+        }
+    }
+    __syncthreads();
+
+    // 4. Compute weighted sum of V
+    // Each thread handles one hs of the output.
+    // We need to change the block structure.
+    // Let's use: Block handles (b, nh, t_q). Threads = hs.
+}
+"""
+
+# Final attempt at a clean, working, and efficient kernel:
+# Each block handles one row (b, nh, t_q).
+# Threads in block = hs.
+# We'll use a loop over t_k inside each thread.
+
+fused_attention_source_v3 = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void attention_kernel_v3(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    float* __restrict__ out,
+    int B, int nh, int T, int hs, float scale) 
+{
+    int t_q = blockIdx.x;
+    int nh_idx = blockIdx.y;
+    int b = blockIdx.z;
+    int tid = threadIdx.x; // 0 to hs-1
+
+    if (t_q >= T) return;
+
+    int q_offset = ((b * nh + nh_idx) * T + t_q) * hs;
+    
+    // We need to find max and sum_exp for the row.
+    // Since we can't easily do a reduction across t_k with threads being hs,
+    // we'll use a single thread to find max and sum_exp, or use a shared memory buffer.
+    // Let's use a shared memory buffer for max and sum_exp.
+    
+    __shared__ float s_max;
+    __shared__ float s_sum_exp;
+
+    // To find max and sum_exp, we'll use a single thread (tid=0) to loop over t_k.
+    // This is efficient because T is not huge.
+    if (tid == 0) {
+        float row_max = -1e20f;
+        for (int tk = 0; tk <= t_q; ++tk) {
+            float score = 0.0f;
+            int k_offset = ((b * nh + nh_idx) * T + tk) * hs;
+            for (int i = 0; i < hs; ++i) {
+                score += q[q_offset + i] * k[k_offset + i];
+            }
+            score *= scale;
+            if (score > row_max) row_max = score;
+        }
+        s_max = row_max;
+
+        float sum_e = 0.0f;
+        for (int tk = 0; tk <= t_q; ++tk) {
+            float score = 0.0f;
+            int k_offset = ((b * nh + nh_idx) * T + tk) * hs;
+            for (int i = 0; i < hs; ++i) {
+                score += q[q_offset + i] * k[k_offset + i];
+            }
+            score *= scale;
+            sum_e += expf(score - row_max);
+        }
+        s_sum_exp = sum_e;
+    }
+    __syncthreads();
+
+    float row_max = s_max;
+    float row_sum_exp = s_sum_exp;
+
+    // Now each thread computes its part of the weighted sum for the hs dimension.
+    // We need to loop over t_k again.
+    float acc = 0.0f;
+    for (int tk = 0; tk <= t_q; ++tk) {
+        float score = 0.0f;
+        int k_offset = ((b * nh + nh_idx) * T + tk) * hs;
+        for (int i = 0; i < hs; ++i) {
+            score += q[q_offset + i] * k[k_offset + i];
+        }
+        float weight = expf(score * scale - row_max) / row_sum_exp;
+        acc += weight * v[k_offset + tid];
+    }
+
+    out[q_offset + tid] = acc;
+}
+
+torch::Tensor attention_cuda(torch::Tensor q, torch::Tensor k, torch::Tensor v, float scale) {
+    int B = q.size(0);
+    int nh = q.size(1);
+    int T = q.size(2);
+    int hs = q.size(3);
+
+    auto out = torch::zeros_like(q);
+
+    dim3 block(hs);
+    dim3 grid(T, nh, B);
+
+    attention_kernel_v3<<<grid, block>>>(
+        q.data_ptr<float>(),
+        k.data_ptr<float>(),
+        v.data_ptr<float>(),
+        out.data_ptr<float>(),
+        B, nh, T, hs, scale
+    );
+
+    return out;
+}
+"""
+
+attention_cpp_source = "torch::Tensor attention_cuda(torch::Tensor q, torch::Tensor k, torch::Tensor v, float scale);"
+
+attention_lib = load_inline(
+    name="attention_lib",
+    cpp_sources=attention_cpp_source,
+    cuda_sources=fused_attention_source_v3,
+    functions=["attention_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen):
+        super().__init__()
+        assert n_embd % n_head == 0
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd)
+        self.c_proj = nn.Linear(n_embd, n_embd)
+        self.attn_dropout = nn.Dropout(attn_pdrop)
+        self.resid_dropout = nn.Dropout(resid_pdrop)
+        self.register_buffer("bias", torch.tril(torch.ones(max_seqlen, max_seqlen))
+                                     .view(1, 1, max_seqlen, max_seqlen))
+        self.n_head = n_head
+        self.n_embd = n_embd
+        self.attention_lib = attention_lib
+
+    def forward(self, x):
+        B, T, C = x.size()
+
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        
+        # Reshape for attention: (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+
+        # Use custom fused kernel
+        scale = 1.0 / math.sqrt(k.size(-1))
+        y = self.attention_lib.attention_cuda(q, k, v, scale)
+
+        # Re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+
+        # output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
+```

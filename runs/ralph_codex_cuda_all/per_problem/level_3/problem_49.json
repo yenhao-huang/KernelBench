@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 96.396,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "2783615488.000000",
+        "2876540928.000000",
+        "2932683264.000000",
+        "2946509312.000000",
+        "2771127296.000000"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "92358976733184.000000",
+        "92358976733184.000000",
+        "101155069755392.000000",
+        "87960930222080.000000",
+        "87960930222080.000000"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_codex_cuda_all/generated_kernels/level_3/problem_49.py",
+  "level": 3,
+  "model_name": "codex-gpt-5.5",
+  "precision": "fp32",
+  "problem_id": 49,
+  "problem_name": "49_Mamba2ReturnFinalState.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_codex_cuda_all/raw_generation/level_3/problem_49.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

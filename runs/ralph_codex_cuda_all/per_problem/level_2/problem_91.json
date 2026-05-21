@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 92.695,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "0.000000",
+        "0.000000",
+        "0.000000",
+        "0.000000",
+        "0.000000"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "0.001826",
+        "0.001693",
+        "0.001520",
+        "0.001355",
+        "0.001591"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_codex_cuda_all/generated_kernels/level_2/problem_91.py",
+  "level": 2,
+  "model_name": "codex-gpt-5.5",
+  "precision": "fp32",
+  "problem_id": 91,
+  "problem_name": "91_ConvTranspose2d_Softmax_BiasAdd_Scaling_Sigmoid.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_codex_cuda_all/raw_generation/level_2/problem_91.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

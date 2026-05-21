@@ -1,0 +1,156 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void pooled_deconv_bn_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ bias,
+    const float* __restrict__ bn_weight,
+    const float* __restrict__ bn_bias,
+    const float* __restrict__ running_mean,
+    const float* __restrict__ running_var,
+    float* __restrict__ out,
+    int N, int Cin, int Cout,
+    int D, int H, int Wd,
+    int K,
+    float scale_factor,
+    float eps
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * Cout;
+    if (idx >= total) return;
+
+    int co = idx % Cout;
+    int n = idx / Cout;
+
+    float acc = 0.0f;
+    int spatial = D * H * Wd;
+    int kvol = K * K * K;
+
+    for (int ci = 0; ci < Cin; ++ci) {
+        float xsum = 0.0f;
+        const float* xptr = x + (((n * Cin + ci) * D) * H) * Wd;
+        for (int s = 0; s < spatial; ++s) {
+            xsum += xptr[s];
+        }
+
+        float wsum = 0.0f;
+        const float* wptr = w + (((ci * Cout + co) * K) * K) * K;
+        for (int kk = 0; kk < kvol; ++kk) {
+            wsum += wptr[kk];
+        }
+
+        acc += xsum * wsum;
+    }
+
+    int OD = D + K - 1;
+    int OH = H + K - 1;
+    int OW = Wd + K - 1;
+    float out_spatial = (float)(OD * OH * OW);
+
+    float v = acc / out_spatial;
+    if (bias != nullptr) {
+        v += bias[co];
+    }
+    v *= scale_factor;
+
+    float inv_std = rsqrtf(running_var[co] + eps);
+    v = (v - running_mean[co]) * inv_std * bn_weight[co] + bn_bias[co];
+
+    out[idx] = v;
+}
+
+torch::Tensor pooled_deconv_bn_cuda(
+    torch::Tensor x,
+    torch::Tensor w,
+    torch::Tensor bias,
+    torch::Tensor bn_weight,
+    torch::Tensor bn_bias,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    double scale_factor,
+    double eps
+) {
+    int N = x.size(0);
+    int Cin = x.size(1);
+    int D = x.size(2);
+    int H = x.size(3);
+    int Wd = x.size(4);
+    int Cout = w.size(1);
+    int K = w.size(2);
+
+    auto out = torch::empty({N, Cout, 1, 1, 1}, x.options());
+
+    int total = N * Cout;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+
+    pooled_deconv_bn_kernel<<<blocks, threads>>>(
+        x.data_ptr<float>(),
+        w.data_ptr<float>(),
+        bias.defined() ? bias.data_ptr<float>() : nullptr,
+        bn_weight.data_ptr<float>(),
+        bn_bias.data_ptr<float>(),
+        running_mean.data_ptr<float>(),
+        running_var.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, Cin, Cout, D, H, Wd, K,
+        (float)scale_factor,
+        (float)eps
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor pooled_deconv_bn_cuda(
+    torch::Tensor x,
+    torch::Tensor w,
+    torch::Tensor bias,
+    torch::Tensor bn_weight,
+    torch::Tensor bn_bias,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    double scale_factor,
+    double eps
+);
+"""
+
+pooled_deconv_bn_ext = load_inline(
+    name="pooled_deconv_bn_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["pooled_deconv_bn_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, scale_factor, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size)
+        self.scale_factor = scale_factor
+        self.batch_norm = nn.BatchNorm3d(out_channels, eps=eps, momentum=momentum)
+        self.global_avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        self._op = pooled_deconv_bn_ext
+
+    def forward(self, x):
+        return self._op.pooled_deconv_bn_cuda(
+            x.contiguous(),
+            self.conv_transpose.weight.contiguous(),
+            self.conv_transpose.bias,
+            self.batch_norm.weight,
+            self.batch_norm.bias,
+            self.batch_norm.running_mean,
+            self.batch_norm.running_var,
+            float(self.scale_factor),
+            float(self.batch_norm.eps),
+        )

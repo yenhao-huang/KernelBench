@@ -1,0 +1,25 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 48.033,
+  "error": "Isolated KernelBench evaluator failed.",
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_2/problem_11.py",
+  "isolated_eval": {
+    "error": "Object of type RuntimeError is not JSON serializable",
+    "error_type": "builtins.TypeError",
+    "ok": false,
+    "subprocess_output_tail": "Failed to compile custom CUDA kernel: Record as compilation failure. \nError: Error building extension 'fused_bn_tanh': [1/3] c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=fused_bn_tanh -DTORCH_API_INCLUDE_EXTENSION_H -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/include -isystem /home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -fPIC -std=c++17 -O2 -c /home/howard/.cache/torch_extensions/py310_cu128/fused_bn_tanh/main.cpp -o main.o \nFAILED: [code=1] main.o \nc++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=fused_bn_tanh -DTORCH_API_INCLUDE_EXTENSION_H -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/include -isystem /home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -fPIC -std=c++17 -O2 -c /home/howard/.cache/torch_extensions/py310_cu128/fused_bn_tanh/main.cpp -o main.o \n/home/howard/.cache/torch_extensions/py310_cu128/fused_bn_tanh/main.cpp: In function \u2018void pybind11_init_fused_bn_tanh(pybind11::module_&)\u2019:\n/home/howard/.cache/torch_extensions/py310_cu128/fused_bn_tanh/main.cpp:4:57: error: \u2018fused_bn_tanh_cuda\u2019 was not declared in this scope\n    4 | m.def(\"fused_bn_tanh_cuda\", torch::wrap_pybind_function(fused_bn_tanh_cuda), \"fused_bn_tanh_cuda\");\n      |                                                         ^~~~~~~~~~~~~~~~~~\n[2/3] /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=fused_bn_tanh -DTORCH_API_INCLUDE_EXTENSION_H -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/include -isystem /home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 --compiler-options '-fPIC' -std=c++17 -c /home/howard/.cache/torch_extensions/py310_cu128/fused_bn_tanh/cuda.cu -o cuda.cuda.o \n/home/howard/.cache/torch_extensions/py310_cu128/fused_bn_tanh/cuda.cu(25): warning #177-D: variable \"batch_idx\" was declared but never referenced\n          int batch_idx = idx / (channels * spatial_size);\n              ^\n\nRemark: The warnings can be suppressed with \"-diag-suppress <warning-number>\"\n\n/home/howard/.cache/torch_extensions/py310_cu128/fused_bn_tanh/cuda.cu(28): warning #177-D: variable \"pixel_idx\" was declared but never referenced\n          int pixel_idx = rest % spatial_size;\n              ^\n\nninja: build stopped: subcommand failed.\n\n",
+    "subprocess_returncode": 0,
+    "traceback": "Traceback (most recent call last):\n  File \"<string>\", line 28, in <module>\n  File \"/home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/json/__init__.py\", line 231, in dumps\n    return _default_encoder.encode(obj)\n  File \"/home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/json/encoder.py\", line 199, in encode\n    chunks = self.iterencode(o, _one_shot=True)\n  File \"/home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/json/encoder.py\", line 257, in iterencode\n    return _iterencode(o, 0)\n  File \"/home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/json/encoder.py\", line 179, in default\n    raise TypeError(f'Object of type {o.__class__.__name__} '\nTypeError: Object of type RuntimeError is not JSON serializable\n"
+  },
+  "level": 2,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 11,
+  "problem_name": "11_ConvTranspose2d_BatchNorm_Tanh_MaxPool_GroupNorm.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_2/problem_11.txt",
+  "static_warnings": [
+    "Uses torch computation op: torch.tanh"
+  ],
+  "status": "evaluation_error"
+}

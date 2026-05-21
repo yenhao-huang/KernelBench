@@ -1,0 +1,424 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernels for fused operations to optimize the RNN loop.
+# We will replace:
+# 1. The Linear layer (i2h) + Tanh activation with a fused kernel.
+#    This avoids global memory writes/reads for the intermediate linear result.
+# 2. The second Linear layer (h2o) can also be optimized, but since it's just a linear projection 
+#    without activation in the hidden path (output is returned directly), we might fuse it or keep it standard.
+#    However, to maximize speedup, let's focus on the heavy computation: i2h (large matmul).
+
+# Kernel 1: Fused Linear + Tanh for the RNN cell update.
+# Input: x_t (batch, input_size), h_prev (batch, hidden_size)
+# We concatenate them internally in the kernel or pass them separately. 
+# Passing separately is often cleaner for memory coalescing if we handle indexing carefully.
+# However, standard cuBLAS handles large matmuls well. The bottleneck here is likely the loop overhead 
+# and small matrix sizes relative to GPU capacity, plus the tanh activation.
+# Let's create a custom kernel that performs: h_new = tanh(W * [x_t; h_prev] + b)
+
+fused_linear_tanh_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+// Helper for tanh approximation or exact calculation. 
+// For FP32, we can use the standard tanh or a fast approximation. 
+// Given "optimized", let's use a reasonably accurate fast tanh or just std::tanh if performance allows.
+// Actually, for high throughput, a polynomial approximation is often faster than transcendental functions.
+__device__ __forceinline__ float fast_tanh(float x) {
+    // Approximation: tanh(x) ~ x / (1 + |x|) is simple but not very accurate for large x.
+    // Better: 2 * sigmoid(2x) - 1. 
+    // Or use the standard library if compiled with appropriate flags, but inline usually prefers custom.
+    // Let's use a high-quality approximation or just rely on the fact that modern GPUs have fast tanh.
+    // However, to show "custom optimization", we can implement a fused matmul + tanh.
+    
+    // Simple and effective approximation for FP32:
+    float abs_x = fabsf(x);
+    float t = 1.0f / (1.0f + 0.15625f * abs_x); // Rough scaling, let's stick to a better one or standard tanh
+    // Actually, let's just use the standard tanh for correctness unless speed is critical over precision.
+    // But wait, we can fuse the matmul. The main gain is avoiding kernel launch overheads and memory traffic.
+    
+    return tanhf(x); 
+}
+
+__global__ void fused_linear_tanh_kernel(
+    const float* x,       // [batch_size, input_size]
+    const float* h_prev,  // [batch_size, hidden_size]
+    const float* W,       // [hidden_size, input_size + hidden_size]
+    const float* b,       // [hidden_size]
+    float* h_new,         // [batch_size, hidden_size]
+    int batch_size,
+    int input_size,
+    int hidden_size) 
+{
+    int batch_idx = blockIdx.x;
+    if (batch_idx >= batch_size) return;
+
+    const float* x_row = x + batch_idx * input_size;
+    const float* h_prev_row = h_prev + batch_idx * hidden_size;
+    float* h_new_row = h_new + batch_idx * hidden_size;
+
+    // We compute the dot product for each output neuron in the hidden state.
+    // W is laid out as [hidden_size, input_size + hidden_size].
+    // For a specific output neuron j (0 to hidden_size-1):
+    // sum = b[j] + sum_{k=0}^{input_size-1} W[j][k] * x[k] + sum_{k=input_size}^{input_size+hidden_size-1} W[j][k] * h_prev[k-input_size]
+    
+    // To optimize, we can use shared memory if the tile size is small, but for 1024+256=1280 features, 
+    // it's better to let each thread handle one output neuron or use a block to compute one.
+    // Given hidden_size=256, we can have each thread compute one element of the new hidden state.
+    
+    int j = threadIdx.x;
+    if (j >= hidden_size) return;
+
+    float sum = b[j];
+    
+    const float* W_row = W + j * (input_size + hidden_size);
+    
+    // Unroll or loop over input features
+    for (int k = 0; k < input_size; ++k) {
+        sum += W_row[k] * x_row[k];
+    }
+    for (int k = 0; k < hidden_size; ++k) {
+        sum += W_row[input_size + k] * h_prev_row[k];
+    }
+
+    h_new_row[j] = tanhf(sum);
+}
+
+torch::Tensor fused_linear_tanh_cuda(
+    torch::Tensor x, 
+    torch::Tensor h_prev, 
+    torch::Tensor W, 
+    torch::Tensor b) 
+{
+    auto batch_size = x.size(0);
+    auto input_size = x.size(1);
+    auto hidden_size = h_prev.size(1);
+
+    auto h_new = torch::zeros({batch_size, hidden_size}, x.options());
+
+    const int block_size = 256; // Match hidden_size or use a multiple
+    // If hidden_size is not a multiple of block_size, we handle it in the kernel check.
+    
+    dim3 grid(batch_size);
+    dim3 block(block_size);
+
+    fused_linear_tanh_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        h_prev.data_ptr<float>(),
+        W.data_ptr<float>(),
+        b.data_ptr<float>(),
+        h_new.data_ptr<float>(),
+        batch_size,
+        input_size,
+        hidden_size
+    );
+
+    return h_new;
+}
+"""
+
+fused_linear_tanh_cpp = (
+    "torch::Tensor fused_linear_tanh_cuda(torch::Tensor x, torch::Tensor h_prev, torch::Tensor W, torch::Tensor b);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_rnn_ops",
+    cpp_sources=fused_linear_tanh_cpp,
+    cuda_sources=fused_linear_tanh_source,
+    functions=["fused_linear_tanh_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+# We also need a fast linear layer for the output projection h2o.
+# Since it's just one matmul per step, we can use standard torch.mm or write a simple kernel.
+# Given the small output size (128), standard mm is likely fine, but let's write a fused one if needed.
+# Actually, to keep it simple and robust, we will replace the heavy i2h+tanh part with our custom kernel.
+# The h2o layer can remain as nn.Linear or be optimized similarly. Let's optimize h2o too for consistency.
+
+linear_output_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void linear_output_kernel(
+    const float* h,       // [batch_size, hidden_size]
+    const float* W,       // [output_size, hidden_size]
+    const float* b,       // [output_size]
+    float* out,           // [batch_size, output_size]
+    int batch_size,
+    int hidden_size,
+    int output_size) 
+{
+    int batch_idx = blockIdx.x;
+    if (batch_idx >= batch_size) return;
+
+    const float* h_row = h + batch_idx * hidden_size;
+    float* out_row = out + batch_idx * output_size;
+
+    int j = threadIdx.x;
+    if (j >= output_size) return;
+
+    float sum = b[j];
+    const float* W_row = W + j * hidden_size;
+
+    for (int k = 0; k < hidden_size; ++k) {
+        sum += W_row[k] * h_row[k];
+    }
+
+    out_row[j] = sum;
+}
+
+torch::Tensor linear_output_cuda(
+    torch::Tensor h, 
+    torch::Tensor W, 
+    torch::Tensor b) 
+{
+    auto batch_size = h.size(0);
+    auto hidden_size = h.size(1);
+    auto output_size = W.size(0);
+
+    auto out = torch::zeros({batch_size, output_size}, h.options());
+
+    const int block_size = 256; 
+    
+    dim3 grid(batch_size);
+    dim3 block(block_size);
+
+    linear_output_kernel<<<grid, block>>>(
+        h.data_ptr<float>(),
+        W.data_ptr<float>(),
+        b.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        hidden_size,
+        output_size
+    );
+
+    return out;
+}
+"""
+
+linear_output_cpp = (
+    "torch::Tensor linear_output_cuda(torch::Tensor h, torch::Tensor W, torch::Tensor b);"
+)
+
+# We need to load this too. Since we can only have one load_inline call per name in some environments, 
+// or we can combine them. Let's combine them into one module for simplicity and fewer compilation steps.
+
+combined_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__device__ __forceinline__ float fast_tanh(float x) {
+    return tanhf(x); 
+}
+
+__global__ void fused_linear_tanh_kernel(
+    const float* x,       
+    const float* h_prev,  
+    const float* W,       
+    const float* b,       
+    float* h_new,         
+    int batch_size,
+    int input_size,
+    int hidden_size) 
+{
+    int batch_idx = blockIdx.x;
+    if (batch_idx >= batch_size) return;
+
+    const float* x_row = x + batch_idx * input_size;
+    const float* h_prev_row = h_prev + batch_idx * hidden_size;
+    float* h_new_row = h_new + batch_idx * hidden_size;
+
+    int j = threadIdx.x;
+    if (j >= hidden_size) return;
+
+    float sum = b[j];
+    
+    const float* W_row = W + j * (input_size + hidden_size);
+    
+    for (int k = 0; k < input_size; ++k) {
+        sum += W_row[k] * x_row[k];
+    }
+    for (int k = 0; k < hidden_size; ++k) {
+        sum += W_row[input_size + k] * h_prev_row[k];
+    }
+
+    h_new_row[j] = fast_tanh(sum);
+}
+
+__global__ void linear_output_kernel(
+    const float* h,       
+    const float* W,       
+    const float* b,       
+    float* out,           
+    int batch_size,
+    int hidden_size,
+    int output_size) 
+{
+    int batch_idx = blockIdx.x;
+    if (batch_idx >= batch_size) return;
+
+    const float* h_row = h + batch_idx * hidden_size;
+    float* out_row = out + batch_idx * output_size;
+
+    int j = threadIdx.x;
+    if (j >= output_size) return;
+
+    float sum = b[j];
+    const float* W_row = W + j * hidden_size;
+
+    for (int k = 0; k < hidden_size; ++k) {
+        sum += W_row[k] * h_row[k];
+    }
+
+    out_row[j] = sum;
+}
+
+torch::Tensor fused_linear_tanh_cuda(
+    torch::Tensor x, 
+    torch::Tensor h_prev, 
+    torch::Tensor W, 
+    torch::Tensor b) 
+{
+    auto batch_size = x.size(0);
+    auto input_size = x.size(1);
+    auto hidden_size = h_prev.size(1);
+
+    auto h_new = torch::zeros({batch_size, hidden_size}, x.options());
+
+    const int block_size = 256; 
+    
+    dim3 grid(batch_size);
+    dim3 block(block_size);
+
+    fused_linear_tanh_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        h_prev.data_ptr<float>(),
+        W.data_ptr<float>(),
+        b.data_ptr<float>(),
+        h_new.data_ptr<float>(),
+        batch_size,
+        input_size,
+        hidden_size
+    );
+
+    return h_new;
+}
+
+torch::Tensor linear_output_cuda(
+    torch::Tensor h, 
+    torch::Tensor W, 
+    torch::Tensor b) 
+{
+    auto batch_size = h.size(0);
+    auto hidden_size = h.size(1);
+    auto output_size = W.size(0);
+
+    auto out = torch::zeros({batch_size, output_size}, h.options());
+
+    const int block_size = 256; 
+    
+    dim3 grid(batch_size);
+    dim3 block(block_size);
+
+    linear_output_kernel<<<grid, block>>>(
+        h.data_ptr<float>(),
+        W.data_ptr<float>(),
+        b.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        hidden_size,
+        output_size
+    );
+
+    return out;
+}
+"""
+
+combined_cpp = (
+    "torch::Tensor fused_linear_tanh_cuda(torch::Tensor x, torch::Tensor h_prev, torch::Tensor W, torch::Tensor b);"
+    "torch::Tensor linear_output_cuda(torch::Tensor h, torch::Tensor W, torch::Tensor b);"
+)
+
+# Load the combined module
+custom_ops = load_inline(
+    name="custom_rnn_ops",
+    cpp_sources=combined_cpp,
+    cuda_sources=combined_cuda_source,
+    functions=["fused_linear_tanh_cuda", "linear_output_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, output_size: int):
+        """
+        Initialize the Optimized RNN model with custom CUDA operators.
+        
+        :param input_size: The number of input features (int).
+        :param hidden_size: The size of the hidden state (int).
+        :param output_size: The number of output features (int).
+        """
+        super(ModelNew, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+
+        # Define weights and biases manually to pass to custom kernels
+        # i2h: Linear(input_size + hidden_size, hidden_size)
+        self.register_buffer('i2h_weight', torch.randn(hidden_size, input_size + hidden_size))
+        self.register_buffer('i2h_bias', torch.zeros(hidden_size))
+        
+        # h2o: Linear(hidden_size, output_size)
+        self.register_buffer('h2o_weight', torch.randn(output_size, hidden_size))
+        self.register_buffer('h2o_bias', torch.zeros(output_size))
+
+    def forward(self, x: torch.Tensor, h0: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the Optimized Vanilla RNN using custom CUDA kernels.
+        
+        :param x: Input tensor of shape (seq_len, batch_size, input_size)
+        :param h0: Initial hidden state tensor of shape (batch_size, hidden_size)
+        :return: Output tensor of shape (seq_len, batch_size, output_size)
+        """
+        seq_len, batch_size, _ = x.size()
+        hidden = h0.to(x.device)
+        outputs = []
+
+        # Pre-allocate output tensor for efficiency if possible, but appending is fine for this structure
+        for t in range(seq_len):
+            x_t = x[t]  # Shape: (batch_size, input_size)
+            
+            # Fused Linear + Tanh for hidden state update
+            # combined = [x_t, hidden]
+            # hidden_new = tanh(i2h(combined))
+            hidden = custom_ops.fused_linear_tanh_cuda(x_t, hidden, self.i2h_weight, self.i2h_bias)
+            
+            # Linear output projection
+            # output = h2o(hidden)
+            output = custom_ops.linear_output_cuda(hidden, self.h2o_weight, self.h2o_bias)
+            
+            outputs.append(output)
+
+        return torch.stack(outputs, dim=0)  # (seq_len, batch_size, output_size)
+
+
+def get_inputs():
+    return [
+        torch.rand(sequence_length, batch_size, input_size),
+        torch.rand(batch_size, hidden_size)
+    ]
+
+def get_init_inputs():
+    return [input_size, hidden_size, output_size]
+```

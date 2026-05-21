@@ -1,0 +1,273 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for 2D Transposed Convolution
+# This implementation handles asymmetric kernels, strides, padding, dilation, and groups.
+# It uses a direct im2col-like approach or direct computation optimized for small kernels.
+# Given the constraints and typical optimization strategies, we will implement a direct 
+# convolution loop which is often faster than cuDNN for specific non-standard configurations 
+# (like asymmetric strides/padding/dilation) when fused with bias addition if needed, 
+# though here we just do the conv. We assume no bias for simplicity as per default, 
+# but the structure allows extension.
+
+transposed_conv2d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper to calculate output dimensions
+// out_h = (in_h - 1) * stride[0] - 2 * padding[0] + dilation[0] * (kernel_h - 1) + 1
+// out_w = (in_w - 1) * stride[1] - 2 * padding[1] + dilation[1] * (kernel_w - 1) + 1
+
+__global__ void transposed_conv2d_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    float* __restrict__ output,
+    int batch_size,
+    int in_channels,
+    int out_channels,
+    int in_height,
+    int in_width,
+    int kernel_height,
+    int kernel_width,
+    int stride_h,
+    int stride_w,
+    int padding_h,
+    int padding_w,
+    int dilation_h,
+    int dilation_w,
+    int groups
+) {
+    // Each thread computes one element of the output tensor
+    // Output shape: (batch_size, out_channels, out_height, out_width)
+    
+    int batch_idx = blockIdx.z;
+    int out_channel_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int out_pixel_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (batch_idx >= batch_size || out_channel_idx >= out_channels) return;
+
+    // Calculate output height and width
+    int out_height = (in_height - 1) * stride_h - 2 * padding_h + dilation_h * (kernel_height - 1) + 1;
+    int out_width = (in_width - 1) * stride_w - 2 * padding_w + dilation_w * (kernel_width - 1) + 1;
+
+    if (out_pixel_idx >= out_height * out_width) return;
+
+    int out_h = out_pixel_idx / out_width;
+    int out_w = out_pixel_idx % out_width;
+
+    // Determine which input channel group this output channel belongs to
+    int group_idx = out_channel_idx / groups;
+    int in_channel_offset = group_idx * (in_channels / groups);
+    int out_channel_in_group = out_channel_idx % groups;
+    
+    // Weight shape: (out_channels, in_channels/groups, kernel_h, kernel_w)
+    // We need to iterate over input channels within the group
+    
+    float sum = 0.0f;
+
+    for (int g = 0; g < groups; ++g) {
+        int current_out_channel_in_group = out_channel_idx % groups; // This logic is slightly flawed if we iterate groups differently
+        
+        // Let's restructure: Iterate over input channels in the group corresponding to this output channel
+        // Output channel 'c' corresponds to input channel 'c / groups * (in_channels/groups) + k' ? No.
+        // Standard grouped conv: Output channel c is connected to Input channels [c/groups * C_in/G ... (c/groups+1)*C_in/G - 1]
+        
+        int start_in_ch = group_idx * (in_channels / groups);
+        int end_in_ch = (group_idx + 1) * (in_channels / groups);
+        
+        for (int in_ch = start_in_ch; in_ch < end_in_ch; ++in_ch) {
+            // Iterate over kernel elements
+            for (int kh = 0; kh < kernel_height; ++kh) {
+                for (int kw = 0; kw < kernel_width; ++kw) {
+                    // Calculate the corresponding input coordinate
+                    // For transposed conv:
+                    // in_h = out_h * stride_h - padding_h + kh * dilation_h
+                    // in_w = out_w * stride_w - padding_w + kw * dilation_w
+                    
+                    int in_h = out_h * stride_h - padding_h + kh * dilation_h;
+                    int in_w = out_w * stride_w - padding_w + kw * dilation_w;
+
+                    // Check bounds for input tensor
+                    if (in_h >= 0 && in_h < in_height && in_w >= 0 && in_w < in_width) {
+                        // Input index: [batch, in_ch, in_h, in_w]
+                        int input_idx = ((batch_idx * in_channels + in_ch) * in_height + in_h) * in_width + in_w;
+                        
+                        // Weight index: [out_channel, in_ch, kh, kw]
+                        // Note: PyTorch weight shape for ConvTranspose2d is (out_channels, in_channels/groups, kernel_h, kernel_w)
+                        int weight_idx = ((out_channel_idx * (in_channels / groups) + (in_ch - start_in_ch)) * kernel_height + kh) * kernel_width + kw;
+                        
+                        sum += input[input_idx] * weight[weight_idx];
+                    }
+                }
+            }
+        }
+    }
+
+    // Output index: [batch, out_channel, out_h, out_w]
+    int output_idx = ((batch_idx * out_channels + out_channel_idx) * out_height + out_h) * out_width + out_w;
+    output[output_idx] = sum;
+}
+
+torch::Tensor transposed_conv2d_cuda(
+    torch::Tensor input,
+    torch::Tensor weight
+) {
+    auto batch_size = input.size(0);
+    auto in_channels = input.size(1);
+    auto in_height = input.size(2);
+    auto in_width = input.size(3);
+
+    auto out_channels = weight.size(0);
+    auto kernel_height = weight.size(2);
+    auto kernel_width = weight.size(3);
+    
+    // These parameters are hardcoded from the problem description for this specific instance, 
+    // but a general solution would take them as args. Since we are optimizing a specific Model class 
+    // defined with fixed args in get_init_inputs, we can either pass them or hardcode. 
+    // To make it robust, let's assume standard PyTorch defaults or infer from weight/input if possible.
+    // However, stride/padding/dilation are not stored in input/weight tensors directly.
+    // We will use the values provided in the problem statement as constants for this specific kernel launch,
+    // OR we can modify the function signature to accept them. 
+    // Given the prompt asks to replace operators in the architecture, and the architecture has fixed args,
+    // we can hardcode the parameters used in `get_init_inputs` test case or make the kernel generic.
+    // Making it generic is better practice. Let's add arguments to the C++ function.
+    
+    return torch::zeros({batch_size, out_channels, 0, 0}, input.options()); 
+}
+
+// We need a wrapper that knows the stride/padding/dilation/groups
+torch::Tensor transposed_conv2d_cuda_full(
+    torch::Tensor input,
+    torch::Tensor weight,
+    int stride_h,
+    int stride_w,
+    int padding_h,
+    int padding_w,
+    int dilation_h,
+    int dilation_w,
+    int groups
+) {
+    auto batch_size = input.size(0);
+    auto in_channels = input.size(1);
+    auto in_height = input.size(2);
+    auto in_width = input.size(3);
+
+    auto out_channels = weight.size(0);
+    auto kernel_height = weight.size(2);
+    auto kernel_width = weight.size(3);
+
+    // Calculate output dimensions
+    int out_height = (in_height - 1) * stride_h - 2 * padding_h + dilation_h * (kernel_height - 1) + 1;
+    int out_width = (in_width - 1) * stride_w - 2 * padding_w + dilation_w * (kernel_width - 1) + 1;
+
+    auto output = torch::zeros({batch_size, out_channels, out_height, out_width}, input.options());
+
+    const int block_x = 32;
+    const int block_y = 8;
+    
+    dim3 threads(block_x, block_y);
+    dim3 blocks(
+        (out_width + block_x - 1) / block_x,
+        (out_channels + block_y - 1) / block_y,
+        batch_size
+    );
+
+    transposed_conv2d_kernel<<<blocks, threads>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        in_channels,
+        out_channels,
+        in_height,
+        in_width,
+        kernel_height,
+        kernel_width,
+        stride_h,
+        stride_w,
+        padding_h,
+        padding_w,
+        dilation_h,
+        dilation_w,
+        groups
+    );
+
+    return output;
+}
+"""
+
+transposed_conv2d_cpp_source = (
+    "torch::Tensor transposed_conv2d_cuda_full("
+    "torch::Tensor input,"
+    "torch::Tensor weight,"
+    "int stride_h,"
+    "int stride_w,"
+    "int padding_h,"
+    "int padding_w,"
+    "int dilation_h,"
+    "int dilation_w,"
+    "int groups"
+    ");"
+);
+
+// Compile the inline CUDA code
+transposed_conv2d = load_inline(
+    name="transposed_conv2d",
+    cpp_sources=transposed_conv2d_cpp_source,
+    cuda_sources=transposed_conv2d_source,
+    functions=["transposed_conv2d_cuda_full"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized 2D transposed convolution using custom CUDA operator.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple, stride: tuple = (1, 1), padding: tuple = (0, 0), dilation: tuple = (1, 1), groups: int = 1, bias: bool = False):
+        super(ModelNew, self).__init__()
+        
+        # Store parameters for the custom kernel
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = groups
+        
+        # We still need a weight tensor to hold the learnable parameters.
+        # In a real scenario, you might want to initialize this properly or load weights.
+        # Here we create an empty parameter that will be used by the custom op.
+        # Note: The custom op expects weight in shape (out_channels, in_channels/groups, kernel_h, kernel_w)
+        kh, kw = kernel_size
+        self.weight = nn.Parameter(torch.empty(out_channels, in_channels // groups, kh, kw))
+        
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_channels))
+        else:
+            self.register_parameter('bias', None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the 2D transposed convolution using the custom CUDA kernel.
+        """
+        out = transposed_conv2d.transposed_conv2d_cuda_full(
+            x,
+            self.weight,
+            self.stride[0],
+            self.stride[1],
+            self.padding[0],
+            self.padding[1],
+            self.dilation[0],
+            self.dilation[1],
+            self.groups
+        )
+        
+        if self.bias is not None:
+            out = out + self.bias.view(1, -1, 1, 1)
+            
+        return out
+```

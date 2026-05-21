@@ -1,0 +1,26 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 65.971,
+  "error": "Isolated KernelBench evaluator failed.",
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_3/problem_26.py",
+  "isolated_eval": {
+    "error": "Object of type RuntimeError is not JSON serializable",
+    "error_type": "builtins.TypeError",
+    "ok": false,
+    "subprocess_output_tail": "[1/3] /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=custom_shuffle_ops -DTORCH_API_INCLUDE_EXTENSION_H -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/include -isystem /home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 --compiler-options '-fPIC' -std=c++17 -c /home/howard/.cache/torch_extensions/py310_cu128/custom_shuffle_ops/cuda.cu -o cuda.cuda.o \nFAILED: [code=2] cuda.cuda.o \n/workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=custom_shuffle_ops -DTORCH_API_INCLUDE_EXTENSION_H -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/include -isystem /home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 --compiler-options '-fPIC' -std=c++17 -c /home/howard/.cache/torch_extensions/py310_cu128/custom_shuffle_ops/cuda.cu -o cuda.cuda.o \n/home/howard/.cache/torch_extensions/py310_cu128/custom_shuffle_ops/cuda.cu(30): error: identifier \"H_out\" is undefined\n      int total_elements = N * C_out * H_out * W_out;\n                                       ^\n\n/home/howard/.cache/torch_extensions/py310_cu128/custom_shuffle_ops/cuda.cu(30): error: identifier \"W_out\" is undefined\n      int total_elements = N * C_out * H_out * W_out;\n                                               ^\n\n2 errors detected in the compilation of \"/home/howard/.cache/torch_extensions/py310_cu128/custom_shuffle_ops/cuda.cu\".\n[2/3] c++ -MMD -MF main.o.d -DTORCH_EXTENSION_NAME=custom_shuffle_ops -DTORCH_API_INCLUDE_EXTENSION_H -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include -isystem /workspace/external/KernelBench/.venv/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -isystem /workspace/.venv/lib/python3.11/site-packages/nvidia/cu13/include -isystem /home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/include/python3.10 -fPIC -std=c++17 -O3 -c /home/howard/.cache/torch_extensions/py310_cu128/custom_shuffle_ops/main.cpp -o main.o \nninja: build stopped: subcommand failed.\nFailed to compile custom CUDA kernel: Record as compilation failure. \nError: Error building extension 'custom_shuffle_ops'\n",
+    "subprocess_returncode": 0,
+    "traceback": "Traceback (most recent call last):\n  File \"<string>\", line 28, in <module>\n  File \"/home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/json/__init__.py\", line 231, in dumps\n    return _default_encoder.encode(obj)\n  File \"/home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/json/encoder.py\", line 199, in encode\n    chunks = self.iterencode(o, _one_shot=True)\n  File \"/home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/json/encoder.py\", line 257, in iterencode\n    return _iterencode(o, 0)\n  File \"/home/howard/.local/share/uv/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/json/encoder.py\", line 179, in default\n    raise TypeError(f'Object of type {o.__class__.__name__} '\nTypeError: Object of type RuntimeError is not JSON serializable\n"
+  },
+  "level": 3,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 26,
+  "problem_name": "26_ShuffleNet.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_3/problem_26.txt",
+  "static_warnings": [
+    "Uses torch.nn.functional op: F.relu",
+    "Uses torch.nn compute layer (only containers, Parameter, init allowed)"
+  ],
+  "status": "evaluation_error"
+}

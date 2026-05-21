@@ -1,0 +1,312 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel source for fused GEMM + GroupNorm + HardTanh
+# This fusion avoids global memory writes/reads between operations, significantly improving performance.
+custom_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper to compute mean and variance in a single pass or two passes.
+// For GroupNorm, we normalize per group. 
+// GroupNorm divides channels into num_groups groups. Each group has C/G channels.
+// We treat each sample independently.
+
+__global__ void fused_gemm_groupnorm_hardtanh_kernel(
+    const float* __restrict__ x,      // Input: [B, in_features]
+    const float* __restrict__ weight, // GEMM Weight: [out_features, in_features]
+    const float* __restrict__ bias,   // GEMM Bias: [out_features]
+    float* __restrict__ out,          // Output: [B, out_features]
+    
+    int batch_size,
+    int in_features,
+    int out_features,
+    int num_groups,
+    float hardtanh_min,
+    float hardtanh_max,
+    float eps
+) {
+    int b = blockIdx.y; // Batch index
+    if (b >= batch_size) return;
+
+    int g = blockIdx.x; // Group index
+    
+    // Each block handles one group for one sample.
+    // Total groups per sample = num_groups.
+    // Channels per group = out_features / num_groups.
+    
+    int channels_per_group = out_features / num_groups;
+    int start_channel = g * channels_per_group;
+    int end_channel = start_channel + channels_per_group;
+
+    // Shared memory for partial sums if needed, but for simplicity and large dimensions, 
+    // we can do a two-pass approach or use atomic adds. 
+    // However, to keep it simple and efficient without complex shared mem management for variable sizes:
+    // We will compute mean/var per group using global memory accesses which are coalesced if structured well,
+    // but here threads in a block work on the same group.
+    
+    // Let's use a standard approach: 
+    // 1. Compute GEMM output for this group's channels.
+    // 2. Compute Mean and Variance for these channels.
+    // 3. Normalize.
+    // 4. Apply HardTanh.
+    
+    // Since we are fusing, we need to be careful about memory access patterns.
+    // The input x is [B, in_features]. Weight is [out_features, in_features].
+    // For a specific sample b and group g, we compute out[b, start_channel:end_channel].
+    
+    int tid = threadIdx.x;
+    int num_threads = blockDim.x;
+    
+    // We assume out_features is divisible by num_groups.
+    // Each thread handles one or more channels in the group? 
+    // Or each block handles all channels in the group?
+    // Let's make each block handle one group for one sample.
+    // Block size should be at least channels_per_group, or we iterate.
+    
+    // To ensure coalesced reads from x and weight, it's better if threads in a warp access contiguous memory.
+    // Here, thread t computes channel (start_channel + t).
+    
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+    
+    // First pass: Compute GEMM and accumulate for Mean/Variance
+    // We need to compute the full GEMM result for these channels first.
+    // However, we can't store intermediate results easily without shared memory or global memory.
+    // Let's write to global memory directly in a first pass? No, that defeats fusion benefits if not careful.
+    
+    // Alternative: Use shared memory to store the GEMM results for the group.
+    // Shared memory size: channels_per_group * sizeof(float).
+    // This might be too large for very large out_features. 
+    // Given out_features=8192, num_groups=16 -> 512 channels per group. 
+    // 512 floats = 2KB. This fits easily in shared memory.
+    
+    extern __shared__ float sdata[];
+    
+    int idx_in_group = tid;
+    
+    // Initialize shared memory for this block's group output
+    if (idx_in_group < channels_per_group) {
+        int out_idx = start_channel + idx_in_group;
+        
+        // Compute GEMM: y = x * W^T + b
+        // x is [in_features], weight row is weight[out_idx, :]
+        float val = 0.0f;
+        if (bias) {
+            val = bias[out_idx];
+        } else {
+            val = 0.0f;
+        }
+        
+        // Unroll or loop over in_features
+        // For performance, we might want to use a more optimized GEMM strategy, 
+        // but for inline code, a simple loop is safer.
+        // We can optimize by loading x into shared memory if in_features is large?
+        // in_features = 8192. Loading 8192 floats per block might be heavy on shared mem bandwidth if many blocks.
+        // But here each block handles one sample/group. 
+        // Let's just do direct access for simplicity, assuming coalesced reads from x and weight are efficient enough.
+        
+        const float* x_row = x + b * in_features;
+        const float* w_row = weight + out_idx * in_features;
+        
+        #pragma unroll
+        for (int i = 0; i < in_features; ++i) {
+            val += x_row[i] * w_row[i];
+        }
+        
+        sdata[idx_in_group] = val;
+    } else {
+        // Pad shared memory if necessary, though we only access valid indices
+        sdata[tid] = 0.0f; 
+    }
+    
+    __syncthreads();
+    
+    // Now compute Mean and Variance from sdata
+    // We need to reduce over the group channels (size = channels_per_group)
+    float local_sum = 0.0f;
+    float local_sum_sq = 0.0f;
+    
+    for (int i = tid; i < channels_per_group; i += num_threads) {
+        float val = sdata[i];
+        local_sum += val;
+        local_sum_sq += val * val;
+    }
+    
+    // Reduce within block
+    __shared__ float shared_sum[1024]; // Max threads 1024
+    __shared__ float shared_sum_sq[1024];
+    
+    if (tid < channels_per_group) {
+        shared_sum[tid] = local_sum;
+        shared_sum_sq[tid] = local_sum_sq;
+    } else {
+        shared_sum[tid] = 0.0f;
+        shared_sum_sq[tid] = 0.0f;
+    }
+    
+    __syncthreads();
+    
+    // Simple reduction loop (assuming num_threads is power of 2 and <= 1024)
+    for (int stride = num_threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+            shared_sum_sq[tid] += shared_sum_sq[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    float group_mean = shared_sum[0] / channels_per_group;
+    float group_var = (shared_sum_sq[0] / channels_per_group) - (group_mean * group_mean);
+    // Add epsilon for numerical stability
+    float inv_std = rsqrtf(group_var + eps);
+    
+    __syncthreads(); // Ensure all threads have the mean/var before proceeding
+    
+    // Second pass: Normalize and Apply HardTanh, write to output
+    if (idx_in_group < channels_per_group) {
+        int out_idx = start_channel + idx_in_group;
+        float val = sdata[idx_in_group];
+        
+        // Normalize
+        val = (val - group_mean) * inv_std;
+        
+        // HardTanh
+        if (val < hardtanh_min) {
+            val = hardtanh_min;
+        } else if (val > hardtanh_max) {
+            val = hardtanh_max;
+        }
+        
+        out[b * out_features + out_idx] = val;
+    }
+}
+
+torch::Tensor fused_gemm_groupnorm_hardtanh_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int num_groups,
+    float hardtanh_min,
+    float hardtanh_max,
+    float eps
+) {
+    auto batch_size = x.size(0);
+    auto in_features = x.size(1);
+    auto out_features = weight.size(0);
+    
+    TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
+    TORCH_CHECK(out_features % num_groups == 0, "out_features must be divisible by num_groups");
+    
+    auto out = torch::zeros({batch_size, out_features}, x.options());
+    
+    int channels_per_group = out_features / num_groups;
+    
+    // Grid: (num_groups * batch_size, 1, 1)
+    dim3 grid(num_groups * batch_size, 1, 1);
+    
+    // Block: max(channels_per_group, 256) threads? 
+    // We need enough threads to cover channels_per_group.
+    int block_size = 256;
+    if (channels_per_group > block_size) {
+        block_size = 512;
+    }
+    if (channels_per_group > block_size) {
+        block_size = 1024;
+    }
+    
+    // Shared memory size: channels_per_group * sizeof(float)
+    int shared_mem_bytes = channels_per_group * sizeof(float);
+    
+    fused_gemm_groupnorm_hardtanh_kernel<<<grid, block_size, shared_mem_bytes>>>(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        out.data_ptr<float>(),
+        batch_size,
+        in_features,
+        out_features,
+        num_groups,
+        hardtanh_min,
+        hardtanh_max,
+        eps
+    );
+    
+    return out;
+}
+"""
+
+custom_cpp_source = (
+    "torch::Tensor fused_gemm_groupnorm_hardtanh_cuda("
+    "torch::Tensor x,"
+    "torch::Tensor weight,"
+    "torch::Tensor bias,"
+    "int num_groups,"
+    "float hardtanh_min,"
+    "float hardtanh_max,"
+    "float eps"
+    ");"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=custom_cpp_source,
+    cuda_sources=custom_cuda_source,
+    functions=["fused_gemm_groupnorm_hardtanh_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs a fused GEMM + GroupNorm + HardTanh operation.
+    """
+    def __init__(self, in_features, out_features, num_groups, hardtanh_min, hardtanh_max):
+        super(ModelNew, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_groups = num_groups
+        self.hardtanh_min = hardtanh_min
+        self.hardtanh_max = hardtanh_max
+        
+        # Initialize weights and biases manually to match nn.Linear behavior
+        # nn.Linear uses Kaiming uniform initialization by default in PyTorch
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(out_features))
+        
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Initialize weight with Kaiming uniform
+        nn.init.kaiming_uniform_(self.weight, a=0.0)
+        # Initialize bias with uniform distribution
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        # Use the fused CUDA operator
+        return fused_ops.fused_gemm_groupnorm_hardtanh_cuda(
+            x,
+            self.weight,
+            self.bias,
+            self.num_groups,
+            self.hardtanh_min,
+            self.hardtanh_max,
+            1e-5  # eps for GroupNorm
+        )
+
+import math

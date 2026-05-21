@@ -1,0 +1,87 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void relu_kernel(const float* __restrict__ x, float* __restrict__ y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = x[i];
+        y[i] = v > 0.0f ? v : 0.0f;
+    }
+}
+
+__global__ void add_relu_kernel(const float* __restrict__ a,
+                                const float* __restrict__ b,
+                                float* __restrict__ y,
+                                int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = a[i] + b[i];
+        y[i] = v > 0.0f ? v : 0.0f;
+    }
+}
+
+torch::Tensor relu_cuda(torch::Tensor x) {
+    auto y = torch::empty_like(x);
+    int n = x.numel();
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    relu_kernel<<<blocks, threads>>>(x.data_ptr<float>(), y.data_ptr<float>(), n);
+    return y;
+}
+
+torch::Tensor add_relu_cuda(torch::Tensor a, torch::Tensor b) {
+    auto y = torch::empty_like(a);
+    int n = a.numel();
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    add_relu_kernel<<<blocks, threads>>>(a.data_ptr<float>(), b.data_ptr<float>(), y.data_ptr<float>(), n);
+    return y;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor relu_cuda(torch::Tensor x);
+torch::Tensor add_relu_cuda(torch::Tensor a, torch::Tensor b);
+"""
+
+_resblock_ops = load_inline(
+    name="resblock_relu_add_relu_ops",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["relu_cuda", "add_relu_cuda"],
+    verbose=False,
+)
+
+
+class ModelNew(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(ModelNew, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.downsample = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels * self.expansion, kernel_size=1, stride=stride, bias=False),
+            nn.BatchNorm2d(out_channels * self.expansion),
+        )
+        self.stride = stride
+        self.ops = _resblock_ops
+
+    def forward(self, x):
+        identity = self.downsample(x)
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.ops.relu_cuda(out.contiguous())
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        return self.ops.add_relu_cuda(out.contiguous(), identity.contiguous())

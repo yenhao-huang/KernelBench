@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 60.85,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "0.515845",
+        "0.516438",
+        "0.516441",
+        "0.514908",
+        "0.515475"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "2.474943",
+        "2.518765",
+        "2.496468",
+        "2.522211",
+        "2.499346"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_3/problem_12.py",
+  "level": 3,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 12,
+  "problem_name": "12_VGG19.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_3/problem_12.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

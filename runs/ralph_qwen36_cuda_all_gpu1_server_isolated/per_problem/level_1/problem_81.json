@@ -1,0 +1,15 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 32.243,
+  "error": "KernelBench evaluator returned None.",
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_1/problem_81.py",
+  "level": 1,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 81,
+  "problem_name": "81_conv_transposed_2D_asymmetric_input_square_kernel___dilated____padded____strided__.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_1/problem_81.txt",
+  "static_warnings": [],
+  "status": "evaluation_error"
+}

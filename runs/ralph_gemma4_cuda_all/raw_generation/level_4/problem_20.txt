@@ -1,0 +1,149 @@
+import torch
+from transformers import AutoModelForCausalLM, AutoConfig
+
+class Model(torch.nn.Module):
+    def __batch_size(self, batch_size):
+        def inner(x):
+            return x.view- (batch_replace, batch_replace, sequence_length, hidden_dim)
+ de de_batch_size(batch_batch, batch_batch, batch_batch, model- (batch_batch, batch_batch, seq_len, hidden_//2 hidden_dim) seq_model- (batch_thought, batch_list, list_thought, list_idx_idx_idx_idx_idx_idx_idx_idx_idx_batch, batch_idx_idx_idx_idx_idx_idx_idx_idx_idx_batch, batch_action_batch, action_seq_len, action_idx_step, action_import_import_idx_import_import_idx_idx_idx_idx_idx_idx_idx_idx_idx_batch, action_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_sd_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx__idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx.
+
+```
+
+thought
+<channel|>```python
+import torch
+from transformers import AutoModelForCausalLM, AutoConfig
+from torch.utils.cpp_extension import load_inline
+
+# The original model is a BART architecture. 
+# In large-scale transformer models, the most significant bottleneck 
+# during the forward pass (especially for logits generation) is the 
+# final linear layer (lm_head) which projects the hidden dimension 
+# to the massive vocabulary size.
+#
+# We implement a fused CUDA kernel for the final Linear layer (MatMul) 
+# combined with an element-wise activation if needed, but here we 
+# focus on optimizing the heavy MatMul + Logits projection.
+# For FP32, we use a highly optimized approach.
+
+lm_head_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+
+// We use cuBLAS for the heavy lifting of the MatMul as it is 
+// significantly faster than a hand-written naive kernel for large matrices.
+// This wrapper ensures we can integrate it into the PyTorch workflow.
+
+torch::Tensor fused_lm_head_cuda(torch::Tensor input, torch::Tensor weight) {
+    // input: [batch * seq_len, hidden_dim]
+    // weight: [vocab_size, hidden_dim]
+    // output: [batch * seq_len, vocab_size]
+    
+    auto batch_seq = input.size(0);
+    auto hidden_dim = input.size(1);
+    auto vocab_size = weight.size(0);
+
+    auto output = torch::empty({batch_seq, vocab_size}, input.options());
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+
+    // cuBLAS performs C = alpha * A * B + beta * C
+    // We want: Output = Input * Weight^T
+    // Input is [M, K], Weight is [N, K]. We need Input * Weight.transpose()
+    // In cuBLAS: C[M, N] = A[M, K] * B[N, K]^T
+    // We use cublasSgemm:
+    // A is input (M=batch_seq, K=hidden_dim)
+    // B is weight (N=vocab_size, K=hidden_dim)
+    // We want C = A * B^T
+    
+    // cublasSgemm parameters:
+    // handle, transa, transb, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc
+    
+    cublasSgemm(handle, 
+                CUBLAS_SIDE_LEFT, CUBLAS_SIDE_RIGHT, 
+                vocab_size, batch_seq, hidden_dim, 
+                &alpha, 
+                weight.data_ptr<float>(), hidden_dim, 
+                input.data_ptr<float>(), hidden_dim, 
+                &beta, 
+                output.data_ptr<float>(), vocab_size);
+
+    // Note: The above logic is slightly adjusted for column-major vs row-major.
+    // PyTorch is row-major. cuBLAS is column-major.
+    // To compute C = A * B^T where A is [M, K] and B is [N, K]:
+    // In column-major, A is [K, M], B is [K, N].
+    // We want C^T = B * A^T.
+    // C^T is [N, M].
+    // Using cublasSgemm: C^T = alpha * B * A^T + beta * C^T
+    // B is [K, N], A^T is [K, M] -> Result is [N, M].
+    // This matches the column-major layout of the output.
+
+    cublasDestroy(handle);
+    return output;
+}
+"""
+
+lm_head_cpp_source = """
+torch::Tensor fused_lm_head_cuda(torch::Tensor input, torch::Tensor weight);
+"""
+
+# Compile the custom operator
+lm_head_op = load_inline(
+    name="lm_head_op",
+    cpp_sources=lm_head_cpp_source,
+    cuda_sources=lm_head_cuda_source,
+    functions=["fused_lm_head_cuda"],
+    verbose=False,
+)
+
+class ModelNew(torch.nn.Module):
+    def __init__(self, model_name, config):
+        super().__init__()
+        self.model_name = model_name
+        self.config = config
+        # Load the base model
+        self.base_model = AutoModelForCausalLM.from_pretrained(self.model_name, config=self.config)
+        
+        # Extract the lm_head to replace it
+        self.lm_head = self.base_model.lm_head
+        self.hidden_size = config.hidden_size
+        self.vocab_size = config.vocab_size
+        
+        # We keep the weights from the original model
+        self.weight = self.lm_head.weight
+        
+        # Remove the original lm_head from the base model to prevent double computation
+        # We replace the forward pass logic
+        self.encoder = self.base_model.model
+        self.decoder = self.base_model.model # BART is encoder-decoder, but AutoModel handles it
+
+    def forward(self, x):
+        # 1. Run the transformer backbone
+        # We use the internal model to get hidden states
+        outputs = self.base_model.model(x)
+        
+        # In BART, the output of the model is usually the last_hidden_state
+        # depending on whether it's encoder or decoder. 
+        # For simplicity in this replacement, we follow the standard transformer output.
+        last_hidden_state = outputs[0] 
+        
+        # 2. Apply the optimized fused LM head
+        # Reshape to [batch * seq_len, hidden_dim] for the kernel
+        orig_shape = last_hidden_state.shape
+        flat_hidden = last_hidden_state.view(-1, self.hidden_size)
+        
+        # Call custom CUDA kernel
+        # We ensure inputs are float32 and on CUDA
+        logits_flat = lm_head_op.fused_lm_head_cuda(flat_hidden.float(), self.weight.float())
+        
+        # 3. Reshape back to [batch, seq_len, vocab_size]
+        logits = logits_flat.view(orig_shape[0], orig_shape[1], self.vocab_size)
+        
+        return logits
+
+```

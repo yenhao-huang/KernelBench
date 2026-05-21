@@ -1,0 +1,123 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for LogSoftmax
+# This implementation uses the online algorithm to compute softmax in a single pass (or two passes: max and sum)
+# It is optimized for FP32 precision.
+log_softmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper kernel to find the maximum value along the reduction dimension
+__global__ void log_softmax_max_kernel(const float* input, float* max_out, int batch_size, int dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        const float* row = input + idx * dim;
+        float max_val = row[0];
+        for (int i = 1; i < dim; ++i) {
+            if (row[i] > max_val) {
+                max_val = row[i];
+            }
+        }
+        max_out[idx] = max_val;
+    }
+}
+
+// Helper kernel to compute the sum of exp(x - max) along the reduction dimension
+__global__ void log_softmax_sum_kernel(const float* input, const float* max_vals, float* sum_out, int batch_size, int dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        const float* row = input + idx * dim;
+        float max_val = max_vals[idx];
+        float sum = 0.0f;
+        for (int i = 0; i < dim; ++i) {
+            sum += expf(row[i] - max_val);
+        }
+        sum_out[idx] = sum;
+    }
+}
+
+// Main kernel to compute log_softmax: out = x - max - log(sum(exp(x - max)))
+__global__ void log_softmax_kernel(const float* input, const float* max_vals, const float* sum_vals, float* output, int batch_size, int dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size * dim) {
+        int batch_idx = idx / dim;
+        int elem_idx = idx % dim;
+        
+        const float* row = input + batch_idx * dim;
+        float val = row[elem_idx];
+        float max_val = max_vals[batch_idx];
+        float sum_val = sum_vals[batch_idx];
+        
+        output[idx] = val - max_val - logf(sum_val);
+    }
+}
+
+torch::Tensor log_softmax_cuda(torch::Tensor x) {
+    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(x.dim() == 2, "Input must be a 2D tensor");
+    
+    int batch_size = x.size(0);
+    int dim = x.size(1);
+    
+    auto output = torch::empty_like(x);
+    auto max_vals = torch::empty({batch_size}, x.options());
+    auto sum_vals = torch::empty({batch_size}, x.options());
+    
+    const int block_size = 256;
+    const int num_blocks_max = (batch_size + block_size - 1) / block_size;
+    const int num_blocks_sum = (batch_size + block_size - 1) / block_size;
+    const int num_blocks_final = (batch_size * dim + block_size - 1) / block_size;
+
+    // Step 1: Find max along dim=1 for each row
+    log_softmax_max_kernel<<<num_blocks_max, block_size>>>(x.data_ptr<float>(), max_vals.data_ptr<float>(), batch_size, dim);
+    
+    // Step 2: Compute sum of exp(x - max) along dim=1 for each row
+    log_softmax_sum_kernel<<<num_blocks_sum, block_size>>>(x.data_ptr<float>(), max_vals.data_ptr<float>(), sum_vals.data_ptr<float>(), batch_size, dim);
+    
+    // Step 3: Compute final log_softmax values
+    log_softmax_kernel<<<num_blocks_final, block_size>>>(x.data_ptr<float>(), max_vals.data_ptr<float>(), sum_vals.data_ptr<float>(), output.data_ptr<float>(), batch_size, dim);
+    
+    return output;
+}
+"""
+
+log_softmax_cpp_source = (
+    "torch::Tensor log_softmax_cuda(torch::Tensor x);"
+)
+
+# Compile the inline CUDA code for LogSoftmax
+log_softmax_ops = load_inline(
+    name="log_softmax_custom",
+    cpp_sources=log_softmax_cpp_source,
+    cuda_sources=log_softmax_source,
+    functions=["log_softmax_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"],
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs a LogSoftmax activation using custom CUDA operators.
+    """
+    def __init__(self, dim: int = 1):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies LogSoftmax activation to the input tensor using custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, dim).
+
+        Returns:
+            torch.Tensor: Output tensor with LogSoftmax applied, same shape as input.
+        """
+        return log_softmax_ops.log_softmax_cuda(x)
+```

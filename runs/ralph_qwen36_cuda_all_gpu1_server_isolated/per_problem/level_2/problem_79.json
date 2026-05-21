@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 52.703,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "0.214627",
+        "0.214952",
+        "0.215411",
+        "0.215554",
+        "0.215004"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "1.330314",
+        "1.330316",
+        "1.330312",
+        "1.330311",
+        "1.330309"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_2/problem_79.py",
+  "level": 2,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 79,
+  "problem_name": "79_Conv3d_Multiply_InstanceNorm_Clamp_Multiply_Max.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_2/problem_79.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

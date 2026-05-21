@@ -1,0 +1,27 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 58.028,
+  "eval_result": {
+    "compiled": true,
+    "correctness": true,
+    "metadata": {
+      "correctness_trials": "(5 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090"
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/generated_kernels/level_2/problem_44.py",
+  "level": 2,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 44,
+  "problem_name": "44_ConvTranspose2d_Multiply_GlobalAvgPool_GlobalAvgPool_Mean.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server_isolated/raw_generation/level_2/problem_44.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

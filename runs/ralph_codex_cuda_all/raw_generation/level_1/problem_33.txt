@@ -1,0 +1,198 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+bn_cpp_source = "torch::Tensor bn2d_forward_cuda(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, torch::Tensor running_mean, torch::Tensor running_var, bool training, double momentum, double eps);"
+
+bn_cuda_source = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void bn_stats_kernel(
+    const float* __restrict__ x,
+    float* __restrict__ mean,
+    float* __restrict__ invstd,
+    float* __restrict__ running_mean,
+    float* __restrict__ running_var,
+    int N, int C, int H, int W,
+    float momentum,
+    float eps
+) {
+    int c = blockIdx.x;
+    int tid = threadIdx.x;
+    int M = N * H * W;
+
+    __shared__ double s_sum[256];
+    __shared__ double s_sq[256];
+
+    double sum = 0.0;
+    double sq = 0.0;
+
+    for (int i = tid; i < M; i += blockDim.x) {
+        int n = i / (H * W);
+        int hw = i - n * H * W;
+        float v = x[((n * C + c) * H * W) + hw];
+        sum += (double)v;
+        sq += (double)v * (double)v;
+    }
+
+    s_sum[tid] = sum;
+    s_sq[tid] = sq;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_sum[tid] += s_sum[tid + stride];
+            s_sq[tid] += s_sq[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        double m = s_sum[0] / (double)M;
+        double var = s_sq[0] / (double)M - m * m;
+        if (var < 0.0) var = 0.0;
+
+        mean[c] = (float)m;
+        invstd[c] = rsqrtf((float)var + eps);
+
+        float unbiased = (M > 1) ? (float)(var * ((double)M / (double)(M - 1))) : (float)var;
+        running_mean[c] = running_mean[c] * (1.0f - momentum) + (float)m * momentum;
+        running_var[c] = running_var[c] * (1.0f - momentum) + unbiased * momentum;
+    }
+}
+
+__global__ void bn_norm_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    const float* __restrict__ mean,
+    const float* __restrict__ invstd,
+    float* __restrict__ out,
+    long long total,
+    int C, int HW
+) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int c = (idx / HW) % C;
+    float y = (x[idx] - mean[c]) * invstd[c];
+    out[idx] = y * weight[c] + bias[c];
+}
+
+__global__ void bn_eval_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    const float* __restrict__ running_mean,
+    const float* __restrict__ running_var,
+    float* __restrict__ out,
+    long long total,
+    int C, int HW,
+    float eps
+) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int c = (idx / HW) % C;
+    float inv = rsqrtf(running_var[c] + eps);
+    out[idx] = (x[idx] - running_mean[c]) * inv * weight[c] + bias[c];
+}
+
+torch::Tensor bn2d_forward_cuda(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    bool training,
+    double momentum,
+    double eps
+) {
+    auto out = torch::empty_like(x);
+
+    int N = (int)x.size(0);
+    int C = (int)x.size(1);
+    int H = (int)x.size(2);
+    int W = (int)x.size(3);
+    int HW = H * W;
+    long long total = x.numel();
+
+    const int threads = 256;
+    const int blocks = (int)((total + threads - 1) / threads);
+
+    if (training) {
+        auto mean = torch::empty({C}, x.options());
+        auto invstd = torch::empty({C}, x.options());
+
+        bn_stats_kernel<<<C, threads>>>(
+            x.data_ptr<float>(),
+            mean.data_ptr<float>(),
+            invstd.data_ptr<float>(),
+            running_mean.data_ptr<float>(),
+            running_var.data_ptr<float>(),
+            N, C, H, W,
+            (float)momentum,
+            (float)eps
+        );
+
+        bn_norm_kernel<<<blocks, threads>>>(
+            x.data_ptr<float>(),
+            weight.data_ptr<float>(),
+            bias.data_ptr<float>(),
+            mean.data_ptr<float>(),
+            invstd.data_ptr<float>(),
+            out.data_ptr<float>(),
+            total, C, HW
+        );
+    } else {
+        bn_eval_kernel<<<blocks, threads>>>(
+            x.data_ptr<float>(),
+            weight.data_ptr<float>(),
+            bias.data_ptr<float>(),
+            running_mean.data_ptr<float>(),
+            running_var.data_ptr<float>(),
+            out.data_ptr<float>(),
+            total, C, HW,
+            (float)eps
+        );
+    }
+
+    return out;
+}
+"""
+
+bn2d_cuda = load_inline(
+    name="bn2d_cuda_kernelbench",
+    cpp_sources=bn_cpp_source,
+    cuda_sources=bn_cuda_source,
+    functions=["bn2d_forward_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias = nn.Parameter(torch.zeros(num_features))
+        self.register_buffer("running_mean", torch.zeros(num_features))
+        self.register_buffer("running_var", torch.ones(num_features))
+        self.momentum = 0.1
+        self.eps = 1e-5
+        self.bn2d_cuda = bn2d_cuda
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.bn2d_cuda.bn2d_forward_cuda(
+            x,
+            self.weight,
+            self.bias,
+            self.running_mean,
+            self.running_var,
+            self.training,
+            self.momentum,
+            self.eps,
+        )
+```

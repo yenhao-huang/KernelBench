@@ -1,0 +1,389 @@
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernels for Conv2d + ReLU fusion and Linear + ReLU fusion
+# We also optimize the MaxPool2d by keeping it standard but ensuring memory layout is optimal,
+# or we can implement a custom fused conv+relu which is the biggest win here.
+
+custom_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAGuard.h>
+
+// Helper for 2D grid/block calculation
+#define BLOCK_SIZE 256
+
+// Kernel for Conv2d + ReLU Fusion
+// Assumes NHWC or NCHW? PyTorch uses NCHW.
+// Input: (N, C, H, W), Weight: (OutC, InC, KH, KW), Bias: (OutC)
+// Output: (N, OutC, OH, OW)
+__global__ void conv2d_relu_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* __restrict__ output,
+    int N, int C, int H, int W,
+    int OutC, int KH, int KW,
+    int stride_h, int stride_w,
+    int pad_h, int pad_w,
+    int OH, int OW) {
+    
+    // Each thread handles one output element (N, out_c, oh, ow)
+    // However, to optimize memory access, we often use a 2D block where threads cooperate.
+    // For simplicity and robustness in inline code without complex shared memory management logic 
+    // that might exceed token limits or complexity, we will use a straightforward approach 
+    // but optimized for coalesced reads if possible. 
+    // Actually, a better strategy for Conv is to have each thread compute one output pixel 
+    // using shared memory for the input tile.
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * OutC * OH * OW;
+    
+    if (idx >= total_elements) return;
+
+    // Decode index to coordinates
+    int ow = idx % OW;
+    int rem = idx / OW;
+    int oh = rem % OH;
+    rem = rem / OH;
+    int oc = rem % OutC;
+    int n = rem / OutC;
+
+    float sum = 0.0f;
+    
+    // Calculate input coordinates for the current output pixel
+    int ih_start = oh * stride_h - pad_h;
+    int iw_start = ow * stride_w - pad_w;
+
+    // Loop over input channels and kernel dimensions
+    for (int ic = 0; ic < C; ++ic) {
+        for (int kh = 0; kh < KH; ++kh) {
+            for (int kw = 0; kw < KW; ++kw) {
+                int ih = ih_start + kh;
+                int iw = iw_start + kw;
+                
+                // Check bounds
+                if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
+                    int input_idx = ((n * C + ic) * H + ih) * W + iw;
+                    int weight_idx = ((oc * C + ic) * KH + kh) * KW + kw;
+                    
+                    sum += input[input_idx] * weight[weight_idx];
+                }
+            }
+        }
+    }
+
+    // Add bias and apply ReLU
+    if (bias != nullptr) {
+        sum += bias[oc];
+    }
+    
+    int output_idx = ((n * OutC + oc) * OH + oh) * OW + ow;
+    output[output_idx] = (sum > 0.0f) ? sum : 0.0f;
+}
+
+// Kernel for Linear + ReLU Fusion
+__global__ void linear_relu_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* __restrict__ output,
+    int N, int InFeatures, int OutFeatures) {
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * OutFeatures;
+
+    if (idx >= total_elements) return;
+
+    int n = idx / OutFeatures;
+    int of = idx % OutFeatures;
+
+    float sum = 0.0f;
+    
+    // Compute dot product for this output neuron
+    for (int if_ = 0; if_ < InFeatures; ++if_) {
+        int input_idx = n * InFeatures + if_;
+        int weight_idx = of * InFeatures + if_; // Weight is typically stored as (Out, In) in PyTorch Linear
+        sum += input[input_idx] * weight[weight_idx];
+    }
+
+    if (bias != nullptr) {
+        sum += bias[of];
+    }
+
+    output[idx] = (sum > 0.0f) ? sum : 0.0f;
+}
+
+// Wrapper for Conv2d + ReLU
+torch::Tensor conv2d_relu_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int stride_h, int stride_w,
+    int pad_h, int pad_w) {
+    
+    auto N = input.size(0);
+    auto C = input.size(1);
+    auto H = input.size(2);
+    auto W = input.size(3);
+    
+    auto OutC = weight.size(0);
+    auto KH = weight.size(2);
+    auto KW = weight.size(3);
+    
+    // Calculate output dimensions
+    int OH = (H + 2 * pad_h - KH) / stride_h + 1;
+    int OW = (W + 2 * pad_w - KW) / stride_w + 1;
+    
+    auto output = torch::zeros({N, OutC, OH, OW}, input.options());
+    
+    const int block_size = 256;
+    int total_elements = N * OutC * OH * OW;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    at::cuda::CUDAGuard device_guard(input.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    conv2d_relu_kernel<<<num_blocks, block_size, 0, stream>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.numel() > 0 ? bias.data_ptr<float>() : nullptr,
+        output.data_ptr<float>(),
+        N, C, H, W,
+        OutC, KH, KW,
+        stride_h, stride_w,
+        pad_h, pad_w,
+        OH, OW
+    );
+    
+    return output;
+}
+
+// Wrapper for Linear + ReLU
+torch::Tensor linear_relu_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias) {
+    
+    auto N = input.size(0);
+    auto InFeatures = input.size(1);
+    auto OutFeatures = weight.size(0);
+    
+    auto output = torch::zeros({N, OutFeatures}, input.options());
+    
+    const int block_size = 256;
+    int total_elements = N * OutFeatures;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    at::cuda::CUDAGuard device_guard(input.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    linear_relu_kernel<<<num_blocks, block_size, 0, stream>>>(
+        input.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.numel() > 0 ? bias.data_ptr<float>() : nullptr,
+        output.data_ptr<float>(),
+        N, InFeatures, OutFeatures
+    );
+    
+    return output;
+}
+
+"""
+
+custom_cpp_source = """
+torch::Tensor conv2d_relu_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int stride_h, int stride_w,
+    int pad_h, int pad_w);
+
+torch::Tensor linear_relu_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias);
+"""
+
+# Compile the inline CUDA code
+custom_ops = load_inline(
+    name="custom_ops",
+    cpp_sources=custom_cpp_source,
+    cuda_sources=custom_cuda_source,
+    functions=["conv2d_relu_cuda", "linear_relu_cuda"],
+    verbose=True,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"]
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000):
+        """
+        :param num_classes: The number of output classes (default is 1000 for ImageNet)
+        """
+        super(ModelNew, self).__init__()
+        
+        # Store parameters as buffers or tensors so they are part of the module state
+        # We will manually handle weights and biases to pass them to custom ops
+        
+        # First convolutional layer
+        self.register_buffer('conv1_weight', torch.empty(96, 3, 11, 11))
+        self.register_buffer('conv1_bias', torch.empty(96))
+        
+        # Second convolutional layer
+        self.register_buffer('conv2_weight', torch.empty(256, 96, 5, 5))
+        self.register_buffer('conv2_bias', torch.empty(256))
+        
+        # Third convolutional layer
+        self.register_buffer('conv3_weight', torch.empty(384, 256, 3, 3))
+        self.register_buffer('conv3_bias', torch.empty(384))
+        
+        # Fourth convolutional layer
+        self.register_buffer('conv4_weight', torch.empty(384, 384, 3, 3))
+        self.register_buffer('conv4_bias', torch.empty(384))
+        
+        # Fifth convolutional layer
+        self.register_buffer('conv5_weight', torch.empty(256, 384, 3, 3))
+        self.register_buffer('conv5_bias', torch.empty(256))
+        
+        # Fully connected layers
+        self.register_buffer('fc1_weight', torch.empty(4096, 256 * 6 * 6))
+        self.register_buffer('fc1_bias', torch.empty(4096))
+        
+        self.register_buffer('fc2_weight', torch.empty(4096, 4096))
+        self.register_buffer('fc2_bias', torch.empty(4096))
+        
+        self.register_buffer('fc3_weight', torch.empty(num_classes, 4096))
+        self.register_buffer('fc3_bias', torch.empty(num_classes))
+
+    def forward(self, x):
+        """
+        :param x: The input tensor, shape (batch_size, 3, 224, 224)
+        :return: The output tensor, shape (batch_size, num_classes)
+        """
+        
+        # Conv1 + ReLU
+        x = custom_ops.conv2d_relu_cuda(
+            x, self.conv1_weight, self.conv1_bias, 
+            stride_h=4, stride_w=4, pad_h=2, pad_w=2
+        )
+        x = F.max_pool2d(x, kernel_size=3, stride=2)
+        
+        # Conv2 + ReLU
+        x = custom_ops.conv2d_relu_cuda(
+            x, self.conv2_weight, self.conv2_bias, 
+            stride_h=1, stride_w=1, pad_h=2, pad_w=2
+        )
+        x = F.max_pool2d(x, kernel_size=3, stride=2)
+        
+        # Conv3 + ReLU
+        x = custom_ops.conv2d_relu_cuda(
+            x, self.conv3_weight, self.conv3_bias, 
+            stride_h=1, stride_w=1, pad_h=1, pad_w=1
+        )
+        
+        # Conv4 + ReLU
+        x = custom_ops.conv2d_relu_cuda(
+            x, self.conv4_weight, self.conv4_bias, 
+            stride_h=1, stride_w=1, pad_h=1, pad_w=1
+        )
+        
+        # Conv5 + ReLU
+        x = custom_ops.conv2d_relu_cuda(
+            x, self.conv5_weight, self.conv5_bias, 
+            stride_h=1, stride_w=1, pad_h=1, pad_w=1
+        )
+        x = F.max_pool2d(x, kernel_size=3, stride=2)
+        
+        x = torch.flatten(x, 1)
+        
+        # FC1 + ReLU (Dropout is p=0.0 so we skip it)
+        x = custom_ops.linear_relu_cuda(
+            x, self.fc1_weight, self.fc1_bias
+        )
+        
+        # FC2 + ReLU (Dropout is p=0.0 so we skip it)
+        x = custom_ops.linear_relu_cuda(
+            x, self.fc2_weight, self.fc2_bias
+        )
+        
+        # FC3 (No ReLU specified in original code for the last layer usually, 
+        # but let's check original: fc3 is just linear. Original code does not apply relu to fc3 output.)
+        # Original: x = self.fc3(x); return x
+        bias_fc3 = self.fc3_bias if self.fc3_bias.numel() > 0 else None
+        x = torch.nn.functional.linear(x, self.fc3_weight, bias_fc3)
+        
+        return x
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.rand(1024, 3, 224, 224).cuda()
+    return [a]
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    num_classes = 1000
+    
+    # Initialize weights and biases with random values to match standard nn.Module init
+    # Conv layers: kaiming_uniform
+    def init_conv(w, b):
+        torch.nn.init.kaiming_uniform_(w, a=math.sqrt(5))
+        fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(w)
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        torch.nn.init.uniform_(b, -bound, bound)
+
+    # Linear layers: uniform
+    def init_linear(w, b):
+        fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(w)
+        bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        torch.nn.init.uniform_(w, -bound, bound)
+        torch.nn.init.zeros_(b)
+
+    import math
+    
+    # Conv1
+    w1 = torch.empty(96, 3, 11, 11).cuda()
+    b1 = torch.empty(96).cuda()
+    init_conv(w1, b1)
+    
+    # Conv2
+    w2 = torch.empty(256, 96, 5, 5).cuda()
+    b2 = torch.empty(256).cuda()
+    init_conv(w2, b2)
+
+    # Conv3
+    w3 = torch.empty(384, 256, 3, 3).cuda()
+    b3 = torch.empty(384).cuda()
+    init_conv(w3, b3)
+
+    # Conv4
+    w4 = torch.empty(384, 384, 3, 3).cuda()
+    b4 = torch.empty(384).cuda()
+    init_conv(w4, b4)
+
+    # Conv5
+    w5 = torch.empty(256, 384, 3, 3).cuda()
+    b5 = torch.empty(256).cuda()
+    init_conv(w5, b5)
+
+    # FC1
+    w_fc1 = torch.empty(4096, 256 * 6 * 6).cuda()
+    b_fc1 = torch.empty(4096).cuda()
+    init_linear(w_fc1, b_fc1)
+
+    # FC2
+    w_fc2 = torch.empty(4096, 4096).cuda()
+    b_fc2 = torch.empty(4096).cuda()
+    init_linear(w_fc2, b_fc2)
+
+    # FC3
+    w_fc3 = torch.empty(num_classes, 4096).cuda()
+    b_fc3 = torch.empty(num_classes).cuda()
+    init_linear(w_fc3, b_fc3)
+
+    return [w1, b1, w2, b2, w3, b3, w4, b4, w5, b5, w_fc1, b_fc1, w_fc2, b_fc2, w_fc3, b_fc3]
+```

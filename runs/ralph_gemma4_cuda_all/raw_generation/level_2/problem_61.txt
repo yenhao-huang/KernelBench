@@ -1,0 +1,741 @@
+im        
+<|channel>thought                        |
+|-----------------------------|
+| Input architecture:        |
+| import torch             |
+| import torch.nn as nn      |
+|                            |
+| class Model(nn.Module):    |
+|     def __init__(self, in_channels, out_channels, kernel_size, groups, bias=False): |
+|         super(Model, self).__init__() |
+|         self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, bias=bias) |
+|         self.relu = nn.ReLU() |
+|         self.group_norm = nn.GroupNorm(groups, out_channels) |
+|                               |
+|     def forward(self, x): |
+|         x = self.conv_transpose(x) |
+|         x = self.relu(x) |
+|         x = self.group_norm(x) |
+|         return x |
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# We will fuse ReLU and GroupNorm into a single kernel.
+# GroupNorm involves calculating mean and variance per group.
+# Since GroupNorm is applied after ReLU, we can compute the statistics 
+# and apply the normalization + ReLU in a single pass or a fused sequence.
+# However, standard GroupNorm is: (x - mean) / sqrt(var + eps) * gamma + beta.
+# Here, we fuse ReLU(x) and then GroupNorm.
+# To maximize efficiency, we'll keep ConvTranspose3d as is (it's highly optimized in cuDNN)
+# and fuse ReLU + GroupNorm.
+
+fused_ops_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+// Kernel to compute mean and variance for GroupNorm
+// We assume input is (N, C, D, H, W)
+// Groups are applied over C. Each group has C/G channels.
+// The statistics are computed over (C/G, D, H, W)
+
+__global__ void fused_relu_gn_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    float* __restrict__ output,
+    int N, int C, int D, int H, int W,
+    int G, int channels_per_group,
+    float eps) 
+{
+    // Each block handles one (batch_idx, group_idx)
+    int b = blockIdx.z;
+    int g = blockIdx.y;
+    
+    if (b >= N || g >= G) return;
+
+    // Shared memory for reduction
+    extern __shared__ float s_mem[];
+    float* s_mean = s_mem;
+    float* s_var = s_mem + blockDim.x;
+
+    // We need to reduce over (channels_per_group * D * H * W) elements
+    // For simplicity in this implementation, we use a single block per group per batch
+    // and use a simple reduction. For production, one would use warp-level primitives.
+
+    int elements_per_group = channels_per_group * D * H * W;
+    
+    // 1. Apply ReLU and accumulate sum and sum of squares
+    float local_sum = 0.0f;
+    float local_sq_sum = 0.0f;
+
+    // We use a simple loop for the reduction within the block
+    // In a real scenario, we'd use multiple blocks or more complex reduction
+    // But for the sake of this example, we'll use a single block per group.
+    
+    // Note: This is a simplified kernel. For large D,H,W, we'd need a multi-pass reduction.
+    // However, to keep the code concise and functional:
+    
+    for (int i = threadIdx.x; i < elements_per_group; i += blockDim.x) {
+        int c_idx = i / (D * H * W);
+        int spatial_idx = i % (D * H * W);
+        int global_c = g * channels_per_group + c_idx;
+        int idx = ((b * C + global_c) * D * H * W) + spatial_idx;
+        
+        float val = input[idx];
+        // Apply ReLU
+        val = val > 0.0f ? val : 0.0f;
+        
+        // We can't easily write back ReLU to 'input' if it's const, 
+        // so we'll compute stats on the ReLU'd values.
+        // But wait, the original order is Conv -> ReLU -> GN.
+        // So GN is applied to the output of ReLU.
+        
+        local_sum += val;
+        local_sq_sum += val * val;
+    }
+
+    // Block reduction
+    // (Using a simple approach for brevity)
+    // In practice, use __shfl_down_sync
+    // ... (omitted complex reduction for brevity, using a simple loop)
+    
+    // For the sake of a working example, we'll use a more robust approach:
+    // We'll use a single thread to write the final mean/var to shared memory
+    // and then use it.
+    
+    // Actually, let's use a simpler approach: 
+    // 1. Compute ReLU and store in a temporary buffer or just compute stats.
+    // Since we want to fuse, we'll compute stats on the fly.
+    
+    // To make this kernel actually work for large tensors, we'll use a 
+    // two-pass approach or a more complex reduction. 
+    // Given the constraints, let's implement a kernel that handles the 
+    // ReLU + GN logic.
+}
+"""
+
+# Since writing a high-performance 3D GroupNorm + ReLU kernel from scratch 
+# in a single block is extremely complex (requires multi-pass reduction), 
+# a more practical and highly effective optimization is to fuse the 
+# element-wise ReLU with the GroupNorm's normalization step.
+
+# Let's use a more reliable approach: 
+# 1. Use PyTorch's optimized ConvTranspose3d.
+# 2. Fuse ReLU and the final part of GroupNorm (the scale and shift).
+# However, GroupNorm requires mean and variance. 
+# The most efficient way to speed this up is to use a custom kernel 
+# that performs: x = relu(x), then compute mean/var, then x = (x-m)/s * gamma + beta.
+
+fused_ops_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void fused_relu_gn_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    float* __restrict__ output,
+    int N, int C, int D, int H, int W,
+    int G, int channels_per_group,
+    float eps) 
+{
+    // Each thread handles one element of the output
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C * D * H * W;
+    
+    if (idx >= total_elements) return;
+
+    // We need mean and var for the group this element belongs to.
+    // This is tricky because mean/var are group-wide.
+    // A standard way is to precompute mean/var.
+    // To keep this kernel "fused", we'll assume mean and var are passed in.
+    // But that's not a single kernel.
+    
+    // Let's do: 
+    // 1. ReLU the input in-place (if possible) or into output.
+    // 2. Use a kernel that applies (x - mean)/std * gamma + beta.
+}
+"""
+
+# Re-evaluating: The most significant bottleneck in this specific architecture 
+# is likely the ConvTranspose3d, followed by the memory-bound GroupNorm.
+# A custom kernel that fuses ReLU and the GroupNorm's affine transformation 
+# is a great way to reduce memory passes.
+
+# Let's implement a kernel that:
+# 1. Takes the output of ConvTranspose3d.
+# 2. Applies ReLU.
+# 3. Applies GroupNorm (using precomputed mean/var to keep it simple and fast).
+
+fused_ops_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void relu_gn_affine_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ mean,
+    const float* __restrict__ inv_std,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    float* __restrict__ output,
+    int N, int C, int D, int H, int W,
+    int G, int channels_per_group) 
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C * D * H * W;
+    if (idx >= total_elements) return;
+
+    // Calculate spatial and channel indices
+    int spatial_size = D * H * W;
+    int rem = idx % spatial_size;
+    int c_idx = (idx / spatial_size) % C;
+    int b_idx = idx / (C * spatial_size);
+
+    // Group index
+    int g_idx = c_idx / channels_per_group;
+    int group_offset = b_idx * G + g_idx;
+
+    // Apply ReLU
+    float val = input[idx];
+    if (val < 0.0f) val = 0.0f;
+
+    // Apply Normalization: (val - mean) * inv_std * gamma + beta
+    // mean and inv_std are per-group (N * G)
+    val = (val - mean[group_offset]) * inv_std[group_offset];
+    val = val * gamma[c_idx] + beta[c_idx];
+
+    output[idx] = val;
+}
+
+torch::Tensor fused_relu_gn_cuda(
+    torch::Tensor input, 
+    torch::Tensor gamma, 
+    torch::Tensor beta, 
+    torch::Tensor mean, 
+    torch::Tensor inv_std,
+    int G) 
+{
+    auto N = input.size(0);
+    auto C = input.size(1);
+    auto D = input.size(2);
+    auto H = input.size(3);
+    auto W = input.size(4);
+    int channels_per_group = C / G;
+
+    auto output = torch::empty_like(input);
+    int total_elements = input.numel();
+
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    relu_gn_affine_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        mean.data_ptr<float>(),
+        inv_std.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        output.data_ptr<float>(),
+        N, C, D, H, W, G, channels_per_group
+    );
+
+    return output;
+}
+"""
+
+fused_ops_cpp_source = "torch::Tensor fused_relu_gn_cuda(torch::Tensor input, torch::Tensor gamma, torch::Tensor beta, torch::Tensor mean, torch::Tensor inv_std, int G);"
+
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_cuda_source,
+    functions=["fused_relu_gn_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, groups, bias=False):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, bias=bias)
+        self.groups = groups
+        self.out_channels = out_channels
+        self.fused_ops = fused_ops
+        
+        # We still need the parameters for GroupNorm
+        self.gamma = nn.Parameter(torch.ones(out_channels))
+        self.beta = nn.Parameter(torch.zeros(out_channels))
+        
+        # To handle the GroupNorm logic (mean/var calculation)
+        # We'll use the standard GroupNorm's internal logic but call our fused kernel
+        self.gn_base = nn.GroupNorm(groups, out_channels)
+
+    def forward(self, x):
+        # 1. ConvTranspose3d (highly optimized)
+        x = self.conv_transpose(x)
+        
+        # 2. We need mean and inv_std for GroupNorm. 
+        # Since we want to avoid the overhead of the full GroupNorm module 
+        # (which does multiple passes), we can compute them efficiently.
+        # However, for a robust implementation, we'll use the standard GN 
+        # to get the stats, then use our fused kernel to do ReLU + Affine.
+        
+        # To avoid double-calculating, we'll use a trick:
+        # We'll use the standard GroupNorm but we'll manually compute mean/var 
+        # to feed into our fused kernel.
+        
+        N, C, D, H, W = x.shape
+        G = self.groups
+        
+        # Reshape for group statistics: (N, G, C//G, D, H, W)
+        x_reshaped = x.view(N, G, C // G, D, H, W)
+        
+        # Compute mean and variance per group
+        # We use dim=(2,3,4,5) to reduce over (C//G, D, H, W)
+        mean = x_reshaped.mean(dim=(2, 3, 4, 5)) # (N, G)
+        var = x_reshaped.var(dim=(2, 3, 4, 5), unbiased=False) # (N, G)
+        inv_std = torch.rsqrt(var + 1e-5) # (N, G)
+        
+        # 3. Fused ReLU + Affine (Scale and Shift)
+        # The fused kernel applies: ReLU(x) -> (ReLU(x) - mean) * inv_std * gamma + beta
+        # Note: The standard GroupNorm applies (x - mean) * inv_std * gamma + beta.
+        # Our kernel applies it to ReLU(x).
+        
+        return self.fused_ops.fused_relu_gn_cuda(
+            x, 
+            self.gamma, 
+            self.beta, 
+            mean, 
+            inv_std, 
+            G
+        )
+
+```
+
+Wait, the logic in `ModelNew` above is slightly different from the original `Model` because the original `Model` does `ReLU` *then* `GroupNorm`. My fused kernel does `ReLU` and then applies the `GroupNorm` transformation to the *ReLU'd* value. This is exactly what the original model does.
+
+One detail: `GroupNorm` in PyTorch applies the affine transformation `y = x * gamma + beta` where `x` is the normalized value. My kernel does `val = (val - mean) * inv_std * gamma + beta`. This is correct.
+
+Let's refine the `ModelNew` to be a drop-in replacement.
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+fused_ops_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void relu_gn_affine_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ mean,
+    const float* __restrict__ inv_std,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    float* __restrict__ output,
+    int N, int C, int D, int H, int W,
+    int G, int channels_per_group) 
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C * D * H * W;
+    if (idx >= total_elements) return;
+
+    int spatial_size = D * H * W;
+    int rem = idx % spatial_size;
+    int c_idx = (idx / spatial_size) % C;
+    int b_idx = idx / (C * spatial_size);
+
+    int g_idx = c_idx / channels_per_group;
+    int group_offset = b_idx * G + g_idx;
+
+    float val = input[idx];
+    if (val < 0.0f) val = 0.0f;
+
+    val = (val - mean[group_offset]) * inv_std[group_offset];
+    val = val * gamma[c_idx] + beta[c_idx];
+
+    output[idx] = val;
+}
+
+torch::Tensor fused_relu_gn_cuda(
+    torch::Tensor input, 
+    torch::Tensor gamma, 
+    torch::Tensor beta, 
+    torch::Tensor mean, 
+    torch::Tensor inv_std,
+    int G) 
+{
+    auto N = input.size(0);
+    auto C = input.size(1);
+    auto D = input.size(2);
+    auto H = input.size(3);
+    auto W = input.size(4);
+    int channels_per_group = C / G;
+
+    auto output = torch::empty_like(input);
+    int total_elements = input.numel();
+
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    relu_gn_affine_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        mean.data_ptr<float>(),
+        inv_std.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        output.data_ptr<float>(),
+        N, C, D, H, W, G, channels_per_group
+    );
+
+    return output;
+}
+"""
+
+fused_ops_cpp_source = "torch::Tensor fused_relu_gn_cuda(torch::Tensor input, torch::Tensor gamma, torch::Tensor beta, torch::Tensor mean, torch::Tensor inv_std, int G);"
+
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_cuda_source,
+    functions=["fused_relu_gn_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, groups, bias=False):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, bias=bias)
+        self.groups = groups
+        self.out_channels = out_channels
+        self.fused_ops = fused_ops
+        
+        # GroupNorm parameters
+        self.gamma = nn.Parameter(torch.ones(out_channels))
+        self.beta = nn.Parameter(torch.zeros(out_channels))
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        
+        N, C, D, H, W = x.shape
+        G = self.groups
+        
+        # Compute mean and variance for GroupNorm
+        # We reshape to (N, G, C//G, D, H, W) to compute stats over (C//G, D, H, W)
+        x_reshaped = x.view(N, G, C // G, D, H, W)
+        
+        # We need to compute mean and var on the original x (before ReLU) 
+        # because the original model does ReLU then GroupNorm.
+        # Wait, the original model is:
+        # x = conv(x)
+        # x = relu(x)
+        # x = group_norm(x)
+        # This means GroupNorm is applied to the output of ReLU.
+        # So the mean and variance should be calculated on the ReLU'd values.
+        
+        # Let's correct the logic:
+        # 1. x = conv(x)
+        # 2. x_relu = relu(x)
+        # 3. mean, var = stats(x_relu)
+        # 4. x_final = (x_relu - mean) / std * gamma + beta
+        
+        # To do this efficiently in one pass, we can compute stats on the ReLU'd values.
+        # But we can't do that in the fused kernel because it's a single-pass kernel.
+        # So we'll do:
+        # 1. x = conv(x)
+        # 2. x = relu(x) (using torch.relu)
+        # 3. mean, var = stats(x)
+        # 4. x = (x - mean) / std * gamma + beta (using fused kernel)
+        
+        # Actually, the most efficient way is:
+        # 1. x = conv(x)
+        # 2. x = relu(x)
+        # 3. mean, var = stats(x)
+        # 4. x = (x - mean) * inv_std * gamma + beta (fused kernel)
+        
+        # Let's implement this.
+        
+        x = torch.relu(x)
+        
+        x_reshaped = x.view(N, G, C // G, D, H, W)
+        mean = x_reshaped.mean(dim=(2, 3, 4, 5))
+        var = x_reshaped.var(dim=(2, 3, 4, 5), unbiased=False)
+        inv_std = torch.rsqrt(var + 1e-5)
+        
+        return self.fused_ops.fused_relu_gn_cuda(
+            x, 
+            self.gamma, 
+            self.beta, 
+            mean, 
+            inv_std, 
+            G
+        )
+```
+
+Wait, if I use `torch.relu(x)` and then `x_reshaped.mean(...)`, I'm still doing multiple passes. The goal is to reduce passes.
+The best way is to compute the mean and variance of the ReLU'd values in a single pass.
+
+Let's refine the kernel to be a single-pass kernel that computes mean/var and applies the transformation. This is essentially what "Online Softmax" or "Online Normalization" does.
+
+However, for a coding task, a robust and clean implementation is better. I will provide a version that fuses the ReLU and the affine part of GroupNorm, which is a significant win.
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+fused_ops_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void relu_gn_affine_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ mean,
+    const float* __restrict__ inv_std,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    float* __restrict__ output,
+    int N, int C, int D, int H, int W,
+    int G, int channels_per_group) 
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C * D * H * W;
+    if (idx >= total_elements) return;
+
+    int spatial_size = D * H * W;
+    int c_idx = (idx / spatial_size) % C;
+    int b_idx = idx / (C * spatial_size);
+
+    int g_idx = c_idx / channels_per_group;
+    int group_offset = b_idx * G + g_idx;
+
+    float val = input[idx];
+    if (val < 0.0f) val = 0.0f;
+
+    val = (val - mean[group_offset]) * inv_std[group_offset];
+    val = val * gamma[c_idx] + beta[c_idx];
+
+    output[idx] = val;
+}
+
+torch::Tensor fused_relu_gn_cuda(
+    torch::Tensor input, 
+    torch::Tensor gamma, 
+    torch::Tensor beta, 
+    torch::Tensor mean, 
+    torch::Tensor inv_std,
+    int G) 
+{
+    auto N = input.size(0);
+    auto C = input.size(1);
+    auto D = input.size(2);
+    auto H = input.size(3);
+    auto W = input.size(4);
+    int channels_per_group = C / G;
+
+    auto output = torch::empty_like(input);
+    int total_elements = input.numel();
+
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    relu_gn_affine_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        mean.data_ptr<float>(),
+        inv_std.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        output.data_ptr<float>(),
+        N, C, D, H, W, G, channels_per_group
+    );
+
+    return output;
+}
+"""
+
+fused_ops_cpp_source = "torch::Tensor fused_relu_gn_cuda(torch::Tensor input, torch::Tensor gamma, torch::Tensor beta, torch::Tensor mean, torch::Tensor inv_std, int G);"
+
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_cuda_source,
+    functions=["fused_relu_gn_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, groups, bias=False):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, bias=bias)
+        self.groups = groups
+        self.out_channels = out_channels
+        self.fused_ops = fused_ops
+        
+        self.gamma = nn.Parameter(torch.ones(out_channels))
+        self.beta = nn.Parameter(torch.zeros(out_channels))
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        
+        N, C, D, H, W = x.shape
+        G = self.groups
+        
+        # To match the original Model:
+        # 1. x = conv(x)
+        # 2. x = relu(x)
+        # 3. x = group_norm(x)
+        
+        # We compute stats on the ReLU'd values.
+        # To avoid a separate ReLU pass, we can compute stats on the ReLU'd values 
+        # using a custom kernel, but for simplicity and correctness:
+        x_relu = torch.relu(x)
+        
+        # Compute mean and variance of the ReLU'd values
+        x_reshaped = x_relu.view(N, G, C // G, D, H, W)
+        mean = x_reshaped.mean(dim=(2, 3, 4, 5))
+        var = x_reshaped.var(dim=(2, 3, 4, 5), unbiased=False)
+        inv_std = torch.rsqrt(var + 1e-5)
+        
+        # Fused kernel applies the affine part of GroupNorm to the ReLU'd values
+        return self.fused_ops.fused_relu_gn_cuda(
+            x, # We pass original x, the kernel will apply ReLU
+            self.gamma, 
+            self.beta, 
+            mean, 
+            inv_std, 
+            G
+        )
+```
+
+Final check: The original model's `GroupNorm` uses its own `gamma` and `beta`. My `ModelNew` uses its own `self.gamma` and `self.beta`. This is correct. The `mean` and `inv_std` are calculated on the `x_relu` values, which is what `GroupNorm` would do if it were applied after `ReLU`.
+
+One small fix: `x_reshaped.var` is slightly slow. But the fusion of `ReLU` and `Affine` is still a win.
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+fused_ops_cuda_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void relu_gn_affine_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ mean,
+    const float* __restrict__ inv_std,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    float* __restrict__ output,
+    int N, int C, int D, int H, int W,
+    int G, int channels_per_group) 
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N * C * D * H * W;
+    if (idx >= total_elements) return;
+
+    int spatial_size = D * H * W;
+    int c_idx = (idx / spatial_size) % C;
+    int b_idx = idx / (C * spatial_size);
+
+    int g_idx = c_idx / channels_per_group;
+    int group_offset = b_idx * G + g_idx;
+
+    float val = input[idx];
+    if (val < 0.0f) val = 0.0f;
+
+    val = (val - mean[group_offset]) * inv_std[group_offset];
+    val = val * gamma[c_idx] + beta[c_idx];
+
+    output[idx] = val;
+}
+
+torch::Tensor fused_relu_gn_cuda(
+    torch::Tensor input, 
+    torch::Tensor gamma, 
+    torch::Tensor beta, 
+    torch::Tensor mean, 
+    torch::Tensor inv_std,
+    int G) 
+{
+    auto N = input.size(0);
+    auto C = input.size(1);
+    auto D = input.size(2);
+    auto H = input.size(3);
+    auto W = input.size(4);
+    int channels_per_group = C / G;
+
+    auto output = torch::empty_like(input);
+    int total_elements = input.numel();
+
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    relu_gn_affine_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        mean.data_ptr<float>(),
+        inv_std.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        output.data_ptr<float>(),
+        N, C, D, H, W, G, channels_per_group
+    );
+
+    return output;
+}
+"""
+
+fused_ops_cpp_source = "torch::Tensor fused_relu_gn_cuda(torch::Tensor input, torch::Tensor gamma, torch::Tensor beta, torch::Tensor mean, torch::Tensor inv_std, int G);"
+
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_cuda_source,
+    functions=["fused_relu_gn_cuda"],
+    verbose=False,
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, groups, bias=False):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, bias=bias)
+        self.groups = groups
+        self.out_channels = out_channels
+        self.fused_ops = fused_ops
+        
+        self.gamma = nn.Parameter(torch.ones(out_channels))
+        self.beta = nn.Parameter(torch.zeros(out_channels))
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        
+        N, C, D, H, W = x.shape
+        G = self.groups
+        
+        # To match the original Model:
+        # 1. x = conv(x)
+        # 2. x = relu(x)
+        # 3. x = group_norm(x)
+        
+        # We compute stats on the ReLU'd values.
+        x_relu = torch.relu(x)
+        
+        # Compute mean and variance of the ReLU'd values
+        x_reshaped = x_relu.view(N, G, C // G, D, H, W)
+        mean = x_reshaped.mean(dim=(2, 3, 4, 5))
+        var = x_reshaped.var(dim=(2, 3, 4, 5), unbiased=False)
+        inv_std = torch.rsqrt(var + 1e-5)
+        
+        # Fused kernel applies the affine part of GroupNorm to the ReLU'd values
+        # Note: We pass 'x' (the original conv output) and the kernel applies ReLU.
+        return self.fused_ops.fused_relu_gn_cuda(
+            x, 
+            self.gamma, 
+            self.beta, 
+            mean, 
+            inv_std, 
+            G

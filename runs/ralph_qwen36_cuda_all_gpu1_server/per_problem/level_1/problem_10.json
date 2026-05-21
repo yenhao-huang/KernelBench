@@ -1,0 +1,17 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 41.58,
+  "generated_kernel_path": "runs/ralph_qwen36_cuda_all_gpu1_server/generated_kernels/level_1/problem_10.py",
+  "level": 1,
+  "model_name": "/workspace/llm_model",
+  "precision": "fp32",
+  "problem_id": 10,
+  "problem_name": "10_3D_tensor_matrix_multiplication.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_qwen36_cuda_all_gpu1_server/raw_generation/level_1/problem_10.txt",
+  "static_errors": [
+    "Missing __global__ kernel definition"
+  ],
+  "static_warnings": [],
+  "status": "static_failed"
+}

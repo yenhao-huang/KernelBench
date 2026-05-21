@@ -1,0 +1,89 @@
+import torch
+                                                                                             
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Model(nn.Module):
+                                                              
+    def __init__(self        
+            self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, bias: bool = False):
+        super(Model, self).__init__()
+        self.conv2d = nn.Conv2d(in_channels, __import__('torch.nn.functional', as_='F').__import__('conv2d', as_='F').__import__('conv2d', as_='F').__import__('conv2d', as_='F').__import__('conv2d', as_='F').__import__('dconv2d', as_='F').__import__('dconv2d', as_='F').__import__('dconv2d', as_='F').__import__('dconv2d', as_='F').__import__('('), as_='F').__import__('conv2d', as_='F').__import__('depthwise_conv2d', depthwise_conv2d=True, groups=in_channels, groups=in_channels, groups=in_channels, groups=in_channels, groups=in
+channels, groups=in_channels, groups=in_channels, globals=True, globals=True, globals_import-1, globals=True, globals=True, globals=True, globals=True, globals
+=True, depthwise_conv2d=True, depth                wise_conv2d=conv2d, conv2d=conv2D_optimized-1,Rate-1, Rate-1, globals=True, globals=True, globals_size=True, globals_import-1, globals_weight-1, bias=bias, in_channels=in_depth_channels,_in_channels=in_channels,
+            self.conv2d = nn.Conv2d(in_channels, out_channels, kernel_size=(kernel_size, kernel_1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111import(
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.cpp_extension
+
+ torch.utils.cpp_depthwise_conv2d_optimized_v1_v1_v1_v1_1_1_1_1_111114_12314_111 little_module_        _v1_v1_v1_1    _v_1_1_1_1_1_1_1_1_1_1_1_1_1_1_1_1_1_1_1_11111111111111111111111times_1    _v1_1_1_11_1<|embed_|><|embed_|>
+```python
+import torch
+import torch.nn as_import
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.cpp_extension
+
+# Define the custom CUDA kernel for depthwise convolution
+depthwise_conv_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void depthwise_conv2d_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    float* __restrict__ output,
+    int batch_size,
+    int in_channels,
+    int height_in,
+    int width_in,
+    int kernel_size,
+    int stride,
+    int padding,
+    int height_out,
+    int width_out
+) {
+    // Each thread handles one output pixel per channel per batch
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int out_c = blockIdx.y; // Channel index
+            int out_h = blockIdx.z / width_out;
+            int out_w = blockIdx.z % width_out;
+                int b = idx; // Batch index
+                
+    if (b >= batch_size) return;
+
+    int in_c = out_c; // For depthwise, in_channels == out_channels
+    
+    int in_h_start = out_h * stride - padding;
+                    int in_w_start = in_w * stride - top_padding;
+                        int in_w_start = in_w * stride - padding;
+
+    float sum = 0.0f;
+ respect to the kernel window.
+    float sum = 0.0f;
+    for (int kh = 0; kh < kernel_size; kh++) {
+        for (int kw = 0; kw < kw_size; kw=kw_size) {
+            // ... (logic for kernel window)
+                int cur_h = in_h_start + kh;
+                int cur_//_h = cur_h;
+                int in_out_h = in_h_start + kh;
+                                 int in_h_val = in_h_start + plane_h;
+                                   int in_h_val = in_h_start + kh;
+                    int in_h_val = in_h_start + kh;
+                    int in_h_val = in_in_h_val = in_h_start + kh;
+                            int in_h_val = int in_h_val = in_h_start + kh;
+                    int    in_h_idx = in_h_start + kh;
+                                 int in_h_idx = in_h_start + kh_val;
+                int in_h_idx = in_h_start + kh;
+                int in_h_idx = in_idx_val = in_idx_val = in_h_idx;
+                // ... (logic for kernel window)
+                int in_grid_idx = in_h_idx + in_w_idx;
+                _//_h_idx = in_idx_depth_idx = in_idx_depth_idx = in_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx(in_idx__idx_idx_idx_idx_idx_idx_idx.data_idx_idx_    
+                
+                // ... (logic_for_idx_idx_idx_idx_idx_idx_idx.data_idx_idx_idx_idx.data_idx_idx_idx.data_idx.data_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx.data_idx_idx_idx_idx_idx.data_idx_idx_idx_idx.idx_idx_idx.idx_idx_idx.idx_idx.idx_idx_idx.idx_idx_idx.idx_idx_idx.idx_idx.idx_idx_idx.idx_idx_idx.idx_idx.idx_idx_idx.idx_idx_idx.idx_idx.idx_idx_idx.idx_idx_idx.idx_idx.idx_idx.idx
+_//_h_idx = in_idx_idx_depth__idx_idx_idx.data_idx_idx_idx.data_idx.data_idx_idx_idx_idx.idx_idx._idx_idx_idx.args_idx_idx_idx_idx.idx_idx_idx_idx_idx.idx_idx.idx_idx.idx_idx_idx.idx_idx.const_idx_idx_idx_idx_idx.data_idx_        
+                
+                int in_idx = (b * in_channels + in_c) * height_batch_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx.data_idx_idx_idx_idx_idx_idx_idx_idx(in_idx_idx_idx_idx_idx_idx_idx_idx_idx.data_idx_idx_idx_idx_idx_idx.data_idx_idx.data_idx_idx_idx.data_idx_idx_idx_idx.idx_idx_idx.idx_idx_idx_idx.idx_idx_idx.idx_idx_idx.idx_idx_idx_idx_idx_idx
+_//_h_idx_idx_idx_idx_idx.data_idx-idx_idx_idx.data_idx_idx_idx_idx_idx_idx_idx.idx_idx.idx_idx_idx_idx.idx_idx.idx_idx.idx_size_idx_idx_idx_idx.idx<_idx_idx_idx.data_idx_square_idx_idx_idx.data__idx_idx_idx_idx.data_idx_idx_idx_idx_idx_idx.data_idx_idx_idx.idx_idx_idx_idx_idx.zero_idx_idx_idx.data_idx_idx_idx.idx_idx_idx.idx_idx.idx_idx_idx_idx.idx.data_idx_idx_idx.idx*idx_idx_idx.idx_idx_idx.x_idx_depthwise_idx_idx_idx_idx_idx_idx_idx_idx_idx_grid_idx_idx_idx.data__idx_idx_idx_idx.idx_idx_idx.idx_idx_idx.idx_idx.t_idx_idx_idx_idx_idx.idx_idx_idx.idx_idx.idx_idx_idx.idx_idx_idx.idx_idx_idx_idx_idx_idx*idx_idx_idx_idx_idx_idx.data_idx_idx_idx_idx_idx.idx.data_idx_idx_idx.idx.idx_idx_idx_idx_idx.idx_idx_idx.idx_idx_idx.idx_idx.idx_idx.idx planes_idx_idx_idx.data_idx_idx.data_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx.idx_idx.idx_idx_idx_idx.idx_idx.idx_idx_idx_idx_idx.idx_idx.idx0_idx_idx_1_idx_idx_idx.data_idx_idx_idx_idx_idx_idx.idx.idx_idx_idx_idx_idx.idx.x_idx_idx_idx.idx_idx_idx.idx_idx_idx.idx_idx_idx_idx_idx.idx.idx_idx_idx.idx_idx_idx0_idx_idx_idx_idx_idx.data_idx_idx_idx_idx.idx_idx_idx.idx_idx_idx_idx_idx.idx_idx.idx_idx_idx.idx[idx_idx_idx_idx_idx_idx_idx_idx_idx.data_idx_idx_idx_idx_idx.idx_idx_idx.idx_idx_idx.idx.idx_idx_idx.idx_idx.index_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx.idx_idx_idx_idx.idx_idx.idx_idx.idx_idx_idx.idx_idx_idx.idx_idx.idx_idx_idx_depthwise_conv2d_kernel_block_idx_idx_idx_idx_idx_idx.data_idx_idx_idx_idx_idx.data_idx.idx_idx_idx_idx_idx.idx.idx_idx_idx.idx_idx_idx.idx_idx.idx_idx_idx.idx[idx.data_idx_idx_idx_idx_idx_idx_idx_idx.data_idx_idx.data_idx_idx.data_idx_idx_idx.data_idx_idx_idx_idx.idx_idx_idx.idx_idx_idx.idx_idx_idx.idx_idx.idx.idx_idx.data_idx_idx_idx_idx.idx.idx_idx_idx.idx_idx_idx.idx_idx.idx.idx_idx_idx.data_idx_idx_idx_idx.idx.idx_idx_idx.idx_idx_idx.idx.idx_idx_idx.idx_idx_idx.idx_idx_idx_idx_idx_idx.idx_idx_idx.idx_idx_idx_idx.idx_idx.idx_idx.idx_idx.idx_idx_idx.idx_idx_idx.idx_idx.idx.idx_idx_idx.idx_idx_idx.idx_idx.idx_idx.idx_idx.idx.idx_idx_idx.idx_idx_idx.idx_idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx.idx_idx_idx.idx_idx_idx.idx_idx.idx.idx_idx_idx.idx_idx_idx.idx_idx_idx.idx.idx_idx_idx.idx_idx_idx_idx.idx_idx_idx.idx_idx.idx_idx.idx_idx.idx.idx_idx.data_idx_idx_idx_idx_idx.data_idx_idx_idx.data_idx_idx_idx.data_idx_idx_idx.idx_idx_idx_idx_idx.idx_idx_idx.idx_idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx.idx_idx_idx.idx_idx_idx.idx_idx.idx.idx_idx_idx.idx_idx_idx.idx_idx_idx.idx.idx_idx_idx.idx_idx_idx_idx.idx_idx_idx.idx_idx_idx.idx_idx.idx_idx.idx.idx_idx.data_idx_idx_idx_idx_idx.data_idx_idx_idx.idx_idx_idx_idx_idx.idx_idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx.idx_idx_idx.idx_idx_idx.idx_idx.idx.idx_idx_idx.idx_idx_idx.idx_idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx.idx_idx.data_idx_idx_idx_idx_idx.data_idx_idx_idx.idx_idx_idx_idx_idx.idx_idx_idx.idx_idx_idx.idx[idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx.data_idx_idx_idx_idx_idx.data_idx_idx_idx_idx.idx_idx_idx_idx_idx.idx_idx_idx.idx.idx_idx_idx.idx_idx_idx_idx_idx.idx_idx_idx_idx_idx.idx_idx_idx.idx_idx_idx.idx_idx_idx.idx_idx_idx.idx_idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx.idx_idx_idx.idx.idx_idx_idx.idx_idx_idx.idx_idx_idx.idx_idx_idx.idx.idx_idx_idx.idx_idx_idx_idx.idx_idx_idx.idx_idx_idx.idx_idx.idx_idx.idx.idx_idx_idx.idx_idx_idx.idx_idx.idx.idx_idx_idx.idx_idx_idx.idx_idx_idx.idx.idx_idx_idx.idx_idx_idx_idx.idx_idx_idx.idx_idx_idx_idx.idx_idx_idx.idx_idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx_idx.idx.idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx.data_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx.data_idx_idx_idx_idx_idx_idx.data_idx_idx_idx_idx_idx.data_idx_idx_idx.data_idx_idx_idx.data_idx_idx_idx.data_idx_idx_idx.data_idx_idx_idx.data_idx_idx_idx.data_idx_idx_idx.data_idx_idx_idx.data_idx_idx_idx.data_idx_idx_idx.data_idx_idx_idx.data_idx_idx_idx.data_idx_idx_idx.data_idx_idx_idx.data_idx_idx_idx.data_idx_idx_idx.data_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx_idx_idx_idx_idx_idx.idx_idx_idx_idx

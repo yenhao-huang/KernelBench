@@ -1,0 +1,165 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__device__ __forceinline__ float sigmoidf_fast(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+__global__ void fused_sigmoid_groupnorm_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ bias,
+    const float* __restrict__ scale,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    float* __restrict__ out,
+    int N,
+    int C,
+    int H,
+    int W,
+    int G,
+    float eps
+) {
+    extern __shared__ float smem[];
+    float* ssum = smem;
+    float* ssq = smem + blockDim.x;
+
+    int ng = blockIdx.x;
+    int n = ng / G;
+    int g = ng - n * G;
+
+    int group_c = C / G;
+    int hw = H * W;
+    int group_elems = group_c * hw;
+    int c0 = g * group_c;
+    int base_n = n * C * hw;
+
+    float sum = 0.0f;
+    float sq = 0.0f;
+
+    for (int i = threadIdx.x; i < group_elems; i += blockDim.x) {
+        int lc = i / hw;
+        int s = i - lc * hw;
+        int c = c0 + lc;
+        float v = x[base_n + c * hw + s];
+        v = sigmoidf_fast((v + bias[c]) * scale[c]);
+        sum += v;
+        sq += v * v;
+    }
+
+    ssum[threadIdx.x] = sum;
+    ssq[threadIdx.x] = sq;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            ssum[threadIdx.x] += ssum[threadIdx.x + stride];
+            ssq[threadIdx.x] += ssq[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    float mean = ssum[0] / (float)group_elems;
+    float var = ssq[0] / (float)group_elems - mean * mean;
+    float inv_std = rsqrtf(var + eps);
+
+    for (int i = threadIdx.x; i < group_elems; i += blockDim.x) {
+        int lc = i / hw;
+        int s = i - lc * hw;
+        int c = c0 + lc;
+        int idx = base_n + c * hw + s;
+        float v = x[idx];
+        v = sigmoidf_fast((v + bias[c]) * scale[c]);
+        out[idx] = (v - mean) * inv_std * gamma[c] + beta[c];
+    }
+}
+
+torch::Tensor fused_sigmoid_groupnorm_cuda(
+    torch::Tensor x,
+    torch::Tensor bias,
+    torch::Tensor scale,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    int64_t groups,
+    double eps
+) {
+    x = x.contiguous();
+    bias = bias.contiguous();
+    scale = scale.contiguous();
+    gamma = gamma.contiguous();
+    beta = beta.contiguous();
+
+    int N = (int)x.size(0);
+    int C = (int)x.size(1);
+    int H = (int)x.size(2);
+    int W = (int)x.size(3);
+    int G = (int)groups;
+
+    auto out = torch::empty_like(x);
+
+    const int threads = 256;
+    const int blocks = N * G;
+    const size_t shmem = threads * 2 * sizeof(float);
+
+    fused_sigmoid_groupnorm_kernel<<<blocks, threads, shmem>>>(
+        x.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        scale.data_ptr<float>(),
+        gamma.data_ptr<float>(),
+        beta.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C, H, W, G, (float)eps
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor fused_sigmoid_groupnorm_cuda(
+    torch::Tensor x,
+    torch::Tensor bias,
+    torch::Tensor scale,
+    torch::Tensor gamma,
+    torch::Tensor beta,
+    int64_t groups,
+    double eps
+);
+"""
+
+fused_ops = load_inline(
+    name="fused_sigmoid_groupnorm_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["fused_sigmoid_groupnorm_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, num_groups, bias_shape, scale_shape):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        self.group_norm = nn.GroupNorm(num_groups, out_channels)
+        self.num_groups = num_groups
+        self.eps = self.group_norm.eps
+
+    def forward(self, x):
+        x = self.conv(x)
+        return fused_ops.fused_sigmoid_groupnorm_cuda(
+            x,
+            self.bias.view(-1),
+            self.scale.view(-1),
+            self.group_norm.weight,
+            self.group_norm.bias,
+            self.num_groups,
+            self.eps,
+        )

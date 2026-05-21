@@ -1,0 +1,139 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for the fused operation: Matmul + Add + Swish + Tanh + GELU + Hardtanh
+# This fuses multiple operations into a single kernel to reduce memory bandwidth pressure and launch overhead.
+fused_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+// Helper for sigmoid
+__device__ inline float sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+// Helper for Swish: x * sigmoid(x)
+__device__ inline float swish(float x) {
+    return x * sigmoid(x);
+}
+
+// Helper for GELU approximation or exact calculation. 
+// Using the standard approximation for speed, or exact if needed. 
+// Exact GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+__device__ inline float gelu(float x) {
+    return 0.5f * x * (1.0f + tanhf(sqrtf(2.0f / M_PI) * (x + 0.044715f * x * x * x)));
+}
+
+// Helper for Hardtanh with min_val=-1, max_val=1
+__device__ inline float hardtanh(float x) {
+    if (x < -1.0f) return -1.0f;
+    if (x > 1.0f) return 1.0f;
+    return x;
+}
+
+// Helper for Tanh
+__device__ inline float tanh_val(float x) {
+    return tanhf(x);
+}
+
+__global__ void fused_ops_kernel(
+    const float* matmul_out, 
+    const float* add_value, 
+    float* out, 
+    int batch_size, 
+    int out_features
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * out_features;
+
+    if (idx < total_elements) {
+        // Calculate row and col for add_value indexing
+        // matmul_out is [batch_size, out_features]
+        // add_value is [out_features]
+        
+        int batch_idx = idx / out_features;
+        int feat_idx = idx % out_features;
+
+        // 1. Matmul result is already in matmul_out (passed from PyTorch side)
+        float val = matmul_out[idx];
+
+        // 2. Add value
+        val += add_value[feat_idx];
+
+        // 3. Swish: x * sigmoid(x)
+        val = swish(val);
+
+        // 4. Tanh
+        val = tanh_val(val);
+
+        // 5. GELU
+        val = gelu(val);
+
+        // 6. Hardtanh (-1, 1)
+        val = hardtanh(val);
+
+        out[idx] = val;
+    }
+}
+
+torch::Tensor fused_ops_cuda(torch::Tensor matmul_out, torch::Tensor add_value) {
+    auto batch_size = matmul_out.size(0);
+    auto out_features = matmul_out.size(1);
+    
+    auto out = torch::zeros_like(matmul_out);
+
+    const int block_size = 256;
+    int total_elements = batch_size * out_features;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    fused_ops_kernel<<<num_blocks, block_size>>>(
+        matmul_out.data_ptr<float>(), 
+        add_value.data_ptr<float>(), 
+        out.data_ptr<float>(), 
+        batch_size, 
+        out_features
+    );
+
+    return out;
+}
+"""
+
+fused_ops_cpp_source = (
+    "torch::Tensor fused_ops_cuda(torch::Tensor matmul_out, torch::Tensor add_value);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_source,
+    functions=["fused_ops_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs a matrix multiplication, adds a value, applies Swish, Tanh, GELU, and Hardtanh activation functions.
+    Uses custom CUDA kernel for the post-matmul operations to fuse them into a single kernel launch.
+    """
+    def __init__(self, in_features, out_features, add_value_shape):
+        super(ModelNew, self).__init__()
+        self.matmul = nn.Linear(in_features, out_features)
+        self.add_value = nn.Parameter(torch.randn(add_value_shape)) 
+        self.fused_ops_func = fused_ops.fused_ops_cuda
+
+    def forward(self, x):
+        # Perform Matmul using standard PyTorch Linear (highly optimized cuBLAS)
+        x = self.matmul(x)
+        
+        # Fuse Add + Swish + Tanh + GELU + Hardtanh into a single custom CUDA kernel
+        x = self.fused_ops_func(x, self.add_value)
+        
+        return x
+```

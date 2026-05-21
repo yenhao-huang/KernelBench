@@ -1,0 +1,457 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernels
+# We will fuse: Conv3d -> Divide -> MaxPool3d -> GlobalAvgPool3d -> Add Bias -> Sum Dim
+# However, since Conv3d is complex and highly optimized in cuDNN, we might only replace the post-processing chain 
+# or implement a fully custom pipeline if specific bottlenecks are identified. 
+# Given the prompt allows "complete freedom", let's implement a fused kernel for the sequence:
+# 1. Element-wise division by scalar
+# 2. Max Pooling (3D)
+# 3. Global Average Pooling (3D) -> effectively taking mean over H, W, D dimensions
+# 4. Adding bias
+# 5. Summing along a specific dimension
+
+# Note: Implementing a full custom Conv3d from scratch in inline CUDA is extremely verbose and often slower than cuDNN 
+# unless specifically tuned for very small kernels or specific shapes. The prompt asks to replace operators to get speedups.
+# The post-processing chain (Div -> MaxPool -> GAP -> Add -> Sum) involves multiple memory reads/writes. Fusing these 
+# can significantly reduce global memory traffic.
+
+custom_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper for max pooling window
+__device__ float get_max(const float* data, int C, int D, int H, int W, 
+                         int c, int d, int h, int w) {
+    if (c >= 0 && c < C && d >= 0 && d < D && h >= 0 && h < H && w >= 0 && w < W) {
+        return data[((c * D + d) * H + h) * W + w];
+    }
+    return -FLT_MAX;
+}
+
+// Kernel for the fused operation: Div -> MaxPool3d -> GlobalAvgPool3d -> Add Bias -> Sum Dim
+// Input shape: (N, C, D, H, W)
+// Output shape: Depends on sum_dim. 
+// If sum_dim=1 (channels), output is (N, D_out, H_out, W_out). 
+// Wait, the original code does:
+// 1. Conv -> (N, Cout, D', H', W')
+// 2. Div -> same shape
+// 3. MaxPool(pool_size) -> (N, Cout, D'', H'', W'')
+// 4. GAP(1,1,1) -> (N, Cout, 1, 1, 1)
+// 5. Add Bias (Cout, 1, 1, 1) -> (N, Cout, 1, 1, 1)
+// 6. Sum(dim=sum_dim). If sum_dim=1, sum over channels -> (N, 1, 1, 1).
+
+// Let's implement a kernel that takes the output of Conv (or just assumes input is pre-conv for this example? 
+// No, we need to replace the operators in the architecture. 
+// Since replacing Conv3d with a custom naive implementation is likely slower than cuDNN, 
+// and the prompt says "replace ... to get speedups", we should focus on the parts that are inefficient or fuseable.
+// However, the example shows replacing simple ops. Let's replace the entire post-conv pipeline with a fused kernel.
+// To make it self-contained and compilable without external dependencies like cuDNN in the inline code, 
+// we will assume the input to this custom operator is the output of the Conv layer (or we implement a simple conv).
+// Actually, the cleanest way to "replace operators" in the model definition is to have a single custom op that does 
+// everything from the raw input if possible, or just the fused tail.
+// Let's implement a fused kernel for: Div -> MaxPool3d -> GAP -> Add Bias -> Sum Dim.
+// We will call this kernel after the standard PyTorch Conv3d to leverage cuDNN for the heavy lifting, 
+// OR we can replace everything. Given "complete freedom", let's replace the whole thing with a custom CUDA implementation 
+// of a simplified Conv + PostProc to demonstrate full control, but optimized.
+// Actually, writing a fast 3D conv in inline CUDA is hard. Let's stick to replacing the post-processing chain which is memory bound and fuseable.
+
+__global__ void fused_postproc_kernel(
+    const float* input, // Output of Conv: (N, C, D, H, W)
+    const float* bias,  // (C, 1, 1, 1)
+    float* output,      // Final result
+    int N, int C, int D, int H, int W,
+    float divisor,
+    int pool_size,
+    int sum_dim_idx
+) {
+    // We need to compute:
+    // 1. x = input / divisor
+    // 2. MaxPool3d(x, pool_size) -> y (N, C, D', H', W') where D' = D/pool_size, etc.
+    // 3. GAP(y) -> z (N, C, 1, 1, 1) which is mean of y over spatial dims? 
+    //    Wait, AdaptiveAvgPool3d((1,1,1)) computes the average over H, W, D dimensions.
+    // 4. z = z + bias
+    // 5. Sum z along sum_dim_idx.
+
+    // Let's calculate output indices.
+    // If sum_dim is 1 (channels), output shape is (N, D', H', W').
+    // If sum_dim is 0 (batch), output shape is (C, D', H', W').
+    // The original code: x = torch.sum(x, dim=self.sum_dim).
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N; 
+    if (sum_dim_idx == 1) {
+        // Output shape: (N, D', H', W')
+        total_elements = N * ((D + pool_size - 1) / pool_size) * ((H + pool_size - 1) / pool_size) * ((W + pool_size - 1) / pool_size);
+    } else if (sum_dim_idx == 0) {
+        // Output shape: (C, D', H', W')
+        total_elements = C * ((D + pool_size - 1) / pool_size) * ((H + pool_size - 1) / pool_size) * ((W + pool_size - 1) / pool_size);
+    } else if (sum_dim_idx == 2 || sum_dim_idx == 3 || sum_dim_idx == 4) {
+        // Summing over spatial dims after GAP? 
+        // After GAP, shape is (N, C, 1, 1, 1). Summing over dim 2,3,4 results in (N, C, 1, 1, 1).
+        total_elements = N * C;
+    } else {
+        // Default to summing over channels if not specified or other dims
+         total_elements = N * ((D + pool_size - 1) / pool_size) * ((H + pool_size - 1) / pool_size) * ((W + pool_size - 1) / pool_size);
+    }
+
+    if (idx >= total_elements) return;
+
+    int D_out = (D + pool_size - 1) / pool_size;
+    int H_out = (H + pool_size - 1) / pool_size;
+    int W_out = (W + pool_size - 1) / pool_size;
+
+    float val = 0.0f;
+
+    if (sum_dim_idx == 1) {
+        // Output index corresponds to (n, d_out, h_out, w_out)
+        int w_out = idx % W_out;
+        int temp = idx / W_out;
+        int h_out = temp % H_out;
+        int d_out = temp / H_out;
+        int n = d_out; // Wait, total_elements = N * D_out * H_out * W_out. 
+                       // Linear index mapping: n * (D_out*H_out*W_out) + d_out * (H_out*W_out) + h_out * W_out + w_out
+        
+        // Recalculate indices properly
+        int stride_dhw = H_out * W_out;
+        int stride_hw = W_out;
+        
+        int n = idx / (D_out * stride_dhw);
+        int rem = idx % (D_out * stride_dhw);
+        int d_out = rem / stride_dhw;
+        rem = rem % stride_dhw;
+        int h_out = rem / stride_hw;
+        int w_out = rem % stride_hw;
+
+        // For each channel c, compute GAP value and sum them up? 
+        // No, the sum is over dim 1 (channels). So we sum over C.
+        float sum_val = 0.0f;
+        
+        for (int c = 0; c < C; ++c) {
+            // Compute MaxPool then GAP for this channel
+            // MaxPool window: [d_out*pool_size, min((d_out+1)*pool_size, D)) etc.
+            float max_val = -FLT_MAX;
+            
+            int d_start = d_out * pool_size;
+            int d_end = (d_out + 1) * pool_size;
+            if (d_end > D) d_end = D;
+            
+            int h_start = h_out * pool_size;
+            int h_end = (h_out + 1) * pool_size;
+            if (h_end > H) h_end = H;
+            
+            int w_start = w_out * pool_size;
+            int w_end = (w_out + 1) * pool_size;
+            if (w_end > W) w_end = W;
+
+            // Max Pooling
+            for (int d = d_start; d < d_end; ++d) {
+                for (int h = h_start; h < h_end; ++h) {
+                    for (int w = w_start; w < w_end; ++w) {
+                        float val_div = input[((n * C + c) * D + d) * H + h] * W + w] / divisor; // Wait, indexing fix below
+                        // Correct indexing: ((n * C + c) * D + d) * H + h) * W + w
+                        float raw_val = input[((((n * C + c) * D + d) * H + h) * W + w)];
+                        if (raw_val > max_val) max_val = raw_val;
+                    }
+                }
+            }
+            
+            // Global Average Pooling on the MaxPooled result? 
+            // The original code: x = self.max_pool(x); x = self.global_avg_pool(x);
+            // GAP computes the average over H, W, D dimensions of the MaxPooled tensor.
+            // Since MaxPool output is (N, C, D_out, H_out, W_out), GAP averages over D_out, H_out, W_out.
+            
+            float sum_max = 0.0f;
+            int num_elements_pool = D_out * H_out * W_out;
+            
+            // We need to iterate over the spatial dimensions of the MaxPooled feature map for this channel
+            for (int d_o = 0; d_o < D_out; ++d_o) {
+                for (int h_o = 0; h_o < H_out; ++h_o) {
+                    for (int w_o = 0; w_o < W_out; ++w_o) {
+                         // We already computed the max value for this specific (d_o, h_o, w_o) window above?
+                         // No, we computed it for the current output position (d_out, h_out, w_out).
+                         // To compute GAP, we need the average of ALL spatial positions in the MaxPooled map.
+                    }
+                }
+            }
+            
+            // This approach is getting complicated because GAP requires aggregating over all spatial outputs.
+            // It's better to separate MaxPool and GAP or compute them efficiently.
+        }
+    }
+}
+
+// Let's simplify. The most efficient way in CUDA for this specific chain:
+// 1. Divide by scalar (broadcast)
+// 2. MaxPool3d
+// 3. GlobalAvgPool3d (Mean over spatial dims)
+// 4. Add Bias
+// 5. Sum over dim
+
+// We can implement a kernel that does steps 1-4 and outputs (N, C), then sum in step 5.
+// Or just do it all in one pass if memory permits.
+
+__global__ void fused_conv_postproc_kernel(
+    const float* input, // (N, C, D, H, W) - Assuming this is the output of Conv
+    const float* bias,  // (C, 1, 1, 1)
+    float* output,      // Final sum result
+    int N, int C, int D, int H, int W,
+    float divisor,
+    int pool_size,
+    int sum_dim_idx
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Output shape after GAP is (N, C, 1, 1, 1).
+    // Summing over dim 1 (C) gives (N, 1, 1, 1).
+    // Summing over dim 0 (N) gives (1, C, 1, 1, 1).
+    
+    int total_out = N; // If sum_dim=1
+    if (sum_dim_idx == 0) total_out = C;
+    else if (sum_dim_idx == 2 || sum_dim_idx == 3 || sum_dim_idx == 4) total_out = N * C; // Summing over singleton dims does nothing effectively to shape, but sums values? No, sum(dim=2) on (N,C,1,1,1) is just the value itself.
+    
+    if (idx >= total_out) return;
+
+    int D_out = (D + pool_size - 1) / pool_size;
+    int H_out = (H + pool_size - 1) / pool_size;
+    int W_out = (W + pool_size - 1) / pool_size;
+
+    if (sum_dim_idx == 1) {
+        // Output is (N, 1, 1, 1). We sum over C.
+        // idx represents N index.
+        int n = idx;
+        float sum_over_c = 0.0f;
+        
+        for (int c = 0; c < C; ++c) {
+            // Compute MaxPool3d then GAP for channel c, batch n
+            // GAP is mean over D_out, H_out, W_out of the MaxPooled tensor.
+            
+            float sum_max_pool_vals = 0.0f;
+            
+            // Iterate over all spatial positions in the MaxPooled feature map
+            for (int d_o = 0; d_o < D_out; ++d_o) {
+                int d_start = d_o * pool_size;
+                int d_end = (d_o + 1) * pool_size;
+                if (d_end > D) d_end = D;
+                
+                for (int h_o = 0; h_o < H_out; ++h_o) {
+                    int h_start = h_o * pool_size;
+                    int h_end = (h_o + 1) * pool_size;
+                    if (h_end > H) h_end = H;
+                    
+                    for (int w_o = 0; w_o < W_out; ++w_o) {
+                        int w_start = w_o * pool_size;
+                        int w_end = (w_o + 1) * pool_size;
+                        if (w_end > W) w_end = W;
+                        
+                        float max_val = -FLT_MAX;
+                        
+                        // Find max in the window
+                        for (int d = d_start; d < d_end; ++d) {
+                            for (int h = h_start; h < h_end; ++h) {
+                                for (int w = w_start; w < w_end; ++w) {
+                                    float val = input[((((n * C + c) * D + d) * H + h) * W + w)] / divisor;
+                                    if (val > max_val) max_val = val;
+                                }
+                            }
+                        }
+                        sum_max_pool_vals += max_val;
+                    }
+                }
+            }
+            
+            float gap_val = sum_max_pool_vals / (float)(D_out * H_out * W_out);
+            sum_over_c += (gap_val + bias[c]);
+        }
+        
+        output[n] = sum_over_c;
+    } else if (sum_dim_idx == 0) {
+        // Output is (1, C, 1, 1, 1). We sum over N.
+        int c = idx;
+        float sum_over_n = 0.0f;
+        
+        for (int n = 0; n < N; ++n) {
+            float sum_max_pool_vals = 0.0f;
+            
+            for (int d_o = 0; d_o < D_out; ++d_o) {
+                int d_start = d_o * pool_size;
+                int d_end = (d_o + 1) * pool_size;
+                if (d_end > D) d_end = D;
+                
+                for (int h_o = 0; h_o < H_out; ++h_o) {
+                    int h_start = h_o * pool_size;
+                    int h_end = (h_o + 1) * pool_size;
+                    if (h_end > H) h_end = H;
+                    
+                    for (int w_o = 0; w_o < W_out; ++w_o) {
+                        int w_start = w_o * pool_size;
+                        int w_end = (w_o + 1) * pool_size;
+                        if (w_end > W) w_end = W;
+                        
+                        float max_val = -FLT_MAX;
+                        
+                        for (int d = d_start; d < d_end; ++d) {
+                            for (int h = h_start; h < h_end; ++h) {
+                                for (int w = w_start; w < w_end; ++w) {
+                                    float val = input[((((n * C + c) * D + d) * H + h) * W + w)] / divisor;
+                                    if (val > max_val) max_val = val;
+                                }
+                            }
+                        }
+                        sum_max_pool_vals += max_val;
+                    }
+                }
+            }
+            
+            float gap_val = sum_max_pool_vals / (float)(D_out * H_out * W_out);
+            sum_over_n += (gap_val + bias[c]);
+        }
+        
+        output[c] = sum_over_n;
+    } else {
+        // Summing over spatial dims 2,3,4 which are size 1 after GAP. 
+        // Effectively just adding bias and returning the value? 
+        // Original: x is (N, C, 1, 1, 1). sum(dim=2) -> (N, C, 1, 1, 1).
+        // So we just output N*C values.
+        int n = idx / C;
+        int c = idx % C;
+        
+        float sum_max_pool_vals = 0.0f;
+        
+        for (int d_o = 0; d_o < D_out; ++d_o) {
+            int d_start = d_o * pool_size;
+            int d_end = (d_o + 1) * pool_size;
+            if (d_end > D) d_end = D;
+            
+            for (int h_o = 0; h_o < H_out; ++h_o) {
+                int h_start = h_o * pool_size;
+                int h_end = (h_o + 1) * pool_size;
+                if (h_end > H) h_end = H;
+                
+                for (int w_o = 0; w_o < W_out; ++w_o) {
+                    int w_start = w_o * pool_size;
+                    int w_end = (w_o + 1) * pool_size;
+                    if (w_end > W) w_end = W;
+                    
+                    float max_val = -FLT_MAX;
+                    
+                    for (int d = d_start; d < d_end; ++d) {
+                        for (int h = h_start; h < h_end; ++h) {
+                            for (int w = w_start; w < w_end; ++w) {
+                                float val = input[((((n * C + c) * D + d) * H + h) * W + w)] / divisor;
+                                if (val > max_val) max_val = val;
+                            }
+                        }
+                    }
+                    sum_max_pool_vals += max_val;
+                }
+            }
+        }
+        
+        float gap_val = sum_max_pool_vals / (float)(D_out * H_out * W_out);
+        output[idx] = gap_val + bias[c];
+    }
+}
+
+torch::Tensor fused_postproc_cuda(
+    torch::Tensor input, // Output of Conv: (N, C, D, H, W)
+    torch::Tensor bias,  // (C, 1, 1, 1)
+    float divisor,
+    int pool_size,
+    int sum_dim_idx
+) {
+    auto N = input.size(0);
+    auto C = input.size(1);
+    auto D = input.size(2);
+    auto H = input.size(3);
+    auto W = input.size(4);
+
+    int D_out = (D + pool_size - 1) / pool_size;
+    int H_out = (H + pool_size - 1) / pool_size;
+    int W_out = (W + pool_size - 1) / pool_size;
+
+    torch::Tensor output;
+    
+    if (sum_dim_idx == 1) {
+        output = torch::empty({N}, input.options());
+    } else if (sum_dim_idx == 0) {
+        output = torch::empty({C}, input.options());
+    } else {
+        output = torch::empty({N, C}, input.options());
+    }
+
+    const int block_size = 256;
+    int total_elements = output.numel();
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    fused_postproc_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        N, C, D, H, W,
+        divisor,
+        pool_size,
+        sum_dim_idx
+    );
+
+    return output;
+}
+"""
+
+custom_ops_cpp_source = (
+    "torch::Tensor fused_postproc_cuda(torch::Tensor input, torch::Tensor bias, float divisor, int pool_size, int sum_dim_idx);"
+)
+
+# Compile the inline CUDA code
+fused_postproc = load_inline(
+    name="fused_postproc",
+    cpp_sources=custom_ops_cpp_source,
+    cuda_sources=custom_ops_source,
+    functions=["fused_postproc_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model using custom CUDA operator for the post-processing chain.
+    The Conv3d is left to PyTorch/cuDNN as it is highly optimized.
+    The subsequent operations (Div, MaxPool, GAP, Add Bias, Sum) are fused into a single kernel.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, divisor, pool_size, bias_shape, sum_dim):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.divisor = divisor
+        self.pool_size = pool_size
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.sum_dim = sum_dim
+
+    def forward(self, x):
+        # 1. Convolution (using cuDNN optimized implementation)
+        x = self.conv(x)
+        
+        # 2-6. Fused Post-Processing: Div -> MaxPool3d -> GAP -> Add Bias -> Sum Dim
+        # The custom kernel handles all these steps efficiently in one pass over memory
+        x = fused_postproc.fused_postproc_cuda(
+            x, 
+            self.bias, 
+            self.divisor, 
+            self.pool_size, 
+            self.sum_dim
+        )
+        
+        return x
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.rand(batch_size, in_channels, depth, height, width)
+    return [a]
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return [in_channels, out_channels, kernel_size, divisor, pool_size, bias_shape, sum_dim]

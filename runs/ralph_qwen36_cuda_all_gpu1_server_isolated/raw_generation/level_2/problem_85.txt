@@ -1,0 +1,595 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernels for Conv2d + GroupNorm + Scale + MaxPool + Clamp fusion.
+# We will implement a fused kernel that performs these operations in a single pass over the data
+# to minimize memory bandwidth overhead and improve cache locality.
+
+fused_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+// Helper for shared memory convolution if needed, but for simplicity and robustness with varying kernel sizes,
+// we will use a standard grid-stride loop approach for the fused operation.
+// Note: A true high-performance Conv2d usually requires cuDNN or cutlass. 
+// Here we implement a naive but correct fused path to demonstrate the concept of operator fusion 
+// and custom CUDA integration as requested. For production, one would likely use cutlass or cuDNN wrappers.
+// However, to strictly follow "custom CUDA operators" and fuse GroupNorm/Scale/MaxPool/Clamp after Conv,
+// we can write a kernel that assumes the Conv output is already computed (or compute it here).
+// Given the complexity of writing a fast generic Conv2d from scratch in inline code, 
+// we will focus on fusing the post-conv operations: GroupNorm -> Scale -> MaxPool -> Clamp.
+// We will call the standard torch conv for the heavy lifting but fuse the rest.
+// Actually, the prompt asks to replace pytorch operators. Let's try to implement a simple Conv2d 
+// and fuse it with the rest if possible, or just fuse the complex tail.
+// To ensure correctness and compilation success without external libraries like cutlass, 
+// we will implement a simplified 2D convolution (im2col style is too large for inline, so direct loop)
+// and fuse it with GroupNorm, Scale, MaxPool, Clamp.
+
+__device__ float clamp_val(float val, float min_val, float max_val) {
+    return fminf(fmaxf(val, min_val), max_val);
+}
+
+__global__ void fused_conv_gn_scale_maxpool_clamp_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias, // Conv2d usually has bias
+    const float* __restrict__ scale_param, // GroupNorm scale
+    const float* __restrict__ shift_param, // GroupNorm shift (usually zeros if not learned, but we handle it)
+    float* __restrict__ output,
+    
+    int batch_size,
+    int in_channels,
+    int height,
+    int width,
+    int out_channels,
+    int kernel_h,
+    int kernel_w,
+    int stride_h,
+    int stride_w,
+    int pad_h,
+    int pad_w,
+    int num_groups,
+    int maxpool_kernel_size,
+    float clamp_min,
+    float clamp_max
+) {
+    // Each thread handles one output element
+    int total_out_elements = batch_size * out_channels * height * width;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= total_out_elements) return;
+
+    // Decode index to coordinates
+    int w_idx = idx % width;
+    int h_idx = (idx / width) % height;
+    int c_idx = (idx / (width * height)) % out_channels;
+    int b_idx = idx / (width * height * out_channels);
+
+    // 1. Conv2d Calculation
+    float sum = 0.0f;
+    
+    // Determine input channel range for this output channel
+    // In standard Conv2d, each output channel is a linear combination of ALL input channels.
+    int kh_start = h_idx - pad_h;
+    int kh_end = kh_start + kernel_h;
+    int kw_start = w_idx - pad_w;
+    int kw_end = kw_start + kernel_w;
+
+    for (int ic = 0; ic < in_channels; ++ic) {
+        for (int kh = kh_start; kh < kh_end; ++kh) {
+            for (int kw = kw_start; kw < kw_end; ++kw) {
+                if (kh >= 0 && kh < height && kw >= 0 && kw < width) {
+                    int input_idx = b_idx * in_channels * height * width + 
+                                    ic * height * width + 
+                                    kh * width + kw;
+                    
+                    // Weight index: out_channel, in_channel, k_h, k_w
+                    int weight_kh = kh - (h_idx - pad_h);
+                    int weight_kw = kw - (w_idx - pad_w);
+                    int weight_idx = c_idx * in_channels * kernel_h * kernel_w + 
+                                     ic * kernel_h * kernel_w + 
+                                     weight_kh * kernel_w + weight_kw;
+                    
+                    sum += input[input_idx] * weight[weight_idx];
+                }
+            }
+        }
+    }
+
+    // Add bias if present (assuming bias is not null, standard Conv2d has bias)
+    // If the model doesn't use bias, we need to handle it. 
+    // The provided Model uses nn.Conv2d which defaults to bias=True.
+    sum += bias[c_idx];
+
+    // 2. Group Normalization
+    // GN normalizes across channels within groups.
+    // We need mean and variance for the group containing c_idx.
+    int group_id = c_idx / (out_channels / num_groups);
+    int channels_per_group = out_channels / num_groups;
+    
+    // Calculate mean and variance for this specific batch, group, height, width
+    float mean = 0.0f;
+    float var_sum = 0.0f;
+    
+    int group_start_channel = group_id * channels_per_group;
+    int group_end_channel = (group_id + 1) * channels_per_group;
+
+    for (int gc = group_start_channel; gc < group_end_channel; ++gc) {
+        int val_idx = b_idx * out_channels * height * width + 
+                      gc * height * width + 
+                      h_idx * width + w_idx;
+        float val = input[val_idx]; // Wait, we just computed sum in 'sum'. 
+                                    // But GN needs the raw conv output for all channels in the group.
+                                    // This implies we can't do it in a single thread pass easily without reading back or storing intermediate.
+                                    // To keep this inline and simple, we will assume the 'input' passed to this kernel 
+                                    // is actually the CONV OUTPUT. 
+                                    // BUT, we are fusing Conv INTO this kernel. 
+                                    // This creates a dependency: GN needs all channels in the group.
+                                    // A single thread computing one output element cannot easily access other channels' conv outputs 
+                                    // without global memory reads which defeats the purpose of fusion optimization if not careful.
+        
+        // Correction: To properly fuse Conv + GN, we typically need to compute the whole batch/channel stats first or use shared memory.
+        // Given the constraints of a single inline kernel for arbitrary sizes, a true high-performance fusion is complex.
+        // However, we can approximate or implement a simpler version:
+        // Let's assume we read the conv output from global memory? No, that's not fused.
+        
+        // Alternative Strategy: 
+        // Since writing a fast, correct, generic Conv2d+GN kernel in inline CUDA is extremely verbose and error-prone,
+        // and the prompt allows "algorithmic changes" and "operator fusion", let's focus on fusing the simpler tail operations 
+        // which are often bottlenecks if not fused: Scale + MaxPool + Clamp.
+        // We will use PyTorch's optimized Conv2d and GroupNorm, but replace the subsequent operations with a custom fused kernel.
+        // This is a valid "custom CUDA operator" replacement strategy.
+    }
+    
+    // RE-STRATEGY: 
+    // The prompt asks to replace pytorch operators. 
+    // Let's implement a custom kernel for `Scale + MaxPool + Clamp`.
+    // We will keep Conv and GroupNorm as standard PyTorch ops (or replace them if easy, but they are complex).
+    // Actually, let's try to replace the whole chain with a single kernel that does:
+    // 1. Naive Conv2d (for demonstration of custom op)
+    // 2. Immediate GroupNorm (approximate or simplified if full stats calc is too big for inline)
+    // 3. Scale
+    // 4. MaxPool
+    // 5. Clamp
+    
+    // To ensure the code compiles and runs correctly without external deps, I will implement a 
+    // kernel that performs Conv2d (naive), then GroupNorm (using global memory for stats calculation in a separate pass or simplified),
+    // then Scale/MaxPool/Clamp.
+    
+    // Simplified GN: We will assume the user provides pre-computed mean/var? No, Model doesn't do that.
+    // Let's stick to replacing the tail: Scale, MaxPool, Clamp. 
+    // And maybe replace Conv with a custom one if it's small.
+    
+    // Let's write a kernel for: Input -> Conv2d (Naive) -> Output1
+    // Then a kernel for: Output1 -> GroupNorm -> Output2
+    // Then a kernel for: Output2 -> Scale -> MaxPool -> Clamp -> Final
+    
+    // This is multiple kernels. The prompt allows replacing "some operators".
+    
+    // Let's implement the Tail Fusion: Scale + MaxPool + Clamp.
+    // And a separate Conv2d kernel if needed. But standard Conv2d is very fast in PyTorch (cuDNN).
+    // GroupNorm is also optimized.
+    // The bottleneck might be the memory traffic between these ops.
+    
+    // Let's implement a fused `Scale_MaxPool_Clamp` kernel.
+}
+
+// Kernel for Scale + MaxPool + Clamp
+__global__ void scale_maxpool_clamp_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ scale_param,
+    float* __restrict__ output,
+    
+    int batch_size,
+    int channels,
+    int height,
+    int width,
+    int maxpool_kernel_size,
+    float clamp_min,
+    float clamp_max
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * channels * height * width;
+    
+    if (idx >= total_elements) return;
+
+    // Decode coordinates
+    int w_idx = idx % width;
+    int h_idx = (idx / width) % height;
+    int c_idx = (idx / (width * height)) % channels;
+    int b_idx = idx / (width * height * channels);
+
+    // 1. Scale
+    float scaled_val = input[idx] * scale_param[c_idx];
+
+    // 2. MaxPool (Same padding, stride=maxpool_kernel_size usually, but nn.MaxPool2d defaults to stride=kernel_size)
+    // We need to find the max in the window centered or top-left aligned?
+    // PyTorch MaxPool2d with kernel_size=k and no stride specified uses stride=k.
+    // Padding is 0 by default.
+    
+    int pool_h_start = h_idx;
+    int pool_w_start = w_idx;
+    
+    // Wait, MaxPool reduces spatial dimensions. 
+    // If we are fusing Scale -> MaxPool -> Clamp, the output shape changes.
+    // The input to this kernel is the result of GroupNorm (same spatial dims as Conv out).
+    // The output will have smaller spatial dims.
+    
+    // This implies the thread mapping is tricky. 
+    // Let's map each thread to an OUTPUT element.
+    
+    int out_w = width / maxpool_kernel_size;
+    int out_h = height / maxpool_kernel_size;
+    
+    // Check if dimensions are divisible
+    if (width % maxpool_kernel_size != 0 || height % maxpool_kernel_size != 0) {
+        // Handle non-divisible cases by padding or ignoring, but for simplicity assume divisible.
+        // If not divisible, PyTorch handles it with floor division.
+        out_w = width / maxpool_kernel_size;
+        out_h = height / maxpool_kernel_size;
+    }
+
+    int total_out_elements = batch_size * channels * out_h * out_w;
+    
+    // Re-calculate idx based on output space? 
+    // No, the kernel launch configuration should match the output size.
+    // Let's restart the logic for this kernel assuming it processes OUTPUT elements.
+}
+
+// Correct Kernel: Scale + MaxPool + Clamp processing Output Elements
+__global__ void fused_scale_maxpool_clamp_kernel(
+    const float* __restrict__ input,   // Input from GroupNorm (B, C, H, W)
+    const float* __restrict__ scale_param, // (C,)
+    float* __restrict__ output,        // Output (B, C, H', W')
+    
+    int batch_size,
+    int channels,
+    int height,
+    int width,
+    int maxpool_kernel_size,
+    float clamp_min,
+    float clamp_max
+) {
+    int out_w = width / maxpool_kernel_size;
+    int out_h = height / maxpool_kernel_size;
+    
+    // If not divisible, PyTorch's MaxPool2d uses floor. 
+    // We assume inputs are divisible for this simple kernel to avoid complex boundary checks.
+    if (width % maxpool_kernel_size != 0 || height % maxpool_kernel_size != 0) {
+        // Fallback or error? For this exercise, we assume valid shapes.
+        return; 
+    }
+
+    int total_out_elements = batch_size * channels * out_h * out_w;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= total_out_elements) return;
+
+    // Decode output coordinates
+    int w_out = idx % out_w;
+    int h_out = (idx / out_w) % out_h;
+    int c_idx = (idx / (out_w * out_h)) % channels;
+    int b_idx = idx / (out_w * out_h * channels);
+
+    // 1. MaxPool: Find max in the window [h_out*k, h_out*k + k) x [w_out*k, w_out*k + k)
+    float max_val = -FLT_MAX;
+    
+    int h_start = h_out * maxpool_kernel_size;
+    int w_start = w_out * maxpool_kernel_size;
+
+    for (int kh = 0; kh < maxpool_kernel_size; ++kh) {
+        for (int kw = 0; kw < maxpool_kernel_size; ++kw) {
+            int h_in = h_start + kh;
+            int w_in = w_start + kw;
+            
+            // Input index: B, C, H, W
+            int input_idx = b_idx * channels * height * width + 
+                            c_idx * height * width + 
+                            h_in * width + w_in;
+                            
+            float val = input[input_idx];
+            if (val > max_val) {
+                max_val = val;
+            }
+        }
+    }
+
+    // 2. Scale: Apply channel-wise scale
+    // Note: The scale parameter is applied BEFORE MaxPool in the original code?
+    // Original: x = self.group_norm(x); x = x * self.scale; x = self.maxpool(x);
+    // Yes, Scale happens before MaxPool.
+    
+    float scaled_val = max_val * scale_param[c_idx];
+
+    // 3. Clamp
+    float final_val = clamp_val(scaled_val, clamp_min, clamp_max);
+
+    output[idx] = final_val;
+}
+
+// Kernel for Conv2d (Naive) + GroupNorm (Simplified/Approximate or Full?)
+// Implementing full GN in a single kernel with Conv is very heavy.
+// Let's replace Conv2d with a custom naive one, and then use the fused tail.
+// But wait, PyTorch's Conv2d is already highly optimized. 
+// The prompt says "replace ... to get speedups". 
+// If we replace Conv2d with a naive CUDA kernel, it will likely be SLOWER than cuDNN.
+// So, we should only replace operators where custom CUDA provides an advantage or allows fusion.
+// Fusion of Scale + MaxPool + Clamp avoids writing the intermediate tensor to global memory and reading it back.
+// This is a valid optimization.
+
+// We will also replace GroupNorm with a custom one if we can fuse it with Conv? 
+// No, let's just fuse Scale + MaxPool + Clamp.
+
+torch::Tensor fused_scale_maxpool_clamp_cuda(
+    torch::Tensor input,
+    torch::Tensor scale_param,
+    int maxpool_kernel_size,
+    float clamp_min,
+    float clamp_max
+) {
+    auto batch_size = input.size(0);
+    auto channels = input.size(1);
+    auto height = input.size(2);
+    auto width = input.size(3);
+
+    int out_w = width / maxpool_kernel_size;
+    int out_h = height / maxpool_kernel_size;
+    
+    // Check divisibility
+    if (width % maxpool_kernel_size != 0 || height % maxpool_kernel_size != 0) {
+        throw std::runtime_error("Input dimensions must be divisible by maxpool_kernel_size for this custom kernel.");
+    }
+
+    auto output = torch::empty({batch_size, channels, out_h, out_w}, input.options());
+
+    int total_elements = batch_size * channels * out_h * out_w;
+    if (total_elements == 0) return output;
+
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    fused_scale_maxpool_clamp_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        scale_param.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        channels,
+        height,
+        width,
+        maxpool_kernel_size,
+        clamp_min,
+        clamp_max
+    );
+
+    return output;
+}
+
+// We can also implement a naive Conv2d to replace nn.Conv2d if desired, 
+// but it's unlikely to be faster than cuDNN. 
+// However, to demonstrate "custom CUDA operators", let's provide one.
+// And we can fuse Conv + GN? No, too complex for inline.
+
+torch::Tensor naive_conv2d_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias
+) {
+    auto batch_size = input.size(0);
+    auto in_channels = input.size(1);
+    auto height = input.size(2);
+    auto width = input.size(3);
+    
+    auto out_channels = weight.size(0);
+    auto kernel_h = weight.size(2);
+    auto kernel_w = weight.size(3);
+    
+    // Assume stride=1, padding=0 for simplicity in this naive implementation
+    // The model uses default Conv2d which is stride=1, padding=kernel_size//2 if not specified? 
+    // No, nn.Conv2d defaults to stride=1, padding=0.
+    // Wait, the example code: `self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)`
+    // This uses default padding=0.
+    
+    auto out_h = height - kernel_h + 1;
+    auto out_w = width - kernel_w + 1;
+    
+    auto output = torch::empty({batch_size, out_channels, out_h, out_w}, input.options());
+
+    int total_elements = batch_size * out_channels * out_h * out_w;
+    if (total_elements == 0) return output;
+
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    // We need a kernel for this. Let's define it inside the source string.
+    
+    return output;
+}
+
+"""
+
+# Since defining multiple kernels and managing them in one load_inline is complex, 
+# and the naive Conv2d will likely be slower, I will focus on the Tail Fusion which is safe and effective.
+# I will also implement a simple GroupNorm kernel if needed, but PyTorch's is good.
+# The main gain here is fusing Scale + MaxPool + Clamp.
+
+# Let's refine the source to include only the necessary fused kernel for the tail.
+
+fused_tail_source = R"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <float.h>
+
+__device__ float clamp_val(float val, float min_val, float max_val) {
+    return fminf(fmaxf(val, min_val), max_val);
+}
+
+__global__ void fused_scale_maxpool_clamp_kernel(
+    const float* __restrict__ input,
+    const float* __restrict__ scale_param,
+    float* __restrict__ output,
+    
+    int batch_size,
+    int channels,
+    int height,
+    int width,
+    int maxpool_kernel_size,
+    float clamp_min,
+    float clamp_max
+) {
+    int out_w = width / maxpool_kernel_size;
+    int out_h = height / maxpool_kernel_size;
+
+    int total_out_elements = batch_size * channels * out_h * out_w;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= total_out_elements) return;
+
+    // Decode output coordinates
+    int w_out = idx % out_w;
+    int h_out = (idx / out_w) % out_h;
+    int c_idx = (idx / (out_w * out_h)) % channels;
+    int b_idx = idx / (out_w * out_h * channels);
+
+    // MaxPool window start
+    int h_start = h_out * maxpool_kernel_size;
+    int w_start = w_out * maxpool_kernel_size;
+
+    float max_val = -FLT_MAX;
+
+    for (int kh = 0; kh < maxpool_kernel_size; ++kh) {
+        for (int kw = 0; kw < maxpool_kernel_size; ++kw) {
+            int h_in = h_start + kh;
+            int w_in = w_start + kw;
+            
+            // Input index: B, C, H, W
+            int input_idx = b_idx * channels * height * width + 
+                            c_idx * height * width + 
+                            h_in * width + w_in;
+                            
+            float val = input[input_idx];
+            if (val > max_val) {
+                max_val = val;
+            }
+        }
+    }
+
+    // Scale
+    float scaled_val = max_val * scale_param[c_idx];
+
+    // Clamp
+    output[idx] = clamp_val(scaled_val, clamp_min, clamp_max);
+}
+
+torch::Tensor fused_scale_maxpool_clamp_cuda(
+    torch::Tensor input,
+    torch::Tensor scale_param,
+    int maxpool_kernel_size,
+    float clamp_min,
+    float clamp_max
+) {
+    auto batch_size = input.size(0);
+    auto channels = input.size(1);
+    auto height = input.size(2);
+    auto width = input.size(3);
+
+    if (width % maxpool_kernel_size != 0 || height % maxpool_kernel_size != 0) {
+        throw std::runtime_error("Input dimensions must be divisible by maxpool_kernel_size.");
+    }
+
+    int out_w = width / maxpool_kernel_size;
+    int out_h = height / maxpool_kernel_size;
+    
+    auto output = torch::empty({batch_size, channels, out_h, out_w}, input.options());
+
+    int total_elements = batch_size * channels * out_h * out_w;
+    if (total_elements == 0) return output;
+
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    fused_scale_maxpool_clamp_kernel<<<num_blocks, block_size>>>(
+        input.data_ptr<float>(),
+        scale_param.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        channels,
+        height,
+        width,
+        maxpool_kernel_size,
+        clamp_min,
+        clamp_max
+    );
+
+    return output;
+}
+"""
+
+fused_tail_cpp_source = (
+    "torch::Tensor fused_scale_maxpool_clamp_cuda(torch::Tensor input, torch::Tensor scale_param, int maxpool_kernel_size, float clamp_min, float clamp_max);"
+)
+
+# Compile the inline CUDA code
+fused_ops = load_inline(
+    name="fused_tail",
+    cpp_sources=fused_tail_cpp_source,
+    cuda_sources=fused_tail_source,
+    functions=["fused_scale_maxpool_clamp_cuda"],
+    verbose=False,
+    extra_cflags=["-O2"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model using custom CUDA operator for Scale + MaxPool + Clamp fusion.
+    Conv2d and GroupNorm are left to PyTorch's optimized implementations (cuDNN/cuBLAS).
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, num_groups, scale_shape, maxpool_kernel_size, clamp_min, clamp_max):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.group_norm = nn.GroupNorm(num_groups, out_channels)
+        self.scale = nn.Parameter(torch.ones(scale_shape))
+        self.maxpool_kernel_size = maxpool_kernel_size
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
+        # The custom fused operator is accessed via the loaded module
+        self.fused_tail = fused_ops
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, in_channels, height, width).
+        Returns:
+            Output tensor of shape (batch_size, out_channels, height', width').
+        """
+        x = self.conv(x)
+        x = self.group_norm(x)
+        
+        # Apply scale manually before passing to fused kernel? 
+        # The fused kernel expects the input to be scaled? 
+        # No, the fused kernel takes `scale_param` and applies it.
+        # So we pass the GroupNorm output directly.
+        
+        x = self.fused_tail.fused_scale_maxpool_clamp_cuda(
+            x, 
+            self.scale, 
+            self.maxpool_kernel_size, 
+            self.clamp_min, 
+            self.clamp_max
+        )
+        
+        return x
+
+def get_inputs():
+    # randomly generate input tensors based on the model architecture
+    a = torch.rand(batch_size, in_channels, height, width)
+    return [a]
+
+def get_init_inputs():
+    # randomly generate tensors required for initialization based on the model architecture
+    return [in_channels, out_channels, kernel_size, num_groups, scale_shape, maxpool_kernel_size, clamp_min, clamp_max]
+```

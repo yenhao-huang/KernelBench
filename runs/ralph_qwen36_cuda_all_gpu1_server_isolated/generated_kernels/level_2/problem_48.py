@@ -1,0 +1,161 @@
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for the fused operation:
+# 1. Conv3d (im2col + gemm or direct convolution)
+# 2. Scale (mul by scaling_factor)
+# 3. Tanh
+# 4. Scale (mul by bias)
+# 5. Sigmoid
+#
+# Note: Implementing a full optimized Conv3d from scratch in inline CUDA is extremely complex 
+# and error-prone without libraries like CUTLASS or cuDNN. However, the prompt asks for 
+# "custom CUDA operators to replace pytorch operators". 
+#
+# A more realistic and high-impact optimization for this specific chain (Conv -> Scale -> Tanh -> Scale -> Sigmoid)
+# is to fuse the post-processing steps (Scale, Tanh, Scale, Sigmoid) into a single kernel, 
+# or even fuse the Conv output with these if we assume the conv is handled by cuDNN.
+#
+# However, to demonstrate "custom CUDA operators" replacing PyTorch ops effectively in an inline context,
+# let's focus on fusing the element-wise operations after the convolution. The convolution itself 
+# is best left to cuDNN via nn.Conv3d for maximum performance, but we can fuse the subsequent 
+# heavy element-wise chain into one kernel to reduce memory bandwidth pressure and launch overhead.
+#
+# Actually, a better approach for "speedups" in this specific small model might be to implement 
+# a custom fused kernel that does: Conv -> Scale1 -> Tanh -> Scale2 -> Sigmoid.
+# But since writing a fast Conv3d from scratch is not feasible in a short inline snippet, 
+# we will replace the element-wise chain with a highly optimized fused kernel.
+#
+# Let's define a kernel that takes the output of conv, scaling_factor, bias, and produces the final result.
+
+fused_post_conv_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+// Helper for tanh approximation or exact tanh
+__device__ inline float fast_tanh(float x) {
+    return tanhf(x);
+}
+
+// Helper for sigmoid
+__device__ inline float fast_sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+__global__ void fused_post_conv_kernel(
+    const float* conv_out, 
+    const float* scaling_factor, 
+    const float* bias, 
+    float* out, 
+    int batch_size, 
+    int out_channels, 
+    int spatial_size // depth * height * width
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = batch_size * out_channels * spatial_size;
+
+    if (idx < total_elements) {
+        // Calculate indices for batch, channel, and spatial position
+        int spatial_idx = idx % spatial_size;
+        int temp = idx / spatial_size;
+        int channel_idx = temp % out_channels;
+        int batch_idx = temp / out_channels;
+
+        // Load values
+        float val = conv_out[idx];
+
+        // Step 1: Multiply by scaling_factor (broadcasted over spatial and batch)
+        val *= scaling_factor[channel_idx];
+
+        // Step 2: Apply Tanh
+        val = fast_tanh(val);
+
+        // Step 3: Multiply by bias (broadcasted over spatial and batch)
+        val *= bias[channel_idx];
+
+        // Step 4: Apply Sigmoid
+        out[idx] = fast_sigmoid(val);
+    }
+}
+
+torch::Tensor fused_post_conv_cuda(
+    torch::Tensor conv_out, 
+    torch::Tensor scaling_factor, 
+    torch::Tensor bias
+) {
+    auto batch_size = conv_out.size(0);
+    auto out_channels = conv_out.size(1);
+    auto spatial_size = conv_out.numel() / (batch_size * out_channels);
+
+    auto out = torch::empty_like(conv_out);
+
+    const int block_size = 256;
+    int total_elements = batch_size * out_channels * spatial_size;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+
+    fused_post_conv_kernel<<<num_blocks, block_size>>>(
+        conv_out.data_ptr<float>(), 
+        scaling_factor.data_ptr<float>(), 
+        bias.data_ptr<float>(), 
+        out.data_ptr<float>(), 
+        batch_size, 
+        out_channels, 
+        spatial_size
+    );
+
+    return out;
+}
+"""
+
+fused_post_conv_cpp_source = (
+    "torch::Tensor fused_post_conv_cuda(torch::Tensor conv_out, torch::Tensor scaling_factor, torch::Tensor bias);"
+)
+
+# Compile the inline CUDA code
+fused_post_conv = load_inline(
+    name="fused_post_conv",
+    cpp_sources=fused_post_conv_cpp_source,
+    cuda_sources=fused_post_conv_source,
+    functions=["fused_post_conv_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized Model that performs a 3D convolution, then fuses the scaling, tanh, 
+    second scaling, and sigmoid operations into a single custom CUDA kernel.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, scaling_factor, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.scaling_factor = nn.Parameter(torch.randn(bias_shape))
+        self.bias = nn.Parameter(torch.randn(bias_shape)) 
+
+    def forward(self, x):
+        # Perform Convolution (using optimized cuDNN backend via PyTorch)
+        x = self.conv(x)
+        
+        # Fuse the remaining element-wise operations into a single kernel
+        x = fused_post_conv.fused_post_conv_cuda(x, self.scaling_factor, self.bias)
+        
+        return x
+
+# Re-defining get_inputs and get_init_inputs to match the required interface for testing/context
+def get_inputs():
+    batch_size = 128
+    in_channels = 3
+    depth, height, width = 16, 64, 64
+    return [torch.rand(batch_size, in_channels, depth, height, width)]
+
+def get_init_inputs():
+    in_channels = 3
+    out_channels = 16
+    kernel_size = 3
+    scaling_factor = 2
+    bias_shape = (out_channels, 1, 1, 1)
+    return [in_channels, out_channels, kernel_size, scaling_factor, bias_shape]

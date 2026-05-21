@@ -1,0 +1,42 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 63.908,
+  "eval_result": {
+    "compiled": true,
+    "correctness": false,
+    "metadata": {
+      "avg_difference": [
+        "0.000076",
+        "0.000076",
+        "0.000076",
+        "0.000076",
+        "0.000076"
+      ],
+      "correctness_issue": "Output mismatch",
+      "correctness_trials": "(0 / 5)",
+      "device": "0",
+      "hardware": "NVIDIA GeForce RTX 4090",
+      "max_difference": [
+        "0.000522",
+        "0.000545",
+        "0.000567",
+        "0.000548",
+        "0.000539"
+      ]
+    },
+    "ref_runtime": -1.0,
+    "ref_runtime_stats": {},
+    "runtime": -1.0,
+    "runtime_stats": {}
+  },
+  "generated_kernel_path": "runs/ralph_codex_cuda_all/generated_kernels/level_1/problem_50.py",
+  "level": 1,
+  "model_name": "codex-gpt-5.5",
+  "precision": "fp32",
+  "problem_id": 50,
+  "problem_name": "50_conv_standard_2D__square_input__square_kernel.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_codex_cuda_all/raw_generation/level_1/problem_50.txt",
+  "static_warnings": [],
+  "status": "evaluated"
+}

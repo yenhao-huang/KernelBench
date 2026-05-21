@@ -1,0 +1,17 @@
+{
+  "backend": "cuda",
+  "elapsed_sec": 31.561,
+  "generated_kernel_path": "runs/ralph_gemma4_cuda_all/generated_kernels/level_2/problem_29.py",
+  "level": 2,
+  "model_name": "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
+  "precision": "fp32",
+  "problem_id": 29,
+  "problem_name": "29_Matmul_Mish_Mish.py",
+  "prompt_option": "one_shot",
+  "raw_generation_path": "runs/ralph_gemma4_cuda_all/raw_generation/level_2/problem_29.txt",
+  "static_errors": [
+    "Missing __global__ kernel definition"
+  ],
+  "static_warnings": [],
+  "status": "static_failed"
+}

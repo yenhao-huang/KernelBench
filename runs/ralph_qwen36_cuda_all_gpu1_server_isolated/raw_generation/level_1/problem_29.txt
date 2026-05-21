@@ -1,0 +1,87 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for Softplus
+# Softplus(x) = log(1 + exp(x))
+# For numerical stability:
+# If x > threshold (e.g., 20), use x directly because log(1+exp(x)) ≈ x
+# Otherwise, use log(1 + exp(x))
+
+softplus_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cmath>
+
+__global__ void softplus_kernel(const float* input, float* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float x = input[idx];
+        // Threshold for numerical stability. 
+        // exp(20) is large enough that 1+exp(x) ≈ exp(x), so log(1+exp(x)) ≈ x.
+        // Using 20.0 as a safe threshold to avoid overflow in exp() and precision loss.
+        if (x > 20.0f) {
+            output[idx] = x;
+        } else {
+            output[idx] = log1pf(expf(x));
+        }
+    }
+}
+
+torch::Tensor softplus_cuda(torch::Tensor input) {
+    auto output = torch::empty_like(input);
+    const int size = input.numel();
+    
+    if (size == 0) {
+        return output;
+    }
+
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+
+    softplus_kernel<<<num_blocks, block_size>>>(input.data_ptr<float>(), output.data_ptr<float>(), size);
+
+    // Synchronize to ensure completion and catch any errors
+    cudaDeviceSynchronize();
+    
+    return output;
+}
+"""
+
+softplus_cpp_source = (
+    "torch::Tensor softplus_cuda(torch::Tensor input);"
+)
+
+# Compile the inline CUDA code for Softplus
+softplus_op = load_inline(
+    name="softplus_custom",
+    cpp_sources=softplus_cpp_source,
+    cuda_sources=softplus_source,
+    functions=["softplus_cuda"],
+    verbose=False,
+    extra_cflags=["-O2"],
+    extra_ldflags=[""]
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs a Softplus activation using a custom CUDA operator.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.softplus_op = softplus_op
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies optimized Softplus activation to the input tensor using custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+
+        Returns:
+            torch.Tensor: Output tensor with Softplus applied, same shape as input.
+        """
+        return self.softplus_op.softplus_cuda(x)
+```

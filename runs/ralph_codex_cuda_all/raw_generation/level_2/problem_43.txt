@@ -1,0 +1,135 @@
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+cuda_sources = r"""
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <float.h>
+#include <math.h>
+
+__global__ void maxpool_logsumexp_relu_kernel(
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int N, int C, int D, int H, int W,
+    int OD, int OH, int OW
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * OD * OH * OW;
+    if (idx >= total) return;
+
+    int ow = idx % OW;
+    int t = idx / OW;
+    int oh = t % OH;
+    t /= OH;
+    int od = t % OD;
+    int n = t / OD;
+
+    int d0 = od * 2;
+    int h0 = oh * 2;
+    int w0 = ow * 2;
+
+    float m = -FLT_MAX;
+
+    for (int c = 0; c < C; ++c) {
+        float vmax = -FLT_MAX;
+        #pragma unroll
+        for (int dz = 0; dz < 2; ++dz) {
+            #pragma unroll
+            for (int dy = 0; dy < 2; ++dy) {
+                #pragma unroll
+                for (int dx = 0; dx < 2; ++dx) {
+                    int d = d0 + dz;
+                    int h = h0 + dy;
+                    int w = w0 + dx;
+                    float v = x[((((n * C + c) * D + d) * H + h) * W + w)];
+                    vmax = fmaxf(vmax, v);
+                }
+            }
+        }
+        m = fmaxf(m, vmax);
+    }
+
+    float s = 0.0f;
+    for (int c = 0; c < C; ++c) {
+        float vmax = -FLT_MAX;
+        #pragma unroll
+        for (int dz = 0; dz < 2; ++dz) {
+            #pragma unroll
+            for (int dy = 0; dy < 2; ++dy) {
+                #pragma unroll
+                for (int dx = 0; dx < 2; ++dx) {
+                    int d = d0 + dz;
+                    int h = h0 + dy;
+                    int w = w0 + dx;
+                    float v = x[((((n * C + c) * D + d) * H + h) * W + w)];
+                    vmax = fmaxf(vmax, v);
+                }
+            }
+        }
+        s += expf(vmax - m);
+    }
+
+    float y = logf(s) + m;
+    out[idx] = y > 0.0f ? y : 0.0f;
+}
+
+torch::Tensor maxpool_logsumexp_relu_cuda(torch::Tensor x) {
+    int N = x.size(0);
+    int C = x.size(1);
+    int D = x.size(2);
+    int H = x.size(3);
+    int W = x.size(4);
+
+    int OD = D / 2;
+    int OH = H / 2;
+    int OW = W / 2;
+
+    auto out = torch::empty({N, 1, OD, OH, OW}, x.options());
+
+    int total = N * OD * OH * OW;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+
+    maxpool_logsumexp_relu_kernel<<<grid, block>>>(
+        x.data_ptr<float>(),
+        out.data_ptr<float>(),
+        N, C, D, H, W, OD, OH, OW
+    );
+
+    return out;
+}
+"""
+
+cpp_sources = r"""
+torch::Tensor maxpool_logsumexp_relu_cuda(torch::Tensor x);
+"""
+
+_fused_pool_lse_relu = load_inline(
+    name="fused_pool_lse_relu_ext",
+    cpp_sources=cpp_sources,
+    cuda_sources=cuda_sources,
+    functions=["maxpool_logsumexp_relu_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Conv3d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+        )
+        self.fused = _fused_pool_lse_relu
+
+    def forward(self, x):
+        x = self.conv(x)
+        return self.fused.maxpool_logsumexp_relu_cuda(x)
+```
